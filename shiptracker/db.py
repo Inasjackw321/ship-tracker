@@ -294,3 +294,11 @@ class Store:
             d["geometry"] = json.loads(d["geometry"]) if d["geometry"] else None
             out.append(d)
         return out
+
+    def get_detection(self, det_id: int) -> dict | None:
+        rows = self._query("SELECT * FROM detections WHERE id=?", (det_id,))
+        return dict(rows[0]) if rows else None
+
+    def get_s3_detection(self, det_id: int) -> dict | None:
+        rows = self._query("SELECT * FROM s3_detections WHERE id=?", (det_id,))
+        return dict(rows[0]) if rows else None

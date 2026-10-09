@@ -308,7 +308,7 @@ def process_granule(settings, store, g: Granule, region: BaseGeometry, keep_file
     chips_dir = settings.chips_dir / "s3" / g.id
     found = detect_granule(paths["refl"], paths["geo"], paths["flags"], region, chips_dir,
                            g.datetime[:10], rejected=rejected)
-    rows = [(d, str(Path(c).relative_to(settings.chips_dir)) if c else None) for d, c in found]
+    rows = [(d, Path(c).relative_to(settings.chips_dir).as_posix() if c else None) for d, c in found]
     added = store.add_s3_detections(g, rows)
     why = ", ".join(f"{n} {r}" for r, n in rejected.most_common())
     store.save_s3_granule(g, "done", f"{len(found)} specks, {added} new" + (f"; rejected {why}" if why else ""), added)

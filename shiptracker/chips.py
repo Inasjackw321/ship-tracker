@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from PIL import Image, ImageDraw, ImageFont
-from rasterio.windows import Window
+from rasterio.windows import Window, transform as window_transform
 
 from .scene import GeoDetection, apply_affine
 
@@ -34,6 +34,18 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
+def write_geotiff(path: Path, rgb: np.ndarray, crs, transform, g: GeoDetection) -> Path:
+    """Clean (no overlay) georeferenced chip: opens in place in QGIS / Google Earth."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(path, "w", driver="GTiff", width=rgb.shape[2], height=rgb.shape[1], count=3,
+                       dtype="uint8", crs=crs, transform=transform, compress="deflate",
+                       photometric="RGB") as dst:
+        dst.write(rgb)
+        dst.update_tags(SHIP_LAT=f"{g.lat:.6f}", SHIP_LON=f"{g.lon:.6f}", LENGTH_M=str(g.det.length_m),
+                        BEAM_M=str(g.det.width_m), HULL_AXIS_DEG=str(g.det.heading_deg))
+    return path
+
+
 def render_chip(src, g: GeoDetection, out_path: Path, label: str = "") -> Path:
     d = g.det
     col, row = apply_affine(~src.transform, g.x, g.y)  # fractional pixel position of the centre
@@ -44,6 +56,7 @@ def render_chip(src, g: GeoDetection, out_path: Path, label: str = "") -> Path:
     arr = src.read(bands, window=win, boundless=True, fill_value=0).astype(np.float32)
     img8 = _stretch(arr)
     mode_img = np.repeat(img8, 3, axis=0) if img8.shape[0] == 1 else img8
+    write_geotiff(out_path.with_suffix(".tif"), mode_img, src.crs, window_transform(win, src.transform), g)
     img = Image.fromarray(np.moveaxis(mode_img, 0, -1), "RGB")
     scale = OUT_PX / img.width
     img = img.resize((OUT_PX, OUT_PX), Image.LANCZOS)

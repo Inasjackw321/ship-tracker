@@ -230,3 +230,53 @@ def test_priority_only_skips_tiles_outside_priority_regions(world, tmp_path):
     assert rep.found == 0 and rep.processed == 0
     rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", sentinel3=False))
     assert rep.processed == 2  # without priority_only the rest of the area still follows
+
+
+def test_downloads_carry_coordinates(world, tmp_path):
+    import io
+    import zipfile
+
+    from PIL import Image
+
+    settings, _, _ = world
+    scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    client = create_app(settings).test_client()
+    ship = client.get("/api/detections").get_json()["features"][0]
+    lon, lat = ship["geometry"]["coordinates"]
+    sid = ship["properties"]["id"]
+    assert ship["properties"]["has_tif"]
+
+    # PNG: coordinates in the metadata and the file name
+    r = client.get(f"/api/detections/{sid}/image.png?dl=1")
+    assert r.status_code == 200 and r.mimetype == "image/png"
+    assert "attachment" in r.headers["Content-Disposition"] and f"{lat:.5f}N" in r.headers["Content-Disposition"]
+    img = Image.open(io.BytesIO(r.data))
+    assert img.text["Coordinates"] == f"{lat:.5f}, {lon:.5f}"
+    assert img.height > img.width  # framed with header and footer text
+
+    # GeoTIFF: the centre pixel is the ship
+    r = client.get(f"/api/detections/{sid}/image.tif")
+    assert r.status_code == 200
+    tif = tmp_path / "ship.tif"
+    tif.write_bytes(r.data)
+    with rasterio.open(tif) as src:
+        cx, cy = apply_affine(src.transform, src.width / 2, src.height / 2)
+        tlon, tlat = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True).transform(cx, cy)
+        assert src.count == 3 and float(src.tags()["SHIP_LAT"]) == pytest.approx(lat, abs=1e-5)
+    assert abs(tlat - lat) < 0.0002 and abs(tlon - lon) < 0.0002  # within ~20 m
+
+    # Sentinel-3 PNG and a zip of everything
+    s3 = client.get("/api/s3/detections").get_json()["features"]
+    assert client.get(f"/api/s3/detections/{s3[0]['properties']['id']}/image.png").status_code == 200
+    s2_ids = [f["properties"]["id"] for f in client.get("/api/detections").get_json()["features"]]
+    r = client.post("/api/download.zip", json={"s2": s2_ids, "s3": [s3[0]["properties"]["id"]]})
+    assert r.status_code == 200
+    z = zipfile.ZipFile(io.BytesIO(r.data))
+    names = z.namelist()
+    assert sum(n.endswith(".png") for n in names) == len(s2_ids) + 1
+    assert sum(n.endswith(".tif") for n in names) == len(s2_ids)
+    csv_rows = z.read("coordinates.csv").decode().strip().splitlines()
+    assert len(csv_rows) == len(s2_ids) + 2  # header + ships
+    assert f"{lat:.5f}, {lon:.5f}" in z.read("coordinates.csv").decode()
+    assert z.read("ships.kml").decode().count("<Placemark>") == len(s2_ids) + 1
+    assert client.post("/api/download.zip", json={}).status_code == 400

@@ -16,7 +16,36 @@
   #app { display: flex; height: 100%; }
   #side { width: 360px; min-width: 300px; background: var(--panel); border-right: 1px solid var(--line);
     display: flex; flex-direction: column; overflow: hidden; }
-  #map { flex: 1; }
+  #mapwrap { flex: 1; position: relative; min-height: 0; }
+  #map { position: absolute; inset: 0; }
+  /* Only as wide as its cards, so the rest of the map stays clickable. */
+  #tray { position: absolute; left: 10px; bottom: 24px; z-index: 1000; background: #0f1419ee; width: max-content;
+    max-width: min(calc(100% - 190px), 980px); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; max-height: 46%; display: flex; flex-direction: column; gap: 8px; }
+  #tray[hidden] { display: none; }
+  #tray .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #tray .bar b { margin-right: auto; font-size: 13px; }
+  #tray-cards { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+  #tray-cards[hidden] { display: none; }
+  .card { position: relative; flex: 0 0 150px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px; font-size: 12px; }
+  .card.s3 { border-color: #7b4bb3; }
+  .card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #000; cursor: pointer; display: block; }
+  .card .t { font-weight: 600; margin-top: 4px; }
+  .card .meta { color: var(--muted); }
+  .card .x { position: absolute; top: 8px; right: 8px; padding: 0 6px; background: #000a; color: #fff; border-radius: 4px; }
+  .coords { display: flex; gap: 4px; margin-top: 6px; }
+  .coords input { font: 12px ui-monospace, monospace; padding: 3px 5px; min-width: 0; }
+  .popup .coords input { background: #f3f5f7; color: #111; border-color: #ccd; }
+  .dms { display: flex; gap: 6px; align-items: center; justify-content: space-between; font-size: 11px; color: #555; margin-top: 4px; }
+  .dl { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .mini { display: inline-block; background: var(--accent); color: #04130a; border: 0; border-radius: 4px; padding: 3px 7px;
+    font: 600 11px system-ui, sans-serif; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .mini.ghost { background: transparent; color: inherit; border: 1px solid #8b98a5; }
+  .leaflet-container a.mini { color: #04130a; }
+  .leaflet-container a.mini.ghost { color: #333; }
+  .card .coords input { width: 100%; font-size: 11px; }
+  .popup .mini.ghost { color: #333; }
   header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
   header h1 { margin: 0; font-size: 17px; }
   header p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
@@ -46,7 +75,7 @@
   #list .len { font-weight: 600; }
   #list .meta { font-size: 12px; color: var(--muted); }
   .tag { font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #3a2f12; color: var(--warn); margin-left: 4px; }
-  .popup img { width: 300px; height: 300px; display: block; border-radius: 4px; background: #000; }
+  .popup img { width: 240px; height: 240px; display: block; border-radius: 4px; background: #000; }
   .popup table { margin-top: 6px; font-size: 12px; border-collapse: collapse; }
   .popup td { padding: 1px 8px 1px 0; }
   .popup td:first-child { color: #666; }
@@ -55,6 +84,7 @@
   .legend { background: #000b; color: #fff; padding: 6px 8px; border-radius: 6px; font-size: 12px; line-height: 1.7; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
   @media (max-width: 760px) {
+    #tray { max-width: calc(100% - 20px); }
     #app { flex-direction: column-reverse; }
     #side { width: 100%; height: 50%; border-right: 0; border-top: 1px solid var(--line); }
   }
@@ -105,7 +135,20 @@
     </section>
     <ul id="list"></ul>
   </aside>
-  <div id="map"></div>
+  <div id="mapwrap">
+    <div id="map"></div>
+    <div id="tray" hidden>
+      <div class="bar">
+        <b>Opened images (<span id="tray-count">0</span>)</b>
+        <button class="mini" id="tray-copy" title="Copy every opened ship's coordinates (one per line)">Copy all coordinates</button>
+        <button class="mini" id="tray-zip" title="Images with coordinates, GeoTIFFs, CSV and Google Earth KML">Download all (.zip)</button>
+        <button class="mini ghost" id="tray-close">Close popups</button>
+        <button class="mini ghost" id="tray-clear">Clear</button>
+        <button class="mini ghost" id="tray-toggle">Hide</button>
+      </div>
+      <div id="tray-cards"></div>
+    </div>
+  </div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/static/app.js"></script>

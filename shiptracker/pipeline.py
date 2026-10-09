@@ -192,7 +192,7 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
     if dets:
         image = tci or nir_path
         paths = render_chips(image, dets, settings.chips_dir / scene.id, scene.datetime[:10])
-        chips = [str(p.relative_to(settings.chips_dir)) if p else None for p in paths]
+        chips = [p.relative_to(settings.chips_dir).as_posix() if p else None for p in paths]
 
     store.delete_scene_detections(scene.id)  # replaces results of an earlier run
     added = store.add_detections(scene, dets, chips)
@@ -210,8 +210,9 @@ def _prune_chips(settings: Settings, store: Store, scene_id: str) -> None:
     keep = store.chips_for_scene(scene_id)
     folder = settings.chips_dir / scene_id
     for f in folder.glob("*.png") if folder.exists() else []:
-        if str(f.relative_to(settings.chips_dir)) not in keep:
+        if f.relative_to(settings.chips_dir).as_posix() not in keep:
             f.unlink()
+            f.with_suffix(".tif").unlink(missing_ok=True)
 
 
 def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,

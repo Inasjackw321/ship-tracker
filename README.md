@@ -128,6 +128,21 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/coverage` | Imaged and not-imaged parts of the area from the last scan's search |
 | `POST /api/scan` `{start, end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
+| `GET /api/detections/<id>/image.png[?dl=1]` | Ship image with coordinates printed on it (and in its metadata) |
+| `GET /api/detections/<id>/image.tif` | Georeferenced GeoTIFF of the ship chip |
+| `GET /api/s3/detections/<id>/image.png[?dl=1]` | Same for a Sentinel-3 possible large ship |
+| `POST /api/download.zip` `{s2: [ids], s3: [ids]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
+
+## Opening several ships, copying coordinates, downloading images
+
+- **Open as many ships as you like.** Click ships on the map, or in the list. Each opens its own popup, and opening one doesn't close the others. Popups also stay open while a scan refreshes the map.
+- **Opened images tray.** Every ship you open also goes into a tray at the bottom of the map, so you can compare them side by side. Click a card's picture to fly back to that ship. The tray has these buttons:
+  - **Copy all coordinates:** one line per ship, as `lat, lon<TAB>size<TAB>date`.
+  - **Download all (.zip):** every image, the GeoTIFFs, `coordinates.csv` and `ships.kml` (opens in Google Earth).
+  - **Close popups**, **Clear** and **Hide**.
+- **Copy:** each popup and card shows the coordinates in a box you can select, with a **Copy** button. They're in decimal degrees (`22.96002, 61.04447`), which pastes straight into Google Maps. Popups also have a second Copy button for degrees/minutes/seconds.
+- **Download image:** a PNG of the ship with its coordinates printed on it. That covers the centre in decimal and DMS, plus the hull end points, size, date and source image. The coordinates are also stored in the PNG metadata (`Coordinates`, `Latitude`, `Longitude`) and in the file name, e.g. `ship_22.96002N_61.04447E_2026-09-30_382m.png`.
+- **GeoTIFF:** a clean, georeferenced copy of the image chip that opens in place in QGIS or Google Earth Pro. It is saved for ships detected from now on. Older detections only have the PNG.
 
 ## Priority regions
 

@@ -7,9 +7,10 @@ from dataclasses import asdict
 from datetime import date, timedelta
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
 from shapely.geometry import mapping
 
+from .annotate import annotated_png, bundle_zip, file_stem, geotiff_path
 from .aoi import aoi_geojson, load_priority
 from .config import Settings
 from .db import Store
@@ -21,7 +22,9 @@ WEB_DIR = Path(__file__).parent / "web"
 
 def _feature(d: dict) -> dict:
     props = {k: v for k, v in d.items() if k not in ("lon", "lat")}
-    props["chip_url"] = f"/chips/{d['chip']}" if d.get("chip") else None
+    if d.get("chip"):
+        props["chip"] = d["chip"].replace("\\", "/")  # rows written on Windows before paths were normalised
+    props["chip_url"] = f"/chips/{props['chip']}" if d.get("chip") else None
     return {"type": "Feature", "geometry": {"type": "Point", "coordinates": [d["lon"], d["lat"]]},
             "properties": props}
 
@@ -68,7 +71,10 @@ def create_app(settings: Settings | None = None) -> Flask:
             )
         except ValueError as exc:
             abort(400, str(exc))
-        return jsonify({"type": "FeatureCollection", "features": [_feature(r) for r in rows]})
+        feats = [_feature(r) for r in rows]
+        for f in feats:  # tell the UI which ships have a clean GeoTIFF to download
+            f["properties"]["has_tif"] = geotiff_path(f["properties"], settings.chips_dir) is not None
+        return jsonify({"type": "FeatureCollection", "features": feats})
 
     @app.get("/api/scenes")
     def scenes():
@@ -91,6 +97,44 @@ def create_app(settings: Settings | None = None) -> Flask:
             ids = set(store.get_meta("s3_current", []))
             rows = [r for r in rows if r["id"] in ids]
         return jsonify(rows)
+
+    def _png_response(kind: str, rec: dict | None) -> Response:
+        if rec is None:
+            abort(404)
+        name = file_stem(kind, rec) + ".png"
+        disposition = "attachment" if request.args.get("dl") else "inline"
+        return Response(annotated_png(kind, rec, settings.chips_dir), mimetype="image/png",
+                        headers={"Content-Disposition": f'{disposition}; filename="{name}"'})
+
+    @app.get("/api/detections/<int:det_id>/image.png")
+    def detection_png(det_id: int):
+        return _png_response("s2", store.get_detection(det_id))
+
+    @app.get("/api/detections/<int:det_id>/image.tif")
+    def detection_tif(det_id: int):
+        rec = store.get_detection(det_id)
+        tif = geotiff_path(rec, settings.chips_dir) if rec else None
+        if tif is None:
+            abort(404, "No GeoTIFF saved for this ship (detected before GeoTIFFs were added)")
+        return send_file(tif, mimetype="image/tiff", as_attachment=True,
+                         download_name=file_stem("s2", rec) + ".tif")
+
+    @app.get("/api/s3/detections/<int:det_id>/image.png")
+    def s3_detection_png(det_id: int):
+        return _png_response("s3", store.get_s3_detection(det_id))
+
+    @app.post("/api/download.zip")
+    def download_zip():
+        body = request.get_json(silent=True) or {}
+        try:
+            s2 = [r for r in (store.get_detection(int(i)) for i in body.get("s2", [])[:500]) if r]
+            s3 = [r for r in (store.get_s3_detection(int(i)) for i in body.get("s3", [])[:500]) if r]
+        except (TypeError, ValueError):
+            abort(400, "ids must be integers")
+        if not s2 and not s3:
+            abort(400, "nothing selected")
+        return Response(bundle_zip(s2, s3, settings.chips_dir), mimetype="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="ships_{len(s2) + len(s3)}.zip"'})
 
     @app.get("/api/priority")
     def priority():
