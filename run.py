@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -42,6 +43,22 @@ def bootstrap() -> int:
     return subprocess.call([str(VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]], cwd=ROOT)
 
 
+def free_port(preferred: int, host: str = "127.0.0.1") -> int:
+    """First port from ``preferred`` upward that can be bound, else one the OS picks.
+
+    On Windows a port can be blocked even when nothing listens on it (Hyper-V, WSL and
+    Docker reserve ranges), which shows up as "access a socket in a way forbidden".
+    """
+    for port in [*range(preferred, preferred + 20), 0]:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+            except OSError:
+                continue
+            return s.getsockname()[1]
+    raise RuntimeError("no free local port found")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Start the ship tracker map and scan recent Sentinel-2 imagery")
     ap.add_argument("--days", type=int, default=10, help="scan imagery from the last N days (default 10)")
@@ -68,8 +85,11 @@ def main() -> int:
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     app = create_app()
-    server = make_server("127.0.0.1", args.port, app, threaded=True)
-    url = f"http://127.0.0.1:{args.port}"
+    port = free_port(args.port)
+    if port != args.port:
+        print(f"Port {args.port} is unavailable on this computer; using {port} instead.", flush=True)
+    server = make_server("127.0.0.1", port, app, threaded=True)
+    url = f"http://127.0.0.1:{port}"
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"\n  Ship Tracker map: {url}   (press Ctrl+C to stop)\n", flush=True)
 
