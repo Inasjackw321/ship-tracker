@@ -44,7 +44,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 4
+DETECTOR_VERSION = 5
 
 
 @dataclass
@@ -88,6 +88,12 @@ class DetectParams:
     # Hull model fit (refines length/beam; see fit_hull) and its error model. The floors
     # were calibrated on synthetic ships and set conservatively for real imagery.
     model_fit: bool = True
+    wake_model: bool = True        # separate a moving ship's wake from its hull
+    wake_min_gain: float = 0.40    # the wake model must fit >= 40 % better to be used
+    wake_soft_end_px: float = 1.5  # ...and is only tried when one end fades out this gradually
+    max_plausible_aspect: float = 9.5  # length/beam above this (150 m+) flags the length as doubtful
+    wake_min_length: float = 0.2   # wake fades over >= 0.2 x hull length (shorter = superstructure)
+    wake_max_brightness: float = 2.0  # wake at most 2 x the deck brightness
     bow_taper: float = 0.12        # pointed part of the bow, as a fraction of length
     length_err_floor_m: float = 4.0
     length_err_rel: float = 0.015
@@ -113,6 +119,7 @@ class Detection:
     length_err_m: float = 0.0  # 1-sigma uncertainty
     width_err_m: float = 0.0
     method: str = "profile"    # "fit" (hull model) or "profile" (fallback)
+    wake_m: float = 0.0        # visible wake behind the stern (ship under way); 0 = none found
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -275,7 +282,14 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
     s_lo, s_hi = ends
     length = max(s_hi - s_lo - corr, 1.0)
     core = _crossings(along, s, 0.7 * _plateau(along))
-    softness = (s_hi - s_lo) / max(core[1] - core[0], 0.5) if core else 9.0
+    if core:
+        # Judge the sharper end: a moving ship's wake softens one end, but its bow stays
+        # sharp; a cloud is soft all round.
+        span = max(core[1] - core[0], 0.5)
+        edges = (max(core[0] - s_lo, 0.0), max(s_hi - core[1], 0.0))
+        softness = (span + 2 * min(edges)) / span
+    else:
+        softness, edges = 9.0, (0.0, 0.0)
 
     inside = (S >= s_lo) & (S <= s_hi)
     across = np.where(inside, grid, 0).sum(axis=0)
@@ -292,14 +306,21 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
         "axis_r": float(u[0]),
         "axis_c": float(u[1]),
         "softness": float(softness),
+        "end_edges_px": edges,  # 30->70 % rise at each end; a wake makes one end long
     }
 
 
 def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float) -> np.ndarray:
     """Blurred hull: a rectangle with a pointed bow (at +s if sign=1), convolved with a
     Gaussian of width ``sigma`` px. Separable in the hull frame, so it is evaluated
-    analytically at pixel centres (no supersampling)."""
-    r0, c0, th, L, W, A = params
+    analytically at pixel centres (no supersampling).
+
+    With 9 parameters a wake is added behind the stern: foam that starts at the stern
+    with brightness ``fa`` x the deck, fades exponentially over ``fl`` x the hull length,
+    and has its own width ``ww``. Expressing the wake relative to the hull keeps it
+    physical: a short, very bright blob is the superstructure, not a wake.
+    """
+    r0, c0, th, L, W, A = params[:6]
     ur, uc = -math.cos(th), math.sin(th)  # along hull; th = axis angle from north
     s = (rr - r0) * ur + (cc - c0) * uc
     t = (rr - r0) * uc - (cc - c0) * ur
@@ -308,11 +329,23 @@ def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float) -> np.nda
     w = np.where(sb > bow0, W * np.clip(1 - (sb - bow0) / max(taper * L, 1e-6), 0.05, 1), W)
     gs = ndtr((s + L / 2) / sigma) - ndtr((s - L / 2) / sigma)
     gt = ndtr((t + w / 2) / sigma) - ndtr((t - w / 2) / sigma)
-    return A * gs * gt
+    out = A * gs * gt
+    if len(params) > 6:
+        fa, fl, ww = params[6:]
+        aw, lam = fa * A, fl * L
+        d = -sb - L / 2  # distance behind the stern (px)
+        onset = ndtr(d / sigma)
+        fade = np.exp(-np.clip(d, 0, None) / max(lam, 1e-3))
+        out = out + aw * onset * fade * (ndtr((t + ww / 2) / sigma) - ndtr((t - ww / 2) / sigma))
+    return out
 
 
 def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) -> dict | None:
     """Refine length, beam, centre and axis by fitting the blurred hull model.
+
+    A moving ship trails a bright wake that would otherwise be measured as hull (a
+    150 m tanker reading 300 m+). When a hull-plus-wake model explains the pixels
+    clearly better, the wake is separated out and only the hull is measured.
 
     Returns None (keep the profile estimate) when the fit fails or runs into its bounds.
     """
@@ -324,28 +357,70 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
     y = excess[rr, cc].astype(np.float64)
     sigma = math.sqrt(p.psf_sigma_px ** 2 + 1 / 12)  # optics + pixel footprint
     th0 = math.atan2(init["axis_c"], -init["axis_r"])
+    ur, uc = -math.cos(th0), math.sin(th0)
     L0, W0 = init["length_px"], max(init["width_px"], 1.0)
     inside = mask[rr, cc]
     A0 = max(float(np.percentile(y[inside], 60)) if inside.any() else float(y.max()), 0.01)
+    lb6 = np.array([init["row"] - 3, init["col"] - 3, th0 - 0.35, 1.5, 0.3, 0.003])
+    ub6 = np.array([init["row"] + 3, init["col"] + 3, th0 + 0.35, L0 * 1.6 + 4, max(W0 * 1.6, 3), 1.0])
+    f_scale = max(2 * noise, 0.004)
+
+    def solve(fun, x0, lb, ub):
+        try:
+            return least_squares(fun, np.clip(x0, lb + 1e-9, ub - 1e-9), bounds=(lb, ub), loss="soft_l1",
+                                 f_scale=f_scale, x_scale="jac")
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+
     x0 = np.array([init["row"], init["col"], th0, L0 * 1.03, max(W0 * 0.7, 0.6), A0])
-    lb = np.array([x0[0] - 3, x0[1] - 3, th0 - 0.35, 1.5, 0.3, 0.003])
-    ub = np.array([x0[0] + 3, x0[1] + 3, th0 + 0.35, L0 * 1.6 + 4, max(W0 * 1.6, 3), 1.0])
-    x0 = np.clip(x0, lb + 1e-9, ub - 1e-9)
     best = None
     for sign in (1, -1):  # bow at either end
-        try:
-            res = least_squares(lambda q: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, x0,
-                                bounds=(lb, ub), loss="soft_l1", f_scale=max(2 * noise, 0.004), x_scale="jac")
-        except (ValueError, np.linalg.LinAlgError):
-            continue
-        if best is None or res.cost < best.cost:
+        res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, x0, lb6, ub6)
+        if res is not None and res.success and (best is None or res.cost < best.cost):
             best = res
-    if best is None or not best.success:
+    if best is None:
         return None
-    r0, c0, th, L, W, A = best.x
+
+    wake = None
+    soft_end = max(init.get("end_edges_px", (0.0, 0.0)))
+    if p.wake_model and L0 >= 6 and soft_end >= p.wake_soft_end_px:
+        # Wake behind the stern. The first estimate may include the wake, so also start
+        # from shorter hulls shifted towards the bow.
+        lbw = np.concatenate([lb6, [0.0, p.wake_min_length, 0.3]])
+        ubw = np.concatenate([ub6, [p.wake_max_brightness, 6.0, max(3 * W0, 4)]])
+        lbw[0] -= L0 / 2
+        lbw[1] -= L0 / 2
+        ubw[0] += L0 / 2
+        ubw[1] += L0 / 2
+        # The wake trails from the end that fades out; the bow is the other end.
+        # (Profile and model share the hull axis direction: +s is the "hi" end.)
+        e_lo, e_hi = init["end_edges_px"]
+        for sign in ((-1,) if e_hi > e_lo else (1,)):
+            for frac in (1.0, 0.6, 0.35):
+                Ls = L0 * frac
+                shift = sign * (L0 - Ls) / 2
+                xw = np.array([init["row"] + ur * shift, init["col"] + uc * shift, th0, Ls, max(W0 * 0.7, 0.6),
+                               A0, 0.5, max(1.0, p.wake_min_length * 1.5), W0])
+                res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, xw, lbw, ubw)
+                if res is not None and res.success and (wake is None or res.cost < wake[0].cost):
+                    wake = (res, sign)
+        # Keep the wake only if it explains the pixels clearly better than a plain hull
+        # and is a real tail (not a sliver of the hull itself).
+        if wake is not None:
+            res = wake[0]
+            fa = res.x[6]
+            plausible = res.x[3] >= 0.35 * best.x[3]  # a wake inflates a hull by ~1/3, not 5x
+            if res.cost < (1 - p.wake_min_gain) * best.cost and fa > 0.15 and plausible:
+                best = res
+            else:
+                wake = None
+
+    r0, c0, th, L, W, A = best.x[:6]
+    ub = ubw if wake is not None else ub6
     if L >= ub[3] * 0.99 or W >= ub[4] * 0.99 or L < W:
         return None
-    dof = max(len(best.fun) - 6, 1)
+    n_par = len(best.x)
+    dof = max(len(best.fun) - n_par, 1)
     try:
         cov = np.linalg.pinv(best.jac.T @ best.jac) * float(np.sum(best.fun ** 2) / dof)
         sl, sw = math.sqrt(max(cov[3, 3], 0.0)), math.sqrt(max(cov[4, 4], 0.0))
@@ -354,8 +429,11 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
     ar, ac = -math.cos(th), math.sin(th)
     if ar > 0:  # same canonical direction as the profile estimate
         ar, ac = -ar, -ac
-    return {"row": r0, "col": c0, "length_px": L, "width_px": W, "axis_r": ar, "axis_c": ac,
-            "sigma_length_px": sl, "sigma_width_px": sw}
+    out = {"row": r0, "col": c0, "length_px": L, "width_px": W, "axis_r": ar, "axis_c": ac,
+           "sigma_length_px": sl, "sigma_width_px": sw, "wake_px": 0.0}
+    if wake is not None:
+        out["wake_px"] = float(3 * best.x[7] * L)  # visible wake length (~95 % faded)
+    return out
 
 
 def _confidence(snr: float, aspect: float, length_m: float) -> float:
@@ -442,6 +520,12 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             rejected["size"] += 1
             continue
         aspect = length_m / max(width_m, 1e-6)
+        # No real ship of 150 m+ is more than ~9x as long as it is wide (supertankers ~5.5,
+        # container ships ~7). Longer and thinner means wake or streak still counted as
+        # hull: say so through a wider uncertainty and lower confidence.
+        implausible = length_m >= 150 and aspect > p.max_plausible_aspect
+        if implausible:
+            length_err = max(length_err, length_m - 7 * width_m)
         if length_m >= p.aspect_from_m and aspect < p.min_aspect:
             rejected["shape"] += 1
             continue
@@ -479,7 +563,8 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             contrast=peak, snr=s, npix=int(rr.size),
             length_m=round(length_m, 1), width_m=round(width_m, 1),
             heading_deg=round(heading, 1),
-            confidence=_confidence(s, aspect, length_m),
+            confidence=round(_confidence(s, aspect, length_m) * (0.6 if implausible else 1.0), 3),
             length_err_m=round(length_err, 1), width_err_m=round(width_err, 1), method=method,
+            wake_m=round(m.get("wake_px", 0.0) * pixel_m, 0),
         ))
     return out

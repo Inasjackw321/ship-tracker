@@ -68,6 +68,7 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 3. **Hull extraction.** Each candidate is grown to every connected pixel brighter than 25 % of its peak, so the whole hull is captured rather than just the brightest part.
 4. **Measurement, first estimate.** PCA gives the hull axis. The along-hull and across-hull brightness profiles give a first length and beam: each end is placed where the profile drops to 30 % of the typical deck level, with a correction for blur.
 4b. **Measurement, refined (hull-model fit).** A model hull is fitted to the pixels by robust least squares. The model is a rectangle with a pointed bow, blurred exactly as the 10 m sensor blurs. The fit solves for centre, axis, length, beam and brightness together, which removes the profile method's biases (pointed bows read short, narrow beams read wide). Bright superstructures and hatch covers are down-weighted rather than trusted. Each size comes with a **± uncertainty**: the fit's own statistical error, plus a model-error floor of 4 m + 1.5 % of length for length and 3 m for beam. If a fit fails, the first estimate is kept, with wider error bars. The hull axis is a true-north bearing (0–180°, since bow and stern can't be told apart).
+4c. **Wakes.** A ship under way trails a bright wake, often hundreds of metres long, which is bright in the near-infrared too. Counted as hull, it turns a 180 m tanker into a "350 m supertanker". When one end of the hull's brightness profile fades out gradually, the fit also tries a hull-plus-wake model, with a wake behind the stern that fades with distance. The wake is kept only if it explains the pixels at least 40 % better than a plain hull and behaves like a wake: it fades over at least 0.2× the hull length (a short bright blob is the superstructure) and is no more than twice as bright as the deck. Then only the hull is measured, and the popup shows "Under way: wake ≈ … m". As a last check, a 150 m+ object more than 9.5× longer than its width gets a wider ± and lower confidence, since no real ship is that slender. Ships of 300–400 m are still reported: supertankers (~330 m) and the largest container ships (~400 m) do sail through Hormuz.
 5. **Filters on the object.**
    - Length must be 25–420 m and beam ≤ 90 m.
    - Objects ≥ 40 m must be at least twice as long as they are wide.
@@ -94,7 +95,16 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 | 60–150 m | 4.2 m → **3.2 m** (3.9 %) | 7.0 m → **2.9 m** |
 | > 150 m | 12.3 m → **4.2 m** (1.5 %) | 1.7 m → 1.1 m |
 
-The reported ± brackets the true length for 84 % of ships and the true beam for 91 % (deliberately conservative). The hull axis is typically within 0.2°. Real imagery is messier than this: wakes, atmosphere, and boats under 30 m that are only 2–3 pixels long. Expect somewhat larger errors, and treat the ± as a guide. `tests/test_measure_accuracy.py` fails if accuracy regresses.
+Moving ships, the same 200 with a wake 0.5–3× their length:
+
+| moving ships | without wake model | now |
+|---|---|---|
+| found | 175 / 200 | **193 / 200** |
+| median length error | 16.7 m | **6.7 m** |
+| 90 % of ships within | 109 m | **28 m** |
+| reported ≥ 300 m, of which really ≥ 300 m | 25, **8** | 22, **19** |
+
+For stationary ships the ± brackets the true length for 84 % of ships and the true beam for 91 % (deliberately conservative). The hull axis is typically within 0.2°. Real imagery is messier than this: wakes, atmosphere, and boats under 30 m that are only 2–3 pixels long. Expect somewhat larger errors, and treat the ± as a guide. `tests/test_measure_accuracy.py` fails if accuracy regresses.
 
 When the detector changes, tiles analysed by an older version are redone automatically on the next scan. Their old results are replaced.
 

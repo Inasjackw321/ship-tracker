@@ -63,6 +63,8 @@ def _lines(rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int
         (f"Ship  {size_text(rec)}   hull axis {axis:.0f}° / {(axis + 180) % 360:.0f}°", 20, FG),
         (f"{when}   Sentinel-2 (10 m)   {how}   {rec['scene_id']}", 13, MUTED),
     ]
+    if rec.get("wake_m"):
+        header.append((f"Under way: wake about {rec['wake_m']:.0f} m behind the stern (not counted in the length)", 13, MUTED))
     if rec.get("method") == "manual" and rec.get("auto_json"):
         auto = json.loads(rec["auto_json"])
         header.append((f"Automatic measurement was {size_text(auto)}", 13, MUTED))
@@ -146,6 +148,7 @@ def bundle_zip(recs: list[dict], chips_dir: Path) -> bytes:
                 "length_m": rec["length_m"], "length_err_m": rec.get("length_err_m") or "",
                 "beam_m": rec["width_m"], "beam_err_m": rec.get("width_err_m") or "",
                 "measured_by": rec.get("method") or "",
+                "wake_m": rec.get("wake_m") or "",
                 "hull_axis_deg": rec.get("heading_deg", ""),
                 "datetime_utc": rec["datetime"], "image": rec["scene_id"],
                 "file": f"{stem}.png",

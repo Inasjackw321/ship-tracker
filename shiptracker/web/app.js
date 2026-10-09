@@ -89,6 +89,7 @@ function popupHtml(p, lat, lon) {
       <tr><td>Beam</td><td>${beamText(p)}</td></tr>
       <tr><td>Measured</td><td>${esc(METHOD[p.method] || '')}${p.adjusted && p.auto
         ? ` <span style="color:#666">(automatic: ${lenText(p.auto)} × ${beamText(p.auto)})</span>` : ''}</td></tr>
+      ${p.wake_m ? `<tr><td>Under way</td><td>wake ≈ ${Math.round(p.wake_m)} m behind the stern (not counted in the length)</td></tr>` : ''}
       <tr><td>Hull axis</td><td>${p.heading_deg.toFixed(0)}° / ${((p.heading_deg + 180) % 360).toFixed(0)}°</td></tr>
       <tr><td>Seen</td><td>${esc(fmtDate(p.datetime))}</td></tr>
       <tr><td>Position</td><td>${lat.toFixed(5)}, ${lon.toFixed(5)}</td></tr>

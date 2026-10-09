@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS detections (
     width_err_m REAL,
     method TEXT,                   -- fit | profile | manual
     auto_json TEXT,                -- the automatic measurement, kept when adjusted by hand
+    wake_m REAL,                   -- wake behind the stern: the ship was under way
     updated_at REAL
 );
 CREATE TABLE IF NOT EXISTS meta (
@@ -84,7 +85,7 @@ class Store:
                 self.conn.execute("ALTER TABLE scenes ADD COLUMN detector_version INTEGER DEFAULT 1")
             dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(detections)")}
             for name, typ in (("length_err_m", "REAL"), ("width_err_m", "REAL"), ("method", "TEXT"),
-                              ("auto_json", "TEXT"), ("updated_at", "REAL")):
+                              ("auto_json", "TEXT"), ("updated_at", "REAL"), ("wake_m", "REAL")):
                 if name not in dcols:  # databases from before measurement uncertainties
                     self.conn.execute(f"ALTER TABLE detections ADD COLUMN {name} {typ}")
             self.conn.commit()
@@ -169,12 +170,12 @@ class Store:
                     """INSERT INTO detections
                        (scene_id, datetime, ts, lon, lat, length_m, width_m, heading_deg,
                         bow_lon, bow_lat, stern_lon, stern_lat, peak_reflectance, contrast, snr,
-                        npix, confidence, stationary, chip, length_err_m, width_err_m, method)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        npix, confidence, stationary, chip, length_err_m, width_err_m, method, wake_m)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (scene.id, scene.datetime, ts, g.lon, g.lat, d.length_m, d.width_m, d.heading_deg,
                      g.bow_lon, g.bow_lat, g.stern_lon, g.stern_lat, round(d.peak_reflectance, 4),
                      round(d.contrast, 4), round(d.snr, 1), d.npix, d.confidence, int(bool(seen)), chip,
-                     d.length_err_m, d.width_err_m, d.method),
+                     d.length_err_m, d.width_err_m, d.method, d.wake_m),
                 )
                 added += 1
         return added

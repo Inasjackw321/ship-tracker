@@ -46,3 +46,33 @@ def test_uncertainties_are_honest(results):
 def test_hull_fit_is_used(results):
     _, rows = results
     assert np.mean([d.method == "fit" for _, _, d in rows]) > 0.9
+
+
+@pytest.fixture(scope="module")
+def moving():
+    """The same ships, every one under way with a bright wake 0.5-3x its length."""
+    cases = make_benchmark(wake_fraction=1.0)
+    return [(c, d) for c, d in zip(cases, run(cases)) if d is not None], len(cases)
+
+
+def test_moving_ships_are_found(moving):
+    rows, n = moving
+    assert len(rows) >= 0.9 * n  # a wake must not make a ship look like a soft-edged cloud
+
+
+def test_wakes_are_not_measured_as_hull(moving):
+    rows, _ = moving
+    dl = np.array([d.length_m - c["L"] for c, d in rows])
+    assert np.median(np.abs(dl)) < 10       # was ~17 m before wakes were modelled
+    assert np.percentile(np.abs(dl), 90) < 35  # was ~110 m
+    assert np.mean([d.wake_m > 0 for c, d in rows if c["L"] > 60]) > 0.6  # wakes are recognised
+
+
+def test_no_fake_supertankers(moving):
+    """Before wakes were modelled, most "300 m+" ships here were 150-250 m ships plus wake."""
+    rows, _ = moving
+    reported = [(c, d) for c, d in rows if d.length_m >= 300]
+    fake = [d for c, d in reported if c["L"] < 260]
+    assert len(fake) <= 0.1 * max(len(reported), 1)
+    real = [c for c, d in rows if c["L"] >= 320]
+    assert all(d.length_m >= 280 for c, d in rows if c["L"] >= 320) and real  # real VLCCs/ULCVs are kept

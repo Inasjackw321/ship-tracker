@@ -9,7 +9,7 @@ from scipy import ndimage
 SS = 10  # 1 m sub-pixels
 
 
-def render_ship(L, W, heading, dx, dy, size, rng):
+def render_ship(L, W, heading, dx, dy, size, rng, wake=None, wake_rng=None):
     """Excess-reflectance image (10 m pixels) of one ship with deck structure."""
     n = size * SS
     yy, xx = np.mgrid[0:n, 0:n] + 0.5
@@ -38,26 +38,41 @@ def render_ship(L, W, heading, dx, dy, size, rng):
         ln = rng.uniform(0.06, 0.12) * L
         sup = (s > pos) & (s < pos + ln) & (np.abs(t) <= hw * 0.9)
         img = np.where(sup, rng.uniform(0.2, 0.45), img)
+    if wake:
+        # turbulent wake behind the stern: bright foam that fades and spreads with distance
+        d = np.clip(-hl - s, 0, None)                 # metres behind the stern
+        wl = wake["length"]
+        spread = hw * (0.8 + 1.5 * d / max(wl, 1))
+        fade = np.exp(-d / (wl / 2.5))
+        texture = np.clip(ndimage.gaussian_filter(1 + wake_rng.normal(0, 5.0, d.shape), 15), 0.3, 1.7)
+        foam = (s < -hl) & (d < wl) & (np.abs(t) < spread)
+        img = img + np.where(foam, deck * wake["brightness"] * fade * texture, 0)
     small = img.reshape(size, SS, size, SS).mean(axis=(1, 3))
     return ndimage.gaussian_filter(small, 0.53)
 
 
-def make_benchmark(n=200, seed=42):
+def make_benchmark(n=200, seed=42, wake_fraction=0.0, wake_seed=7):
+    """``wake_fraction`` of the ships are moving and trail a wake 0.5-3x their length."""
     rng = np.random.default_rng(seed)
+    wrng = np.random.default_rng(wake_seed)  # separate stream: the ships themselves stay identical
     cases = []
     for _ in range(n):
         L = float(np.exp(rng.uniform(np.log(25), np.log(400))))
         W = float(np.clip(L / rng.uniform(4.5, 8.0), 6, 62))
         heading = float(rng.uniform(0, 180))
         dx, dy = rng.uniform(-0.5, 0.5, 2)
-        size = int(L / 10 * 1.5) + 40
+        wake = None
+        if wrng.random() < wake_fraction:
+            wake = {"length": L * wrng.uniform(0.5, 3.0), "brightness": wrng.uniform(0.3, 1.0)}
+        size = int(L / 10 * (1.5 + (2 * wake["length"] / L if wake else 0))) + 40
         size += size % 2
-        excess = render_ship(L, W, heading, dx, dy, size, rng)
+        excess = render_ship(L, W, heading, dx, dy, size, rng, wake, wrng)
         water = 0.012 + rng.uniform(0, 0.02)
         noise = rng.uniform(0.0015, 0.004)
-        refl = (water + excess + rng.normal(0, noise, excess.shape)).astype(np.float32)
+        noise_rng = np.random.default_rng(int(rng.integers(1 << 31)))  # image size must not shift later ships
+        refl = (water + excess + noise_rng.normal(0, noise, excess.shape)).astype(np.float32)
         truth_rc = (size / 2 - 0.5 + dy, size / 2 - 0.5 + dx)
-        cases.append(dict(refl=refl, L=L, W=W, heading=heading, rc=truth_rc))
+        cases.append(dict(refl=refl, L=L, W=W, heading=heading, rc=truth_rc, wake=wake))
     return cases
 
 
