@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ship Tracker</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --bg: #0f1419; --panel: #161c23; --line: #26303b; --text: #e6edf3; --muted: #8b98a5;
+    --accent: #39d353; --warn: #f0b429; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { display: flex; height: 100%; }
+  #side { width: 360px; min-width: 300px; background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; overflow: hidden; }
+  #map { flex: 1; }
+  header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+  section { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  section h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  label.inline { flex-direction: row; align-items: center; gap: 6px; }
+  input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font: inherit; width: 100%; }
+  input[type=checkbox] { width: auto; }
+  button { background: var(--accent); color: #04130a; border: 0; border-radius: 6px; padding: 8px 12px;
+    font: 600 13px system-ui, sans-serif; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .stat b { display: block; font-size: 18px; }
+  .stat span { font-size: 11px; color: var(--muted); }
+  #status { font: 11px/1.4 ui-monospace, monospace; color: var(--muted); white-space: pre-wrap;
+    max-height: 120px; overflow: auto; margin-top: 8px; }
+  #list { flex: 1; overflow: auto; padding: 0; margin: 0; list-style: none; }
+  #list li { display: flex; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  #list li:hover { background: #1c242d; }
+  #list img { width: 56px; height: 56px; border-radius: 4px; object-fit: cover; background: #000; }
+  #list .len { font-weight: 600; }
+  #list .meta { font-size: 12px; color: var(--muted); }
+  .tag { font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #3a2f12; color: var(--warn); margin-left: 4px; }
+  .popup img { width: 300px; height: 300px; display: block; border-radius: 4px; background: #000; }
+  .popup table { margin-top: 6px; font-size: 12px; border-collapse: collapse; }
+  .popup td { padding: 1px 8px 1px 0; }
+  .popup td:first-child { color: #666; }
+  .ruler-label { background: #000c; color: #fff; border: 0; box-shadow: none; font-weight: 600; padding: 1px 5px; }
+  .ruler-label::before { display: none; }
+  .legend { background: #000b; color: #fff; padding: 6px 8px; border-radius: 6px; font-size: 12px; line-height: 1.7; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  @media (max-width: 760px) {
+    #app { flex-direction: column-reverse; }
+    #side { width: 100%; height: 50%; border-right: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <header>
+      <h1>Ship Tracker</h1>
+      <p>Sentinel-2 ship detection &amp; sizing · Hormuz / Gulf of Oman / Arabian Sea</p>
+    </header>
+    <section>
+      <div class="stats">
+        <div class="stat"><b id="s-ships">–</b><span>ships</span></div>
+        <div class="stat"><b id="s-scenes">–</b><span>tiles analysed</span></div>
+        <div class="stat"><b id="s-shown">–</b><span>shown</span></div>
+      </div>
+    </section>
+    <section>
+      <h2>Download &amp; scan imagery</h2>
+      <div class="grid">
+        <label>From <input type="date" id="scan-start"></label>
+        <label>To <input type="date" id="scan-end"></label>
+        <label>Max cloud % <input type="number" id="scan-cloud" value="30" min="0" max="100"></label>
+        <label>Max tiles <input type="number" id="scan-limit" placeholder="all" min="1"></label>
+      </div>
+      <div class="row"><button id="scan-btn">Scan</button><span id="scan-state" class="meta"></span></div>
+      <div id="status"></div>
+    </section>
+    <section>
+      <h2>Filter</h2>
+      <div class="grid">
+        <label>From <input type="date" id="f-start"></label>
+        <label>To <input type="date" id="f-end"></label>
+        <label>Min length (m) <input type="number" id="f-min" value="0" min="0"></label>
+        <label>Max length (m) <input type="number" id="f-max" placeholder="any" min="0"></label>
+        <label>Min confidence <input type="number" id="f-conf" value="0" min="0" max="1" step="0.1"></label>
+        <label class="inline"><input type="checkbox" id="f-stat" checked> show stationary</label>
+      </div>
+      <div class="row"><button class="ghost" id="f-apply">Apply</button></div>
+    </section>
+    <ul id="list"></ul>
+  </aside>
+  <div id="map"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

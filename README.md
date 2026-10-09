@@ -1,196 +1,91 @@
-# Ship Tracker - Ireland
+# Ship Tracker: Sentinel-2 ship detection and sizing
 
-A real-time and historical ship tracking system focused on maritime traffic around Ireland. This application tracks all ships in Irish waters using AIS (Automatic Identification System) data and maintains a historical database of ship movements.
+This tool finds ships at sea in free **Sentinel-2** satellite imagery and measures each one: length, beam and hull axis. You get the same kind of number as laying the Google Maps ruler bow to stern. It covers the **Strait of Hormuz, the Gulf of Oman and the Arabian Sea** (`config/aoi.geojson`). Results are stored in SQLite and shown on a web map, with an image chip of every ship that has a ruler drawn along the hull.
 
-## Features
-
-- **Real-time Tracking**: Monitor current ship positions in Irish waters
-- **Historical Tracking**: View ship movements over time (hours, days, weeks)
-- **Individual Ship History**: Track specific vessels and their routes
-- **Interactive Map**: Visual representation using OpenStreetMap
-- **Ship Information**: View detailed ship data including:
-  - MMSI (Maritime Mobile Service Identity)
-  - Ship name and type
-  - Speed, course, and heading
-  - Destination and ETA
-  - Physical dimensions
-
-## Technology Stack
-
-- **Backend**: Node.js, TypeScript, Express
-- **Database**: SQLite3 for historical data storage
-- **Frontend**: HTML, CSS, JavaScript, Leaflet.js for maps
-- **Data Source**: AIS data (AISHub API with fallback to mock data)
-
-## Installation
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd ship-tracker
+```
+STAC search ──► download tiles ──► sea/cloud masks ──► bright-hull detection ──► measure ──► SQLite ──► web map
+(Earth Search)  (SCL, B08, TCI)    (SCL + NIR)          (local CFAR, NIR B08)    (profiles)             + chips
 ```
 
-2. Install dependencies:
-```bash
-npm install
-```
-
-3. (Optional) Set up AISHub API key:
-```bash
-export AISHUB_API_KEY=your_api_key_here
-```
-
-> **Note**: The application works without an API key using mock data for testing. For real ship data, register for a free API key at [AISHub](https://www.aishub.net/).
-
-## Usage
-
-### Start the Full Application
-
-Run both the tracker and web server:
+## Quick start
 
 ```bash
-npm run build
-npm start
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# list available imagery over the area for the last 5 days (no download)
+.venv/bin/python -m shiptracker search --days 5
+
+# download tiles and detect ships (newest 10 tiles in the last 5 days)
+.venv/bin/python -m shiptracker scan --days 5 --limit 10
+
+# open the map at http://127.0.0.1:8000
+.venv/bin/python -m shiptracker serve
 ```
 
-Then open your browser to `http://localhost:3000`
+You can also start scans from the web page: pick dates and click **Scan**. Progress shows live and ships appear on the map as each tile finishes.
 
-### Development Mode
+You don't need any accounts or API keys. Imagery comes from the public [Element 84 Earth Search](https://earth-search.aws.element84.com/v1) catalogue (`sentinel-2-c1-l2a` on AWS). Add `--source planetary-computer` to use Microsoft Planetary Computer instead; it signs URLs anonymously.
 
-For development with auto-reload:
+## Commands
+
+| Command | What it does |
+|---|---|
+| `search [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
+| `scan  [same] [--limit N] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store |
+| `watch [--every-hours 6] [--days 3]` | Keep scanning for new passes |
+| `serve [--host --port]` | Web map and JSON API |
+| `detect B08.tif SCL.tif [--rgb TCI.tif --chips DIR]` | Run detection on GeoTIFFs you already have |
+
+Global options are `--data DIR` (default `./data`), `--aoi file.geojson` and `--source earth-search|planetary-computer`.
+
+### What gets downloaded
+
+For each tile (an MGRS square about 110 × 110 km), files go to `data/tiles/<scene-id>/`:
+
+1. **`SCL.tif`** (20 m scene classification, a few MB). This is checked first. A tile with no cloud-free sea inside the area is marked *skipped* and nothing else is downloaded.
+2. **`B08.tif`** (10 m near-infrared, roughly 100–200 MB). Detection runs on this band.
+3. **`TCI.tif`** (10 m true colour). This is downloaded only when ships were found, and only for the image chips. Pass `--no-rgb` to skip it; chips then use the NIR band.
+
+Downloads resume after an interruption (`.part` files with HTTP Range) and are retried with backoff. A scene that has already been processed is never processed again, so you can re-run `scan` safely. `--delete-tiles` removes each tile once it is processed, so disk use stays small.
+
+## How detection and measurement work (`shiptracker/detect.py`)
+
+1. **Sea mask.** Pixels count as sea if SCL calls them water or their NIR reflectance is very dark. Small enclosed non-water blobs are filled back in, because SCL often labels the ships themselves as cloud or land. A 30 m coastal buffer is removed, as are SCL clouds and cloud shadows plus 100 m around them. Cloud blobs the size of a ship are not treated as cloud.
+2. **Candidates.** In the 10 m NIR band, open water is near zero and hulls are bright. Each pixel is compared with the mean and standard deviation of the water around it (a 610 m window). It must be at least 5σ brighter and at least 0.025 reflectance brighter. This is computed in two passes, the second leaving out first-pass hits, and copes with sun glint gradients.
+3. **Hull extraction.** Each candidate is grown to every connected pixel brighter than 25 % of its peak, so the whole hull is captured rather than just the brightest part.
+4. **Measurement.** PCA gives the hull axis. The image is resampled onto a grid aligned with the hull, and the along-hull and across-hull brightness profiles give **length and beam**. Each end is placed where the profile drops to 30 % of the typical deck level, and the 10 m sensor blur is corrected for. The deck level is a median rather than the peak, so a bright superstructure does not cut off the bow. The hull axis is reported as a true-north bearing (0–180°, since bow and stern can't be told apart).
+5. **Filters.** Length must be 25–500 m and beam ≤ 90 m. Objects ≥ 50 m must be at least twice as long as they are wide, which rejects cloud puffs. A confidence score combines contrast, elongation and size.
+6. **Bookkeeping.**
+   - A ship seen in two overlapping tiles of the same satellite pass is stored once.
+   - A detection at the same spot on another date is flagged **stationary**: oil platforms, anchored ships or islets. The map can hide these.
+
+**Accuracy.** On synthetic ships rendered with the Sentinel-2 10 m point-spread function, measured length is within about 5 % for 35–400 m vessels, e.g. a 121.5 m ship measures 116–122 m, and the hull axis is within 2°. Real-world error will be larger, roughly ±10–20 m. Causes include hull paint and cargo, wakes, and ships under 30 m that are only 2–3 pixels long. Beam is less reliable than length because most beams are only 2–5 pixels.
+
+## Coverage caveat
+
+Sentinel-2 does **not** image the whole open ocean. It images land, coastal water out to about 20 km, enclosed seas and some extra areas. The Strait of Hormuz, the Gulf of Oman and the coastal strips are covered regularly, about every 5 days. Much of the central Arabian Sea is rarely or never imaged. `search` shows what is actually available, and the **Tile footprints** layer on the map shows what has been analysed.
+
+## API
+
+| Endpoint | |
+|---|---|
+| `GET /api/detections?start=&end=&min_length=&max_length=&min_confidence=&stationary=0\|1` | GeoJSON of ships: length/width/heading, bow and stern points, chip URL |
+| `GET /api/scenes` | Processed tiles with status and footprint |
+| `GET /api/stats` | Counts |
+| `GET /api/aoi` | Search area polygon |
+| `POST /api/scan` `{start, end, max_cloud, limit}` / `GET /api/scan` | Start a background scan or check its progress |
+| `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
+
+## Changing the area
+
+Edit `config/aoi.geojson` (lon, lat order) or pass `--aoi other.geojson`. The default polygon traces the hand-drawn region. It can overlap land because land is masked automatically.
+
+## Tests
 
 ```bash
-npm run dev
+.venv/bin/pip install pytest
+.venv/bin/python -m pytest -q
 ```
 
-### Run Tracker Only
-
-To run only the background ship tracker (without the web interface):
-
-```bash
-npm run track
-```
-
-## API Endpoints
-
-### Get Current Ships
-```
-GET /api/ships/current
-```
-Returns all ships detected in the last hour.
-
-### Get Historical Ships
-```
-GET /api/ships/history?start=<timestamp>&end=<timestamp>
-```
-Returns all ship positions within the specified time range.
-
-### Get Ship History by MMSI
-```
-GET /api/ships/:mmsi/history?start=<timestamp>&end=<timestamp>
-```
-Returns the movement history for a specific ship.
-
-### Get All Tracked Ships
-```
-GET /api/ships/list
-```
-Returns a list of all unique ship MMSIs in the database.
-
-### Health Check
-```
-GET /api/health
-```
-Returns server status.
-
-## Geographic Coverage
-
-The tracker focuses on Irish waters with the following bounding box:
-- North: 55.5°
-- South: 51.0°
-- West: -11.0°
-- East: -5.5°
-
-This covers:
-- Republic of Ireland coastline
-- Northern Ireland coastline
-- Irish Sea
-- Celtic Sea (western approaches)
-- North Atlantic approaches
-
-## How It Works
-
-1. **Data Collection**: The tracker fetches AIS data every 5 minutes (configurable)
-2. **Storage**: Ship positions are stored in SQLite with timestamps
-3. **API**: Express server exposes REST endpoints for querying data
-4. **Visualization**: Web frontend displays ships on an interactive map
-
-## Configuration
-
-You can configure the tracker in `src/tracker.ts`:
-
-- `updateIntervalMs`: How often to fetch new data (default: 300000ms = 5 minutes)
-- Database path: Default is `./data/ships.db`
-
-## Database Schema
-
-```sql
-CREATE TABLE ship_positions (
-  id INTEGER PRIMARY KEY,
-  mmsi TEXT NOT NULL,
-  name TEXT,
-  latitude REAL NOT NULL,
-  longitude REAL NOT NULL,
-  speed REAL,
-  course REAL,
-  heading REAL,
-  timestamp INTEGER NOT NULL,
-  ship_type TEXT,
-  destination TEXT,
-  eta TEXT,
-  draught REAL,
-  length REAL,
-  width REAL,
-  UNIQUE(mmsi, timestamp)
-);
-```
-
-## Web Interface Features
-
-### Current View
-- Displays all ships currently in Irish waters
-- Real-time updates every 5 minutes
-- Click on ship markers for detailed information
-
-### Historical View
-- Select time ranges: 1 hour, 6 hours, 24 hours, or 7 days
-- View ship movement tracks with start/end markers
-- Filter by specific ship MMSI
-
-### Ship List
-- Sidebar shows all detected ships
-- Click to focus on a specific ship
-- Color-coded by ship type:
-  - Orange: Cargo
-  - Red: Tanker
-  - Green: Passenger
-  - Blue: Fishing
-  - Gray: Unknown
-
-## Future Enhancements
-
-- Real-time WebSocket updates
-- Ship search by name
-- Port information and geofencing
-- Weather overlay
-- Traffic density heatmaps
-- Export data to CSV/GeoJSON
-- Email/SMS alerts for specific ships
-
-## License
-
-MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+`tests/test_detect.py` checks detection and length accuracy on synthetic ships, and checks for no false alarms on empty sea, land and cloud. `tests/test_pipeline.py` runs the whole chain end to end: a local HTTP server plays the STAC API and the imagery bucket, and the test checks search with pagination, tile download, detection, de-duplication across tiles, chips and the web API.
