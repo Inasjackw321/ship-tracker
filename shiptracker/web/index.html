@@ -29,7 +29,6 @@
   #tray-cards[hidden] { display: none; }
   .card { position: relative; flex: 0 0 150px; background: var(--panel); border: 1px solid var(--line);
     border-radius: 6px; padding: 6px; font-size: 12px; }
-  .card.s3 { border-color: #7b4bb3; }
   .card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #000; cursor: pointer; display: block; }
   .card .t { font-weight: 600; margin-top: 4px; }
   .card .meta { color: var(--muted); }
@@ -62,7 +61,7 @@
   button:disabled { opacity: .5; cursor: default; }
   button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
   .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
   .stat b { display: block; font-size: 18px; }
   .stat span { font-size: 11px; color: var(--muted); }
@@ -102,7 +101,6 @@
         <div class="stat"><b id="s-ships">–</b><span>ships</span></div>
         <div class="stat"><b id="s-scenes">–</b><span>tiles analysed</span></div>
         <div class="stat"><b id="s-shown">–</b><span>shown</span></div>
-        <div class="stat" title="Possible large ships spotted by Sentinel-3 (300 m) at open sea; size not measurable"><b id="s-s3">–</b><span>open-sea (S3)</span></div>
         <div class="stat" title="Share of the search area Sentinel-2 photographed in the last scan's date window"><b id="s-imaged">–</b><span>area imaged</span></div>
       </div>
     </section>
@@ -115,7 +113,6 @@
         <label>Max tiles <input type="number" id="scan-limit" placeholder="all" min="1"></label>
         <label class="inline" title="Off: most recent usable image of every tile. On: every satellite pass in the date range."><input type="checkbox" id="scan-all"> every pass</label>
         <label class="inline" title="Scan only the priority regions (dashed yellow). They are always scanned first."><input type="checkbox" id="scan-priority"> priority regions only</label>
-        <label class="inline" title="Check open sea that Sentinel-2 never images with Sentinel-3 (300 m): finds large ships only, without size"><input type="checkbox" id="scan-s3" checked> Sentinel-3 open sea</label>
       </div>
       <div class="row"><button id="scan-btn">Scan</button><span id="scan-state" class="meta"></span></div>
       <div id="status"></div>

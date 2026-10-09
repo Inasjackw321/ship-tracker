@@ -70,24 +70,12 @@ def main() -> int:
     ap.add_argument("--keep-tiles", action="store_true",
                     help="keep downloaded tiles (default: delete each after processing; chips are kept)")
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
-    ap.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
-    ap.add_argument("--s3-days", type=int, default=7, help="Sentinel-3 look-back in days (default 7)")
-    ap.add_argument("--cdse-login", action="store_true",
-                    help="save your free Copernicus Data Space login, used for Sentinel-3, and exit")
-    ap.add_argument("--s3-check", action="store_true",
-                    help="test Sentinel-3 step by step (search, download, read, detect) and exit")
     ap.add_argument("--priority-only", action="store_true",
                     help="scan only the priority regions in config/priority.geojson (they are always scanned first)")
     ap.add_argument("--no-scan", action="store_true", help="don't scan, just open the map")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
-    if args.cdse_login:
-        from shiptracker.__main__ import main as cli
-        return cli(["cdse-login"])
-    if args.s3_check:
-        from shiptracker.__main__ import main as cli
-        return cli(["s3-check", "--days", str(args.s3_days)])
 
     import logging
     from datetime import date, timedelta
@@ -117,9 +105,7 @@ def main() -> int:
             "all_passes": args.all_passes,
             "workers": args.workers,
             "keep_tiles": args.keep_tiles,
-            "sentinel3": not args.no_s3,
             "priority_only": args.priority_only,
-            "s3_days": args.s3_days,
         }
         resp = app.test_client().post("/api/scan", json=body)
         if resp.status_code != 202:

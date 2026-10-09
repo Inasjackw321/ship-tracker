@@ -14,9 +14,9 @@ py run.py          # Windows (or double-click run.bat)
 python3 run.py     # macOS / Linux
 ```
 
-The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the **whole area**. Every Sentinel-2 tile uses its most recent usable image from the last 30 days. Open sea that Sentinel-2 never photographs is then checked with Sentinel-3. Ships appear on the map as each tile finishes.
+The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the **whole area**. Every Sentinel-2 tile uses its most recent usable image from the last 30 days. Ships appear on the map as each tile finishes.
 
-Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). Useful options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes`, `--no-s3`, `--keep-tiles` and `--no-scan`.
+Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). Useful options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes`, `--priority-only`, `--keep-tiles` and `--no-scan`.
 
 ## Manual setup
 
@@ -88,18 +88,6 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 
 When the detector changes, tiles analysed by an older version are redone automatically on the next scan. Their old results are replaced.
 
-### Open sea: Sentinel-3 (`shiptracker/s3.py`)
-
-Sentinel-2 does not photograph most of the open Arabian Sea. After the Sentinel-2 part of a scan, the remaining sea is checked with **Sentinel-3 OLCI**. This is the 300 m full-resolution water product, from the last 7 days, from Copernicus Data Space (free login) or Microsoft Planetary Computer, as described below. The newest image of each part of that sea is used.
-
-A 300 m pixel is larger than any ship, so this is a different, weaker kind of detection:
-
-- **Detected:** a large ship (roughly 150 m and up, in clear sky) brightens its pixel in the 865 nm band enough to stand out as an isolated **bright speck**, often helped by its wake. Specks are rejected if they are larger than about 6 pixels (cloud or land), close to land, or surrounded by cloud or clutter.
-- **Size:** **cannot be measured**, and position is good to about ±300 m. Small ships are invisible.
-- **On the map:** these show as purple rings labelled *possible large ship (Sentinel-3)*, in their own layer and with their own image chips.
-
-Each image downloads about 100–150 MB: the 865 nm band, latitude/longitude and quality flags. Turn this off with `--no-s3`, or untick it in the scan form.
-
 ## Covering the whole area
 
 By default a scan uses the **most recent usable image of each MGRS tile** within the look-back window (30 days):
@@ -124,14 +112,12 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/scenes` | Processed tiles with status and footprint |
 | `GET /api/stats` | Counts |
 | `GET /api/aoi` | Search area polygon |
-| `GET /api/s3/detections?view=latest\|all`, `GET /api/s3/granules` | Sentinel-3 possible large ships (no size) and the images used |
 | `GET /api/coverage` | Imaged and not-imaged parts of the area from the last scan's search |
 | `POST /api/scan` `{start, end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
 | `GET /api/detections/<id>/image.png[?dl=1]` | Ship image with coordinates printed on it (and in its metadata) |
 | `GET /api/detections/<id>/image.tif` | Georeferenced GeoTIFF of the ship chip |
-| `GET /api/s3/detections/<id>/image.png[?dl=1]` | Same for a Sentinel-3 possible large ship |
-| `POST /api/download.zip` `{s2: [ids], s3: [ids]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
+| `POST /api/download.zip` `{ids: [...]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
 
 ## Opening several ships, copying coordinates, downloading images
 
@@ -148,54 +134,16 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 
 `config/priority.geojson` lists the regions, and a scan works through them **one at a time**:
 
-1. **Gulf of Oman mouth**: Ras al Hadd to Gwadar and south to about 19.5° N. This is mostly open sea, so it relies largely on Sentinel-3.
+1. **Gulf of Oman mouth**: Ras al Hadd to Gwadar and south to about 19.5° N. Much of it is open sea that Sentinel-2 rarely photographs; only the parts it does image can be scanned (see the dark *Not imaged* shading).
 2. **Strait of Hormuz**: Bandar Abbas, Musandam, the UAE east coast and the western Gulf of Oman.
 3. **Gulf of Oman and Makran coast**: Muscat to near Karachi.
 4. **The rest of the search area.**
 
-Each region is **finished completely before the next one starts**:
-
-1. Its Sentinel-2 tiles.
-2. Older passes for any tile whose newest image was cloud.
-3. Sentinel-3 for the part of it that Sentinel-2 doesn't photograph.
+Each region is **finished completely before the next one starts**: first its Sentinel-2 tiles, then older passes for any tile whose newest image was cloud.
 
 Even with several tiles downloading in parallel, nothing from a later region begins early. The log shows `=== Phase 1/4: … ===` and `=== Phase 1/4 done ===`.
 
 `py run.py --priority-only` stops after the priority regions. Edit the file, or set `SHIPTRACKER_PRIORITY`, to change the regions. Lower `order` values come first. The regions are always included in the search area. The map opens zoomed to them and draws them as dashed yellow outlines.
-
-## Sentinel-3 sources and login
-
-Two sources are supported. With the default `auto`, the scan uses Copernicus Data Space when a login is saved, and Planetary Computer otherwise.
-
-| Source | Account | How current |
-|---|---|---|
-| **Copernicus Data Space** (ESA, official) | free login needed to download | near-real-time images within hours, reprocessed ones a few days later |
-| Microsoft Planetary Computer | none | may lag far behind, or have no recent images at all |
-
-To set up Copernicus once:
-
-1. Register at <https://dataspace.copernicus.eu>. It's free.
-2. Run:
-
-   ```
-   py run.py --cdse-login
-   ```
-
-It asks for your e-mail and password and checks them. It then saves them on your computer in `data/cdse.json`, which is never committed; you can use the `CDSE_USERNAME` / `CDSE_PASSWORD` environment variables instead. Each sensing time exists twice on Copernicus, near-real-time (`_NR_`) and reprocessed (`_NT_`); the reprocessed one is used when available. Only the three files needed are downloaded, not the whole ~700 MB product. Force a source with `--s3-source cdse` or `--s3-source planetary-computer`.
-
-## If Sentinel-3 finds nothing
-
-```
-py run.py --s3-check
-```
-
-This prints:
-
-- The date of the newest Sentinel-3 image Planetary Computer has, anywhere and over the first priority region.
-- How many images Copernicus has there. Its catalogue needs no login.
-- Then, through the source that will actually be used, OK or the exact error for each step: login, search, downloading the three files, reading reflectance, flags and coordinates, and detection.
-
-A scan looks back 7 days (`--s3-days 14` to change this) and uses the newest image of each part of the sea.
 
 ## Changing the area
 

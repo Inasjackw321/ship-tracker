@@ -7,7 +7,7 @@
     "name": "Gulf of Oman mouth (Ras al Hadd to Gwadar)",
     "order": 1,
     "exclusive": true,
-    "note": "Traced from a hand-drawn sketch, widened ~10 km. Scanned completely (Sentinel-2 and Sentinel-3) before anything else starts."
+    "note": "Traced from a hand-drawn sketch, widened ~10 km. Scanned completely before anything else starts."
    },
    "geometry": {
     "type": "Polygon",

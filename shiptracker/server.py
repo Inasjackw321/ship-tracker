@@ -84,31 +84,17 @@ def create_app(settings: Settings | None = None) -> Flask:
             rows = [r for r in rows if r["id"] in ids]
         return jsonify(rows)
 
-    @app.get("/api/s3/detections")
-    def s3_detections():
-        ids = set(store.get_meta("s3_current", [])) if latest_view() else None
-        rows = store.s3_detections(ids, request.args.get("start") or None, request.args.get("end") or None)
-        return jsonify({"type": "FeatureCollection", "features": [_feature(r) for r in rows]})
-
-    @app.get("/api/s3/granules")
-    def s3_granules():
-        rows = store.s3_granules()
-        if latest_view():
-            ids = set(store.get_meta("s3_current", []))
-            rows = [r for r in rows if r["id"] in ids]
-        return jsonify(rows)
-
-    def _png_response(kind: str, rec: dict | None) -> Response:
+    def _png_response(rec: dict | None) -> Response:
         if rec is None:
             abort(404)
-        name = file_stem(kind, rec) + ".png"
+        name = file_stem(rec) + ".png"
         disposition = "attachment" if request.args.get("dl") else "inline"
-        return Response(annotated_png(kind, rec, settings.chips_dir), mimetype="image/png",
+        return Response(annotated_png(rec, settings.chips_dir), mimetype="image/png",
                         headers={"Content-Disposition": f'{disposition}; filename="{name}"'})
 
     @app.get("/api/detections/<int:det_id>/image.png")
     def detection_png(det_id: int):
-        return _png_response("s2", store.get_detection(det_id))
+        return _png_response(store.get_detection(det_id))
 
     @app.get("/api/detections/<int:det_id>/image.tif")
     def detection_tif(det_id: int):
@@ -117,24 +103,19 @@ def create_app(settings: Settings | None = None) -> Flask:
         if tif is None:
             abort(404, "No GeoTIFF saved for this ship (detected before GeoTIFFs were added)")
         return send_file(tif, mimetype="image/tiff", as_attachment=True,
-                         download_name=file_stem("s2", rec) + ".tif")
-
-    @app.get("/api/s3/detections/<int:det_id>/image.png")
-    def s3_detection_png(det_id: int):
-        return _png_response("s3", store.get_s3_detection(det_id))
+                         download_name=file_stem(rec) + ".tif")
 
     @app.post("/api/download.zip")
     def download_zip():
         body = request.get_json(silent=True) or {}
         try:
-            s2 = [r for r in (store.get_detection(int(i)) for i in body.get("s2", [])[:500]) if r]
-            s3 = [r for r in (store.get_s3_detection(int(i)) for i in body.get("s3", [])[:500]) if r]
+            ships = [r for r in (store.get_detection(int(i)) for i in body.get("ids", body.get("s2", []))[:500]) if r]
         except (TypeError, ValueError):
             abort(400, "ids must be integers")
-        if not s2 and not s3:
+        if not ships:
             abort(400, "nothing selected")
-        return Response(bundle_zip(s2, s3, settings.chips_dir), mimetype="application/zip",
-                        headers={"Content-Disposition": f'attachment; filename="ships_{len(s2) + len(s3)}.zip"'})
+        return Response(bundle_zip(ships, settings.chips_dir), mimetype="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="ships_{len(ships)}.zip"'})
 
     @app.get("/api/priority")
     def priority():
@@ -180,9 +161,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 keep_tiles=bool(body.get("keep_tiles", True)),
                 mode="all" if body.get("all_passes") else "latest",
                 workers=int(body.get("workers", 3)),
-                sentinel3=bool(body.get("sentinel3", True)),
                 priority_only=bool(body.get("priority_only", False)),
-                s3_days=int(body.get("s3_days", 7)),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

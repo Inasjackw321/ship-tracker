@@ -42,43 +42,31 @@ def coord_dms(lat: float, lon: float) -> str:
     return f"{dms(lat, 'N', 'S')}  {dms(lon, 'E', 'W')}"
 
 
-def file_stem(kind: str, rec: dict) -> str:
+def file_stem(rec: dict) -> str:
     lat, lon = rec["lat"], rec["lon"]
     ns, ew = ("N" if lat >= 0 else "S"), ("E" if lon >= 0 else "W")
-    size = f"_{rec['length_m']:.0f}m" if kind == "s2" else "_S3"
-    return f"ship_{abs(lat):.5f}{ns}_{abs(lon):.5f}{ew}_{rec['datetime'][:10]}{size}"
+    return f"ship_{abs(lat):.5f}{ns}_{abs(lon):.5f}{ew}_{rec['datetime'][:10]}_{rec['length_m']:.0f}m"
 
 
-def _lines(kind: str, rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int, tuple]]]:
+def _lines(rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int, tuple]]]:
     when = rec["datetime"].replace("T", " ")[:16] + " UTC"
-    if kind == "s2":
-        axis = rec.get("heading_deg") or 0.0
-        header = [
-            (f"Ship  {rec['length_m']:.0f} m x {rec['width_m']:.0f} m   hull axis {axis:.0f}° / {(axis + 180) % 360:.0f}°", 20, FG),
-            (f"{when}   Sentinel-2 (10 m)   {rec['scene_id']}", 13, MUTED),
-        ]
-        footer = [
-            (coord_text(rec["lat"], rec["lon"]), 26, ACCENT),
-            (coord_dms(rec["lat"], rec["lon"]), 16, FG),
-        ]
-        if rec.get("bow_lat") is not None:
-            footer.append((f"Hull ends: {coord_text(rec['stern_lat'], rec['stern_lon'])}  to  "
-                           f"{coord_text(rec['bow_lat'], rec['bow_lon'])}", 13, MUTED))
-        footer.append((f"Confidence {rec['confidence'] * 100:.0f}%   SNR {rec['snr']}   (WGS84 lat, lon)", 13, MUTED))
-    else:
-        header = [
-            ("Possible large ship (bright speck)", 20, FG),
-            (f"{when}   Sentinel-3 OLCI (300 m): size not measurable", 13, MUTED),
-        ]
-        footer = [
-            (coord_text(rec["lat"], rec["lon"]), 26, ACCENT),
-            (coord_dms(rec["lat"], rec["lon"]) + "   (± ~300 m)", 16, FG),
-            (f"Confidence {rec['confidence'] * 100:.0f}%   SNR {rec['snr']}   {rec['granule_id'][:60]}", 13, MUTED),
-        ]
+    axis = rec.get("heading_deg") or 0.0
+    header = [
+        (f"Ship  {rec['length_m']:.0f} m x {rec['width_m']:.0f} m   hull axis {axis:.0f}° / {(axis + 180) % 360:.0f}°", 20, FG),
+        (f"{when}   Sentinel-2 (10 m)   {rec['scene_id']}", 13, MUTED),
+    ]
+    footer = [
+        (coord_text(rec["lat"], rec["lon"]), 26, ACCENT),
+        (coord_dms(rec["lat"], rec["lon"]), 16, FG),
+    ]
+    if rec.get("bow_lat") is not None:
+        footer.append((f"Hull ends: {coord_text(rec['stern_lat'], rec['stern_lon'])}  to  "
+                       f"{coord_text(rec['bow_lat'], rec['bow_lon'])}", 13, MUTED))
+    footer.append((f"Confidence {rec['confidence'] * 100:.0f}%   SNR {rec['snr']}   (WGS84 lat, lon)", 13, MUTED))
     return header, footer
 
 
-def annotated_png(kind: str, rec: dict, chips_dir: Path) -> bytes:
+def annotated_png(rec: dict, chips_dir: Path) -> bytes:
     """The ship's image chip framed with its coordinates, as PNG bytes."""
     chip_path = chips_dir / rec["chip"].replace("\\", "/") if rec.get("chip") else None
     if chip_path is not None and chip_path.exists():
@@ -87,7 +75,7 @@ def annotated_png(kind: str, rec: dict, chips_dir: Path) -> bytes:
         chip = Image.new("RGB", (360, 360), (0, 0, 0))
     chip = chip.resize((WIDTH, round(chip.height * WIDTH / chip.width)), Image.LANCZOS)
 
-    header, footer = _lines(kind, rec)
+    header, footer = _lines(rec)
     pad = 12
     h_head = pad + sum(size + 8 for _, size, _ in header) + pad // 2
     h_foot = pad + sum(size + 8 for _, size, _ in footer) + pad // 2
@@ -120,28 +108,26 @@ def geotiff_path(rec: dict, chips_dir: Path) -> Path | None:
     return p if p.exists() else None
 
 
-def bundle_zip(s2: list[dict], s3: list[dict], chips_dir: Path) -> bytes:
+def bundle_zip(recs: list[dict], chips_dir: Path) -> bytes:
     """Zip of annotated PNGs (+ GeoTIFFs where saved), coordinates.csv and ships.kml."""
     buf = io.BytesIO()
     rows = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for kind, recs in (("s2", s2), ("s3", s3)):
-            for rec in recs:
-                stem = file_stem(kind, rec)
-                z.writestr(f"{stem}.png", annotated_png(kind, rec, chips_dir))
-                tif = geotiff_path(rec, chips_dir) if kind == "s2" else None
-                if tif:
-                    z.write(tif, f"{stem}.tif")
-                rows.append({
-                    "type": "Sentinel-2 ship" if kind == "s2" else "Sentinel-3 possible large ship",
-                    "latitude": f"{rec['lat']:.6f}", "longitude": f"{rec['lon']:.6f}",
-                    "coordinates": coord_text(rec["lat"], rec["lon"]),
-                    "coordinates_dms": coord_dms(rec["lat"], rec["lon"]),
-                    "length_m": rec.get("length_m", ""), "beam_m": rec.get("width_m", ""),
-                    "hull_axis_deg": rec.get("heading_deg", ""),
-                    "datetime_utc": rec["datetime"], "image": rec.get("scene_id") or rec.get("granule_id"),
-                    "file": f"{stem}.png",
-                })
+        for rec in recs:
+            stem = file_stem(rec)
+            z.writestr(f"{stem}.png", annotated_png(rec, chips_dir))
+            tif = geotiff_path(rec, chips_dir)
+            if tif:
+                z.write(tif, f"{stem}.tif")
+            rows.append({
+                "latitude": f"{rec['lat']:.6f}", "longitude": f"{rec['lon']:.6f}",
+                "coordinates": coord_text(rec["lat"], rec["lon"]),
+                "coordinates_dms": coord_dms(rec["lat"], rec["lon"]),
+                "length_m": rec["length_m"], "beam_m": rec["width_m"],
+                "hull_axis_deg": rec.get("heading_deg", ""),
+                "datetime_utc": rec["datetime"], "image": rec["scene_id"],
+                "file": f"{stem}.png",
+            })
         out = io.StringIO()
         if rows:
             w = csv.DictWriter(out, fieldnames=list(rows[0]))
@@ -155,9 +141,9 @@ def bundle_zip(s2: list[dict], s3: list[dict], chips_dir: Path) -> bytes:
 def _kml(rows: list[dict]) -> str:
     marks = []
     for r in rows:
-        size = f"{float(r['length_m']):.0f} m x {float(r['beam_m']):.0f} m" if r["length_m"] != "" else "size n/a"
+        size = f"{float(r['length_m']):.0f} m x {float(r['beam_m']):.0f} m"
         marks.append(
-            f"<Placemark><name>{escape(size)}</name><description>{escape(r['type'])}, "
+            f"<Placemark><name>{escape(size)}</name><description>Ship, "
             f"{escape(r['datetime_utc'])}, {escape(r['coordinates'])}</description>"
             f"<Point><coordinates>{r['longitude']},{r['latitude']},0</coordinates></Point></Placemark>")
     return ('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'

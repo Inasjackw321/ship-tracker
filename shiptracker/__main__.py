@@ -33,8 +33,6 @@ def _settings(args) -> Settings:
         s.aoi_path = Path(args.aoi)
     if args.source:
         s.source = args.source
-    if getattr(args, "s3_source", None):
-        s.s3_source = args.s3_source
     return s
 
 
@@ -43,8 +41,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data", help="data directory (tiles, chips, database)")
     ap.add_argument("--aoi", help="AOI GeoJSON (default: config/aoi.geojson)")
     ap.add_argument("--source", choices=sorted(SOURCES), help="imagery source (default: earth-search)")
-    ap.add_argument("--s3-source", choices=["auto", "cdse", "planetary-computer"],
-                    help="Sentinel-3 source (default auto: Copernicus Data Space when logged in)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -61,15 +57,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all-passes", action="store_true",
                    help="scan every pass in the date range, not just the newest image of each tile")
     p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
-    p.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
-    p.add_argument("--s3-days", type=int, default=7, help="Sentinel-3 look-back in days (default 7)")
     p.add_argument("--priority-only", action="store_true", help="scan only the priority regions")
 
     p = sub.add_parser("watch", help="scan for new imagery repeatedly")
     p.add_argument("--every-hours", type=float, default=6.0)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--days", type=int, default=30, help="look-back window on each run")
-    p.add_argument("--no-s3", action="store_true")
     p.add_argument("--max-cloud", type=float, default=30.0)
     p.add_argument("--no-rgb", action="store_true")
     p.add_argument("--delete-tiles", action="store_true")
@@ -81,11 +74,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", type=float, default=1e-4)
     p.add_argument("--offset", type=float, default=-0.1, help="-0.1 for processing baseline >= 04.00, else 0")
     p.add_argument("--chips", help="directory to write chips into")
-
-    sub.add_parser("cdse-login", help="save a Copernicus Data Space login (for Sentinel-3)")
-
-    p = sub.add_parser("s3-check", help="test Sentinel-3 step by step on this computer")
-    p.add_argument("--days", type=int, default=7)
 
     p = sub.add_parser("serve", help="web map and API")
     p.add_argument("--host", default="127.0.0.1")
@@ -118,9 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         opts.reprocess = args.reprocess
         opts.mode = "all" if args.all_passes else "latest"
         opts.workers = args.workers
-        opts.sentinel3 = not args.no_s3
         opts.priority_only = args.priority_only
-        opts.s3_days = args.s3_days
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -131,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             opts = ScanOptions(start=(now - timedelta(days=args.days)).date().isoformat(),
                                end=now.date().isoformat(), max_cloud=args.max_cloud,
                                rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles,
-                               workers=args.workers, sentinel3=not args.no_s3)
+                               workers=args.workers)
             try:
                 scan(settings, opts)
             except Exception:
@@ -151,17 +137,6 @@ def main(argv: list[str] | None = None) -> int:
                 "confidence": g.det.confidence} for g in dets]
         print(json.dumps(out, indent=2))
         return 0
-
-    if args.cmd == "cdse-login":
-        from .cdse import login_interactive
-        return login_interactive(settings.data_dir, settings.cdse_config()["token_url"])
-
-    if args.cmd == "s3-check":
-        from .aoi import load_priority
-        from .s3 import diagnose
-        regions = load_priority(settings.priority_path)
-        region = regions[0][1] if regions else settings.search_area()
-        return diagnose(settings, region, args.days)
 
     if args.cmd == "serve":
         from .server import create_app

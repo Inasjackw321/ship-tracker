@@ -1,16 +1,16 @@
-"""Region 1 is finished completely (Sentinel-2 and Sentinel-3) before anything else starts."""
+"""Region 1 is finished completely before anything else starts."""
 import json
 import threading
 import time
 
 from shapely.geometry import box, mapping
 
-from shiptracker import pipeline, s3
+from shiptracker import pipeline
 from shiptracker.config import Settings
 from shiptracker.pipeline import ScanOptions, scan
 from tests.test_coverage import _scene
 
-R1 = box(60, 21, 63, 24)    # first region (open sea, partly imaged by Sentinel-2)
+R1 = box(60, 21, 63, 24)    # first region
 R2 = box(56, 26, 57, 27)    # second region (Hormuz)
 
 
@@ -43,36 +43,24 @@ def test_first_region_finishes_before_anything_else(tmp_path, monkeypatch):
         store.save_scene(sc, "done", "", detector_version=pipeline.DETECTOR_VERSION)
         return "done", 0
 
-    granules = [
-        s3.Granule("S3-first", "2026-10-08T05:00:00Z", mapping(box(59, 20, 64, 22.9)), {}),
-        s3.Granule("S3-rest", "2026-10-08T05:10:00Z", mapping(box(63, 8, 72, 20)), {}),
-    ]
-
-    def fake_s3_process(settings, store, g, region, keep):
-        with lock:
-            events.append(("s3", g.id))
-        store.save_s3_granule(g, "done", "")
-        return 0
 
     monkeypatch.setattr(pipeline, "search_scenes", lambda *a, **k: list(found))
     monkeypatch.setattr(pipeline, "process_scene", fake_process)
-    monkeypatch.setattr(s3, "search_granules", lambda cfg, region, start, end: list(granules))
-    monkeypatch.setattr(s3, "process_granule", fake_s3_process)
 
     rep = scan(_settings(tmp_path), ScanOptions(start="2026-10-01", end="2026-10-08", workers=3))
-    order = [e for e in events if e[0] in ("start", "s3")]
+    order = [e for e in events if e[0] == "start"]
     names = [i for _, i in order]
 
-    first = [i for i in names if i.startswith("first")] + ["S3-first"]
+    first = [i for i in names if i.startswith("first")]
     last_first = max(names.index(i) for i in first)
     first_other = min(names.index(i) for i in names if i not in first)
     assert last_first < first_other, names
     # every first-region image had *finished* before the second region started
     second_start = events.index(("start", "second-1"))
-    assert all(events.index(("end", i)) < second_start for i in first if i.startswith("first"))
+    assert all(events.index(("end", i)) < second_start for i in first)
     # second region before the rest of the area
     assert names.index("second-1") < min(names.index("rest-1"), names.index("rest-2"))
-    assert rep.processed == 6 and rep.s3_granules == 2
+    assert rep.processed == 6
     assert any("Phase 1/3: first" in m for m in rep.log)
 
 
@@ -82,13 +70,6 @@ def test_priority_only_stops_after_regions(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(pipeline, "search_scenes", lambda *a, **k: list(found))
     monkeypatch.setattr(pipeline, "process_scene", lambda st, store, sc, o: (seen.append(sc.id), ("done", 0))[1])
-    rep = scan(_settings(tmp_path), ScanOptions(start="2026-10-01", end="2026-10-08", priority_only=True,
-                                                sentinel3=False))
+    rep = scan(_settings(tmp_path), ScanOptions(start="2026-10-01", end="2026-10-08", priority_only=True))
     assert seen == ["first-1"] and rep.processed == 1
 
-
-def test_s3_reports_when_planetary_computer_has_nothing_yet(tmp_path, monkeypatch):
-    monkeypatch.setattr(pipeline, "search_scenes", lambda *a, **k: [])
-    monkeypatch.setattr(s3, "search_granules", lambda *a, **k: [])
-    rep = scan(_settings(tmp_path), ScanOptions(start="2026-10-01", end="2026-10-08", priority_only=True))
-    assert any("Planetary Computer has no recent images here" in m and "--cdse-login" in m for m in rep.log)

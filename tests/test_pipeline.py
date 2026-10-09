@@ -21,7 +21,7 @@ from shiptracker.config import Settings
 from shiptracker.scene import apply_affine
 from shiptracker.pipeline import ScanOptions, scan
 from shiptracker.server import create_app
-from tests.synth import make_scene, write_s3_granule
+from tests.synth import make_scene
 
 EPSG = 32641            # UTM 41N
 LON, LAT = 61.0, 23.0   # Gulf of Oman, inside config/aoi.geojson
@@ -68,71 +68,21 @@ def _item(item_id, dt, base_url, sub, bounds, tile="41QKL"):
     }
 
 
-CDSE_NAME = "S3B_OL_2_WFR____20260930T060000_20260930T060300_20261002T120000_0179_100_200_2520_MAR_O_NT_003.SEN3"
-
-
 class Handler(SimpleHTTPRequestHandler):
-    """Fake STAC API + imagery bucket, plus a fake Copernicus Data Space (catalogue,
-    login and token-protected downloads that redirect, like the real service)."""
+    """Fake STAC API + imagery bucket."""
     pages: list = []
-    s3_items: list = []
-    s3_geom: dict = {}
 
     def log_message(self, *a):
         pass
 
-    def _json(self, obj, code=200):
-        data = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self):
-        from urllib.parse import parse_qs, unquote, urlparse
-
-        u = urlparse(self.path)
-        if u.path == "/odata/v1/Products":  # open catalogue
-            flt = parse_qs(u.query)["$filter"][0]
-            assert "OL_2_WFR___" in flt and "OData.CSC.Intersects" in flt and "ContentDate/Start ge" in flt
-            base = {"Id": "abc-123", "ContentDate": {"Start": "2026-09-30T06:00:00.000Z"}, "GeoFootprint": self.s3_geom}
-            nr = {**base, "Id": "nr-999", "Name": CDSE_NAME.replace("_NT_", "_NR_")}
-            return self._json({"value": [nr, {**base, "Name": CDSE_NAME}]})
-        if u.path.startswith("/dl/") or u.path.startswith("/blob/"):
-            if self.headers.get("Authorization") != "Bearer tok":
-                return self._json({"detail": "unauthorized"}, 401)
-            if u.path.startswith("/dl/"):
-                path = unquote(u.path)
-                assert "Products(abc-123)" in path and f"Nodes({CDSE_NAME})" in path  # NT, not NR
-                fname = path.split("Nodes(")[-1].split(")")[0]
-                self.send_response(307)  # the real service redirects to another host
-                self.send_header("Location", f"/blob/{fname}")
-                self.end_headers()
-                return
-            self.path = "/s3/" + u.path.split("/blob/")[1]
-        return super().do_GET()
-
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length) or b"{}"
-        if self.path == "/token":
-            from urllib.parse import parse_qs
-
-            form = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
-            if (form.get("username"), form.get("password"), form.get("client_id")) != ("me", "secret", "cdse-public"):
-                return self._json({"error": "invalid_grant"}, 401)
-            return self._json({"access_token": "tok", "expires_in": 600})
-        body = json.loads(raw)
+        body = json.loads(self.rfile.read(length) or b"{}")
         page = body.get("page", 0)
-        if "intersects" in body:
-            assert body["intersects"]["type"] in ("Polygon", "MultiPolygon")
-        if body["collections"] == ["sentinel-3-olci-wfr-l2-netcdf"]:
-            out = {"type": "FeatureCollection", "features": self.s3_items, "links": []}
-        else:
-            assert body["collections"] == ["sentinel-2-c1-l2a"]
-            out = {"type": "FeatureCollection", "features": self.pages[page], "links": []}
-        if body["collections"] == ["sentinel-2-c1-l2a"] and page + 1 < len(self.pages):
+        assert body["intersects"]["type"] in ("Polygon", "MultiPolygon")
+        assert body["collections"] == ["sentinel-2-c1-l2a"]
+        out = {"type": "FeatureCollection", "features": self.pages[page], "links": []}
+        if page + 1 < len(self.pages):
             out["links"].append({"rel": "next", "href": f"http://{self.headers['Host']}/search",
                                  "method": "POST", "body": {"page": page + 1}, "merge": True})
         data = json.dumps(out).encode()
@@ -144,9 +94,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 @pytest.fixture()
-def world(tmp_path, monkeypatch):
-    monkeypatch.delenv("CDSE_USERNAME", raising=False)  # tests decide about logins themselves
-    monkeypatch.delenv("CDSE_PASSWORD", raising=False)
+def world(tmp_path):
     served = tmp_path / "served"
     x, y = Transformer.from_crs("EPSG:4326", f"EPSG:{EPSG}", always_xy=True).transform(LON, LAT)
     origin = (round(x, -1), round(y, -1))
@@ -162,18 +110,7 @@ def world(tmp_path, monkeypatch):
         [_item("S2A_41QKM_20260930_0_L2A", "2026-09-30T06:40:15Z", base, "b", bounds, tile="41QKM")],
     ]
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    (served / "s3").mkdir()
-    s3_truth, s3_geom = write_s3_granule(served / "s3")
-    Handler.s3_geom = s3_geom
-    Handler.s3_items = [{
-        "type": "Feature", "id": "S3A_OL_2_WFR____20260930T060000", "geometry": s3_geom,
-        "properties": {"datetime": "2026-09-30T06:00:00Z"},
-        "assets": {k: {"href": f"{base}/s3/{f}"} for k, f in
-                   (("oa17", "Oa17_reflectance.nc"), ("geo", "geo_coordinates.nc"), ("wqsf", "wqsf.nc"))},
-    }]
-    settings = Settings(data_dir=tmp_path / "data", stac_url=base, s3_stac_url=base,
-                        cdse_urls={"catalogue": f"{base}/odata/v1", "download": f"{base}/dl/odata/v1",
-                                   "token_url": f"{base}/token"})
+    settings = Settings(data_dir=tmp_path / "data", stac_url=base)
     yield settings, truth, tr
     server.shutdown()
 
@@ -207,13 +144,8 @@ def test_scan_end_to_end(world):
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/api/aoi").get_json()["geometry"]["type"] == "Polygon"
 
-    n_chips = len([p for p in settings.chips_dir.rglob("*.png") if "s3" not in p.parts])
+    n_chips = len(list(settings.chips_dir.rglob("*.png")))
     assert n_chips == len(SHIPS), "chips of de-duplicated detections should be removed"
-
-    # Sentinel-3 ran on the open sea Sentinel-2 did not cover
-    s3 = client.get("/api/s3/detections").get_json()["features"]
-    assert len(s3) == 3 and all(f["properties"]["chip_url"] for f in s3)
-    assert rep.s3_granules == 1 and rep.s3_ships == 3
 
     cov = client.get("/api/coverage").get_json()
     assert 0 < cov["fraction"] < 0.01  # one small synthetic tile in a huge area
@@ -260,7 +192,7 @@ def test_tile_falls_back_to_older_pass_when_newest_is_cloud(world):
     Handler.pages = [[_item("S2A_41QKL_20261005_0_L2A", "2026-10-05T06:40:11Z", settings.stac_url, "c",
                             (w, s, e, n)), older]]
 
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-06", sentinel3=False))
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-06"))
     assert (rep.skipped, rep.processed) == (1, 1)
     assert rep.ships == len(SHIPS)
     client = create_app(settings).test_client()
@@ -278,9 +210,9 @@ def test_priority_only_skips_tiles_outside_priority_regions(world, tmp_path):
         "type": "Feature", "properties": {"name": "Hormuz only"},
         "geometry": {"type": "Polygon", "coordinates": [[[56, 26], [57, 26], [57, 27], [56, 27], [56, 26]]]}}]}))
     settings.priority_path = far_away
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", priority_only=True, sentinel3=False))
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", priority_only=True))
     assert rep.found == 0 and rep.processed == 0
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", sentinel3=False))
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
     assert rep.processed == 2  # without priority_only the rest of the area still follows
 
 
@@ -317,87 +249,17 @@ def test_downloads_carry_coordinates(world, tmp_path):
         assert src.count == 3 and float(src.tags()["SHIP_LAT"]) == pytest.approx(lat, abs=1e-5)
     assert abs(tlat - lat) < 0.0002 and abs(tlon - lon) < 0.0002  # within ~20 m
 
-    # Sentinel-3 PNG and a zip of everything
-    s3 = client.get("/api/s3/detections").get_json()["features"]
-    assert client.get(f"/api/s3/detections/{s3[0]['properties']['id']}/image.png").status_code == 200
+    # a zip of everything
     s2_ids = [f["properties"]["id"] for f in client.get("/api/detections").get_json()["features"]]
-    r = client.post("/api/download.zip", json={"s2": s2_ids, "s3": [s3[0]["properties"]["id"]]})
+    r = client.post("/api/download.zip", json={"ids": s2_ids})
     assert r.status_code == 200
     z = zipfile.ZipFile(io.BytesIO(r.data))
     names = z.namelist()
-    assert sum(n.endswith(".png") for n in names) == len(s2_ids) + 1
+    assert sum(n.endswith(".png") for n in names) == len(s2_ids)
     assert sum(n.endswith(".tif") for n in names) == len(s2_ids)
     csv_rows = z.read("coordinates.csv").decode().strip().splitlines()
-    assert len(csv_rows) == len(s2_ids) + 2  # header + ships
+    assert len(csv_rows) == len(s2_ids) + 1  # header + ships
     assert f"{lat:.5f}, {lon:.5f}" in z.read("coordinates.csv").decode()
-    assert z.read("ships.kml").decode().count("<Placemark>") == len(s2_ids) + 1
+    assert z.read("ships.kml").decode().count("<Placemark>") == len(s2_ids)
     assert client.post("/api/download.zip", json={}).status_code == 400
 
-
-def test_s3_check_runs_every_step(world, capsys):
-    from shapely.geometry import box
-
-    from shiptracker.s3 import diagnose
-
-    settings, _, _ = world
-    settings.s3_source = "planetary-computer"
-    lines = []
-    code = diagnose(settings, box(60, 10, 70, 20), out=lines.append)
-    text = "\n".join(lines)
-    assert code == 0, text
-    for step in ("search", "download Oa17_reflectance.nc", "read quality flags", "detect bright specks"):
-        assert f"- {step} ..." in text
-    assert "FAILED" not in text and "3 possible large ships" in text
-
-
-@pytest.fixture()
-def cdse_login(monkeypatch):
-    monkeypatch.setenv("CDSE_USERNAME", "me")
-    monkeypatch.setenv("CDSE_PASSWORD", "secret")
-
-
-def test_copernicus_used_when_logged_in(world, cdse_login):
-    from shapely.geometry import box
-
-    from shiptracker.s3 import diagnose
-
-    settings, _, _ = world
-    lines = []
-    code = diagnose(settings, box(60, 10, 70, 20), out=lines.append)
-    text = "\n".join(lines)
-    assert code == 0, text
-    assert "Testing with: Copernicus Data Space" in text and "Copernicus login ...\n  OK: token received" in text
-    assert "1 images over this area" in text  # near-real-time duplicate merged into the reprocessed one
-
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
-    assert rep.s3_granules == 1 and rep.s3_ships == 3
-    assert any("Sentinel-3 source: Copernicus Data Space" in m for m in rep.log)
-    feats = create_app(settings).test_client().get("/api/s3/detections").get_json()["features"]
-    assert len(feats) == 3 and feats[0]["properties"]["granule_id"] == CDSE_NAME
-
-
-def test_copernicus_wrong_password_is_reported(world, monkeypatch):
-    from shapely.geometry import box
-
-    from shiptracker.s3 import diagnose
-
-    monkeypatch.setenv("CDSE_USERNAME", "me")
-    monkeypatch.setenv("CDSE_PASSWORD", "wrong")
-    settings, _, _ = world
-    lines = []
-    assert diagnose(settings, box(60, 10, 70, 20), out=lines.append) == 1
-    assert "rejected the username/password" in "\n".join(lines)
-
-
-def test_without_login_copernicus_catalogue_is_still_reported(world, monkeypatch):
-    from shapely.geometry import box
-
-    from shiptracker.s3 import diagnose
-
-    monkeypatch.delenv("CDSE_USERNAME", raising=False)
-    settings, _, _ = world
-    lines = []
-    diagnose(settings, box(60, 10, 70, 20), out=lines.append)
-    text = "\n".join(lines)
-    assert "Planetary Computer: newest Sentinel-3 image anywhere ...\n  OK: 2026-09-30T06:00:00Z" in text
-    assert "1 images over this area, newest 2026-09-30T06:00" in text and "--cdse-login" in text
