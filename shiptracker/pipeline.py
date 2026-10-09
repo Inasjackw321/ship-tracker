@@ -2,8 +2,18 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
+
+from pyproj import Transformer
+from shapely.geometry import mapping, shape
+from shapely.geometry.base import BaseGeometry
+import numpy as np
+import shapely
+from shapely.ops import unary_union
 
 from .aoi import load_aoi
 from .chips import render_chips
@@ -23,6 +33,10 @@ class ScanOptions:
     end: str
     max_cloud: float = 30.0
     limit: int | None = None
+    # "latest": newest images that together cover every tile of the area once.
+    # "all": every pass in the date range (several looks at the same place).
+    mode: str = "latest"
+    workers: int = 3             # tiles downloaded/processed in parallel
     min_sea_fraction: float = 0.01
     rgb_chips: bool = True       # download the true-colour image for chips
     keep_tiles: bool = True
@@ -39,12 +53,69 @@ class ScanReport:
     already_done: int = 0
     ships: int = 0
     current: str = ""
+    area_imaged: float | None = None  # share of the search area with any imagery in the window
     log: list[str] = field(default_factory=list)
+
+
+_TO_EQUAL_AREA = Transformer.from_crs("EPSG:4326", "EPSG:6933", always_xy=True)
+
+
+def area_km2(geom: BaseGeometry) -> float:
+    if geom.is_empty:
+        return 0.0
+    projected = shapely.transform(geom, lambda xy: np.column_stack(_TO_EQUAL_AREA.transform(xy[:, 0], xy[:, 1])))
+    return projected.area / 1e6
+
+
+def select_latest_coverage(scenes: list[Scene], aoi: BaseGeometry, min_gain: float = 0.02) -> list[Scene]:
+    """For each MGRS tile, take the newest scenes until the tile's part of the area is covered.
+
+    A tile at the edge of an orbit swath is only partly imaged on each pass, so a
+    second (older) pass from the neighbouring orbit is added when it fills a gap.
+    """
+    by_tile: dict[str, list[Scene]] = defaultdict(list)
+    for sc in scenes:
+        by_tile[sc.tile or sc.id].append(sc)
+    chosen: list[Scene] = []
+    for group in by_tile.values():
+        group.sort(key=lambda sc: sc.datetime, reverse=True)
+        geoms = [shape(sc.geometry).intersection(aoi) for sc in group]
+        total = unary_union(geoms).area
+        if total <= 0:
+            continue
+        covered = None
+        for sc, g in zip(group, geoms):
+            gain = g.area if covered is None else g.difference(covered).area
+            if gain >= min_gain * total:
+                chosen.append(sc)
+                covered = g if covered is None else covered.union(g)
+            if covered is not None and covered.area >= 0.98 * total:
+                break
+    chosen.sort(key=lambda sc: sc.datetime, reverse=True)
+    return chosen
 
 
 def find_scenes(settings: Settings, opts: ScanOptions) -> list[Scene]:
     aoi = load_aoi(settings.aoi_path)
-    return search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud, opts.limit)
+    scenes = search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud)
+    if opts.mode == "latest":
+        scenes = select_latest_coverage(scenes, aoi)
+    return scenes[: opts.limit] if opts.limit else scenes
+
+
+def imagery_coverage(scenes: list[Scene], aoi: BaseGeometry) -> dict:
+    """Which part of the search area has any imagery among ``scenes``."""
+    imaged = unary_union([shape(sc.geometry) for sc in scenes]).intersection(aoi) if scenes else None
+    total = area_km2(aoi)
+    got = area_km2(imaged) if imaged is not None else 0.0
+    missing = aoi.difference(imaged) if imaged is not None else aoi
+    return {
+        "fraction": round(got / total, 6) if total else 0.0,
+        "imaged_km2": round(got),
+        "area_km2": round(total),
+        "imaged": mapping(imaged.simplify(0.005)) if imaged is not None and not imaged.is_empty else None,
+        "missing": mapping(missing.simplify(0.005)) if not missing.is_empty else None,
+    }
 
 
 def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions) -> tuple[str, int]:
@@ -89,7 +160,7 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
 
 def _prune_chips(settings: Settings, store: Store, scene_id: str) -> None:
     """Delete chips of detections that were dropped as duplicates of another tile."""
-    keep = {r[0] for r in store.conn.execute("SELECT chip FROM detections WHERE scene_id=?", (scene_id,))}
+    keep = store.chips_for_scene(scene_id)
     folder = settings.chips_dir / scene_id
     for f in folder.glob("*.png") if folder.exists() else []:
         if str(f.relative_to(settings.chips_dir)) not in keep:
@@ -110,32 +181,63 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         if on_progress:
             on_progress(report)
 
+    lock = threading.Lock()
     try:
         note(f"Searching {settings.source} for Sentinel-2 scenes {opts.start} .. {opts.end} (cloud <= {opts.max_cloud}%)")
-        scenes = find_scenes(settings, opts)
+        aoi = load_aoi(settings.aoi_path)
+        found = search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud)
+        cov = imagery_coverage(found, aoi)
+        cov.update(start=opts.start, end=opts.end, max_cloud=opts.max_cloud)
+        store.set_meta("coverage", cov)
+        report.area_imaged = cov["fraction"]
+        scenes = select_latest_coverage(found, aoi) if opts.mode == "latest" else found
+        if opts.limit:
+            scenes = scenes[: opts.limit]
         report.found = len(scenes)
-        note(f"Found {len(scenes)} scenes over the area")
-        for i, scene in enumerate(scenes, 1):
-            if not opts.reprocess and store.scene_status(scene.id) in ("done", "skipped"):
+        note(f"Found {len(found)} images; {len(scenes)} selected "
+             f"({'newest per tile' if opts.mode == 'latest' else 'every pass'}"
+             f"{f', limited to {opts.limit}' if opts.limit else ''})")
+        note(f"Sentinel-2 imaged {cov['fraction']:.0%} of the search area in this window "
+             f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2); the rest has no images to scan")
+
+        todo = []
+        for sc in scenes:
+            if not opts.reprocess and store.scene_status(sc.id) in ("done", "skipped"):
                 report.already_done += 1
-                continue
-            report.current = scene.id
-            note(f"[{i}/{len(scenes)}] {scene.id} ({scene.datetime[:16]}, cloud {scene.cloud_cover}%)")
-            try:
-                status, added = process_scene(settings, store, scene, opts)
-            except Exception as exc:
-                log.exception("Scene %s failed", scene.id)
-                store.save_scene(scene, "failed", str(exc)[:500])
-                report.failed += 1
-                note(f"  failed: {exc}")
-                continue
-            if status == "skipped":
-                report.skipped += 1
-                note("  skipped: no cloud-free sea in the area")
             else:
-                report.processed += 1
-                report.ships += added
-                note(f"  {added} ships recorded")
+                todo.append(sc)
+        if report.already_done:
+            note(f"{report.already_done} already processed earlier; {len(todo)} to go")
+
+        def work(sc: Scene):
+            with lock:
+                report.current = sc.id
+            note(f"start {sc.id} ({sc.datetime[:16]}, cloud {sc.cloud_cover}%)")
+            return process_scene(settings, store, sc, opts)
+
+        done_n = 0
+        with ThreadPoolExecutor(max_workers=max(1, opts.workers)) as pool:
+            futures = {pool.submit(work, sc): sc for sc in todo}
+            for fut in as_completed(futures):
+                sc = futures[fut]
+                done_n += 1
+                prefix = f"[{done_n}/{len(todo)}] {sc.id}"
+                try:
+                    status, added = fut.result()
+                except Exception as exc:
+                    log.exception("Scene %s failed", sc.id)
+                    store.save_scene(sc, "failed", str(exc)[:500])
+                    with lock:
+                        report.failed += 1
+                    note(f"{prefix}: failed: {exc}")
+                    continue
+                with lock:
+                    if status == "skipped":
+                        report.skipped += 1
+                    else:
+                        report.processed += 1
+                        report.ships += added
+                note(f"{prefix}: " + ("skipped, no cloud-free sea" if status == "skipped" else f"{added} ships"))
         report.current = ""
         note(f"Scan finished: {report.processed} processed, {report.skipped} skipped, "
              f"{report.failed} failed, {report.already_done} already done, {report.ships} ships")

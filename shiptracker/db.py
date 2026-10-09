@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS detections (
     stationary INTEGER DEFAULT 0,  -- seen at the same spot on another date
     chip TEXT
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_det_ts ON detections(ts);
 CREATE INDEX IF NOT EXISTS idx_det_pos ON detections(lat, lon);
 """
@@ -66,7 +70,7 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # one connection shared by scan workers and web requests
         with self.lock:
             self.conn.executescript(SCHEMA)
 
@@ -75,8 +79,21 @@ class Store:
 
     # scenes ---------------------------------------------------------------
 
+    def _query(self, sql: str, args=()) -> list[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute(sql, args).fetchall()
+
+    def set_meta(self, key: str, value) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+
+    def get_meta(self, key: str, default=None):
+        rows = self._query("SELECT value FROM meta WHERE key=?", (key,))
+        return json.loads(rows[0]["value"]) if rows else default
+
     def scene_status(self, scene_id: str) -> str | None:
-        row = self.conn.execute("SELECT status FROM scenes WHERE id=?", (scene_id,)).fetchone()
+        rows = self._query("SELECT status FROM scenes WHERE id=?", (scene_id,))
+        row = rows[0] if rows else None
         return row["status"] if row else None
 
     def save_scene(self, scene, status: str, note: str = "", sea_fraction: float | None = None,
@@ -93,9 +110,9 @@ class Store:
             )
 
     def scenes(self, limit: int = 500) -> list[dict]:
-        rows = self.conn.execute(
+        rows = self._query(
             "SELECT id, datetime, tile, cloud_cover, aoi_overlap, sea_fraction, status, note, n_ships,"
-            " processed_at, geometry FROM scenes ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            " processed_at, geometry FROM scenes ORDER BY ts DESC LIMIT ?", (limit,))
         out = []
         for r in rows:
             d = dict(r)
@@ -161,15 +178,20 @@ class Store:
             q.append("AND stationary = 0")
         q.append("ORDER BY ts DESC, length_m DESC LIMIT ?")
         args.append(limit)
-        return [dict(r) for r in self.conn.execute(" ".join(q), args).fetchall()]
+        return [dict(r) for r in self._query(" ".join(q), args)]
+
+    def chips_for_scene(self, scene_id: str) -> set[str]:
+        return {r["chip"] for r in self._query("SELECT chip FROM detections WHERE scene_id=?", (scene_id,))}
 
     def stats(self) -> dict:
-        c = self.conn
+        def one(sql: str):
+            return self._query(sql)[0][0]
+
         return {
-            "scenes_done": c.execute("SELECT COUNT(*) FROM scenes WHERE status='done'").fetchone()[0],
-            "scenes_skipped": c.execute("SELECT COUNT(*) FROM scenes WHERE status='skipped'").fetchone()[0],
-            "scenes_failed": c.execute("SELECT COUNT(*) FROM scenes WHERE status='failed'").fetchone()[0],
-            "detections": c.execute("SELECT COUNT(*) FROM detections").fetchone()[0],
-            "first": c.execute("SELECT MIN(datetime) FROM detections").fetchone()[0],
-            "last": c.execute("SELECT MAX(datetime) FROM detections").fetchone()[0],
+            "scenes_done": one("SELECT COUNT(*) FROM scenes WHERE status='done'"),
+            "scenes_skipped": one("SELECT COUNT(*) FROM scenes WHERE status='skipped'"),
+            "scenes_failed": one("SELECT COUNT(*) FROM scenes WHERE status='failed'"),
+            "detections": one("SELECT COUNT(*) FROM detections"),
+            "first": one("SELECT MIN(datetime) FROM detections"),
+            "last": one("SELECT MAX(datetime) FROM detections"),
         }

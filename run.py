@@ -1,7 +1,7 @@
 """One-command launcher: sets up the environment, starts the map, scans recent imagery.
 
     python run.py                 (Windows: py run.py, or double-click run.bat)
-    python run.py --days 10 --limit 20
+    python run.py --days 15 --max-cloud 50
     python run.py --no-scan       (just open the map with existing results)
 """
 from __future__ import annotations
@@ -44,8 +44,13 @@ def bootstrap() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Start the ship tracker map and scan recent Sentinel-2 imagery")
-    ap.add_argument("--days", type=int, default=5, help="scan imagery from the last N days (default 5)")
-    ap.add_argument("--limit", type=int, default=10, help="max tiles to download this run (default 10, 0 = all)")
+    ap.add_argument("--days", type=int, default=10, help="scan imagery from the last N days (default 10)")
+    ap.add_argument("--limit", type=int, default=0, help="max tiles to download this run (default 0 = whole area)")
+    ap.add_argument("--all-passes", action="store_true",
+                    help="scan every pass in the window instead of the newest image of each tile")
+    ap.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
+    ap.add_argument("--keep-tiles", action="store_true",
+                    help="keep downloaded tiles (default: delete each after processing; chips are kept)")
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
     ap.add_argument("--no-scan", action="store_true", help="don't scan, just open the map")
     ap.add_argument("--port", type=int, default=8000)
@@ -74,6 +79,9 @@ def main() -> int:
             "end": date.today().isoformat(),
             "max_cloud": args.max_cloud,
             "limit": args.limit or None,
+            "all_passes": args.all_passes,
+            "workers": args.workers,
+            "keep_tiles": args.keep_tiles,
         }
         resp = app.test_client().post("/api/scan", json=body)
         if resp.status_code != 202:

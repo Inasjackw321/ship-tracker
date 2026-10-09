@@ -46,15 +46,20 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("search", help="list Sentinel-2 scenes over the area (no download)")
     _add_scan_args(p)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--all-passes", action="store_true", help="list every pass, not just the newest per tile")
 
     p = sub.add_parser("scan", help="download tiles, detect and measure ships")
     _add_scan_args(p)
     p.add_argument("--no-rgb", action="store_true", help="skip the true-colour download; chips use NIR")
     p.add_argument("--delete-tiles", action="store_true", help="delete each tile after it is processed")
     p.add_argument("--reprocess", action="store_true", help="re-run scenes that were already processed")
+    p.add_argument("--all-passes", action="store_true",
+                   help="scan every pass in the date range, not just the newest image of each tile")
+    p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
 
     p = sub.add_parser("watch", help="scan for new imagery repeatedly")
     p.add_argument("--every-hours", type=float, default=6.0)
+    p.add_argument("--workers", type=int, default=3)
     p.add_argument("--days", type=int, default=3, help="look-back window on each run")
     p.add_argument("--max-cloud", type=float, default=30.0)
     p.add_argument("--no-rgb", action="store_true")
@@ -84,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             max_cloud=args.max_cloud, limit=args.limit,
         )
         if args.cmd == "search":
+            opts.mode = "all" if args.all_passes else "latest"
             scenes = find_scenes(settings, opts)
             if args.json:
                 print(json.dumps([s.to_dict() for s in scenes], indent=2))
@@ -96,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
         opts.rgb_chips = not args.no_rgb
         opts.keep_tiles = not args.delete_tiles
         opts.reprocess = args.reprocess
+        opts.mode = "all" if args.all_passes else "latest"
+        opts.workers = args.workers
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -105,7 +113,8 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.now(timezone.utc)
             opts = ScanOptions(start=(now - timedelta(days=args.days)).date().isoformat(),
                                end=now.date().isoformat(), max_cloud=args.max_cloud,
-                               rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles)
+                               rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles,
+                               workers=args.workers)
             try:
                 scan(settings, opts)
             except Exception:

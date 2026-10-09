@@ -68,6 +68,13 @@ def create_app(settings: Settings | None = None) -> Flask:
     def scenes():
         return jsonify(store.scenes(int(request.args.get("limit", 500))))
 
+    @app.get("/api/coverage")
+    def coverage():
+        cov = store.get_meta("coverage")
+        if cov is None:
+            return jsonify({"fraction": None, "imaged": None, "missing": None})
+        return jsonify(cov)
+
     @app.get("/api/stats")
     def stats():
         return jsonify({**store.stats(), "source": settings.source})
@@ -97,6 +104,8 @@ def create_app(settings: Settings | None = None) -> Flask:
                 limit=int(body["limit"]) if body.get("limit") else None,
                 rgb_chips=bool(body.get("rgb_chips", True)),
                 keep_tiles=bool(body.get("keep_tiles", True)),
+                mode="all" if body.get("all_passes") else "latest",
+                workers=int(body.get("workers", 3)),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

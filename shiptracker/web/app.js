@@ -10,14 +10,18 @@ const labels = L.tileLayer(
   { maxZoom: 19 }).addTo(map);
 
 const aoiLayer = L.geoJSON(null, { style: { color: '#39ff5a', weight: 3, fill: false } }).addTo(map);
+const gapLayer = L.geoJSON(null, {
+  style: { color: '#000', weight: 0, fillColor: '#000', fillOpacity: 0.45 },
+  onEachFeature: (f, l) => l.bindTooltip('No Sentinel-2 image of this part in the scan window — nothing to scan here', { sticky: true }),
+}).addTo(map);
 const sceneLayer = L.geoJSON(null, {
   style: (f) => ({ color: f.properties.status === 'done' ? '#58a6ff' : '#8b98a5', weight: 1, fillOpacity: 0.03 }),
   onEachFeature: (f, l) => l.bindTooltip(`${f.properties.id}<br>${f.properties.status}: ${f.properties.note || ''}`),
-});
+}).addTo(map);
 const shipLayer = L.layerGroup().addTo(map);
 const rulerLayer = L.layerGroup().addTo(map);
 L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Search area': aoiLayer,
-  'Tile footprints': sceneLayer, 'Ships': shipLayer, 'Rulers': rulerLayer }).addTo(map);
+  'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships': shipLayer, 'Rulers': rulerLayer }).addTo(map);
 
 function colorFor(len) {
   if (len >= 250) return '#ff4d4d';
@@ -134,6 +138,13 @@ async function loadStats() {
   $('s-scenes').textContent = s.scenes_done;
 }
 
+async function loadCoverage() {
+  const c = await getJSON('/api/coverage');
+  gapLayer.clearLayers();
+  if (c.missing) gapLayer.addData({ type: 'Feature', geometry: c.missing, properties: {} });
+  $('s-imaged').textContent = c.fraction == null ? '–' : `${Math.round(c.fraction * 100)}%`;
+}
+
 async function loadScenes() {
   const scenes = await getJSON('/api/scenes');
   sceneLayer.clearLayers();
@@ -148,7 +159,7 @@ async function pollScan() {
   $('scan-btn').disabled = running;
   const r = s.report;
   $('scan-state').textContent = running
-    ? `running… ${r ? `${r.processed + r.skipped + r.failed}/${r.found} tiles, ${r.ships} ships` : ''}`
+    ? `running… ${r ? `${r.processed + r.skipped + r.failed + r.already_done}/${r.found} tiles, ${r.ships} ships` : ''}`
     : (s.error ? `error: ${s.error}` : (r ? 'finished' : ''));
   if (r) {
     $('status').textContent = r.log.slice(-12).join('\n');
@@ -156,10 +167,10 @@ async function pollScan() {
   }
   if (running) {
     if (!polling) polling = setInterval(() => pollScan().catch(console.error), 3000);
-    loadDetections(); loadStats();
+    loadDetections(); loadStats(); loadScenes(); loadCoverage();
   } else if (polling) {
     clearInterval(polling); polling = null;
-    loadDetections(); loadStats(); loadScenes();
+    loadDetections(); loadStats(); loadScenes(); loadCoverage();
   }
 }
 
@@ -171,6 +182,7 @@ $('scan-btn').onclick = async () => {
         start: $('scan-start').value, end: $('scan-end').value,
         max_cloud: Number($('scan-cloud').value || 30),
         limit: $('scan-limit').value ? Number($('scan-limit').value) : null,
+        all_passes: $('scan-all').checked,
       }),
     });
   } catch (e) { $('scan-state').textContent = 'error: ' + e.message; }
@@ -180,12 +192,13 @@ $('f-apply').onclick = () => loadDetections().catch((e) => alert(e.message));
 
 (function init() {
   const today = new Date();
-  const weekAgo = new Date(today - 7 * 864e5);
+  const weekAgo = new Date(today - 10 * 864e5);
   $('scan-end').value = today.toISOString().slice(0, 10);
   $('scan-start').value = weekAgo.toISOString().slice(0, 10);
   getJSON('/api/aoi').then((g) => { aoiLayer.addData(g); map.fitBounds(aoiLayer.getBounds()); });
   loadDetections().catch(console.error);
   loadStats().catch(console.error);
   loadScenes().catch(console.error);
+  loadCoverage().catch(console.error);
   pollScan().catch(console.error);
 })();

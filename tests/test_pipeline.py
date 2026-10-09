@@ -116,7 +116,7 @@ def world(tmp_path):
 
 def test_scan_end_to_end(world):
     settings, truth, tr = world
-    opts = ScanOptions(start="2026-09-29", end="2026-10-01")
+    opts = ScanOptions(start="2026-09-29", end="2026-10-01", mode="all")
     rep = scan(settings, opts)
     assert (rep.found, rep.processed, rep.failed) == (2, 2, 0)
     assert rep.ships == len(SHIPS), "overlapping tile from the same pass must not double count"
@@ -146,5 +146,16 @@ def test_scan_end_to_end(world):
     n_chips = len(list(settings.chips_dir.rglob("*.png")))
     assert n_chips == len(SHIPS), "chips of de-duplicated detections should be removed"
 
+    cov = client.get("/api/coverage").get_json()
+    assert 0 < cov["fraction"] < 0.01  # one small synthetic tile in a huge area
+    assert cov["missing"]["type"] in ("Polygon", "MultiPolygon")
+
     again = scan(settings, opts)
     assert again.already_done == 2 and again.ships == 0
+
+
+def test_latest_mode_uses_newest_image_per_tile(world):
+    settings, _, _ = world
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    assert (rep.found, rep.processed) == (1, 1)  # both images are tile 41QKL: newest wins
+    assert rep.area_imaged is not None

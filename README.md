@@ -14,7 +14,9 @@ py run.py          # Windows (or double-click run.bat)
 python3 run.py     # macOS / Linux
 ```
 
-The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the newest 10 tiles from the last 5 days. Ships appear on the map as each tile finishes. Change the scan with `--days 10 --limit 20`, or open the map without scanning with `--no-scan`.
+The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the **whole area**: the newest image of every Sentinel-2 tile from the last 10 days. Ships appear on the map as each tile finishes.
+
+Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). Useful options are `--days 15`, `--max-cloud 50`, `--workers 4`, `--all-passes`, `--keep-tiles` and `--no-scan`.
 
 ## Manual setup
 
@@ -41,7 +43,7 @@ You don't need any accounts or API keys. Imagery comes from the public [Element 
 | Command | What it does |
 |---|---|
 | `search [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
-| `scan  [same] [--limit N] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store |
+| `scan  [same] [--limit N] [--all-passes] [--workers 3] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the whole area once. |
 | `watch [--every-hours 6] [--days 3]` | Keep scanning for new passes |
 | `serve [--host --port]` | Web map and JSON API |
 | `detect B08.tif SCL.tif [--rgb TCI.tif --chips DIR]` | Run detection on GeoTIFFs you already have |
@@ -71,9 +73,15 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 
 **Accuracy.** On synthetic ships rendered with the Sentinel-2 10 m point-spread function, measured length is within about 5 % for 35–400 m vessels, e.g. a 121.5 m ship measures 116–122 m, and the hull axis is within 2°. Real-world error will be larger, roughly ±10–20 m. Causes include hull paint and cargo, wakes, and ships under 30 m that are only 2–3 pixels long. Beam is less reliable than length because most beams are only 2–5 pixels.
 
+## Covering the whole area
+
+By default a scan selects the **newest image of each MGRS tile** in the date window. Some tiles sit at the edge of a satellite swath, where each pass images only part of the tile. For those, older passes are added until the whole tile is covered. `--all-passes` processes every pass instead, which shows the same sea several times over.
+
+Each scan also measures how much of the search area Sentinel-2 photographed in the window. The figure appears in the log and as **area imaged** on the map, and the unimaged part is shaded dark.
+
 ## Coverage caveat
 
-Sentinel-2 does **not** image the whole open ocean. It images land, coastal water out to about 20 km, enclosed seas and some extra areas. The Strait of Hormuz, the Gulf of Oman and the coastal strips are covered regularly, about every 5 days. Much of the central Arabian Sea is rarely or never imaged. `search` shows what is actually available, and the **Tile footprints** layer on the map shows what has been analysed.
+Sentinel-2 does **not** image the whole open ocean. It images land, coastal water out to about 20 km, enclosed seas and some extra areas. The Strait of Hormuz, the Gulf of Oman and the coastal strips are covered regularly, about every 5 days. Much of the central Arabian Sea is rarely or never imaged. `search` shows what is actually available. On the map, the dark **Not imaged** layer marks sea that had no image to scan, and **Scanned tiles** outlines what has been analysed.
 
 ## API
 
@@ -83,7 +91,8 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/scenes` | Processed tiles with status and footprint |
 | `GET /api/stats` | Counts |
 | `GET /api/aoi` | Search area polygon |
-| `POST /api/scan` `{start, end, max_cloud, limit}` / `GET /api/scan` | Start a background scan or check its progress |
+| `GET /api/coverage` | Imaged and not-imaged parts of the area from the last scan's search |
+| `POST /api/scan` `{start, end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
 
 ## Changing the area
