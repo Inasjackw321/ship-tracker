@@ -91,4 +91,4 @@ def test_s3_reports_when_planetary_computer_has_nothing_yet(tmp_path, monkeypatc
     monkeypatch.setattr(pipeline, "search_scenes", lambda *a, **k: [])
     monkeypatch.setattr(s3, "search_granules", lambda *a, **k: [])
     rep = scan(_settings(tmp_path), ScanOptions(start="2026-10-01", end="2026-10-08", priority_only=True))
-    assert any("no images on Planetary Computer" in m for m in rep.log)
+    assert any("Planetary Computer has no recent images here" in m and "--cdse-login" in m for m in rep.log)

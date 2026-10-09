@@ -72,6 +72,8 @@ def main() -> int:
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
     ap.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
     ap.add_argument("--s3-days", type=int, default=7, help="Sentinel-3 look-back in days (default 7)")
+    ap.add_argument("--cdse-login", action="store_true",
+                    help="save your free Copernicus Data Space login, used for Sentinel-3, and exit")
     ap.add_argument("--s3-check", action="store_true",
                     help="test Sentinel-3 step by step (search, download, read, detect) and exit")
     ap.add_argument("--priority-only", action="store_true",
@@ -80,6 +82,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
+    if args.cdse_login:
+        from shiptracker.__main__ import main as cli
+        return cli(["cdse-login"])
     if args.s3_check:
         from shiptracker.__main__ import main as cli
         return cli(["s3-check", "--days", str(args.s3_days)])

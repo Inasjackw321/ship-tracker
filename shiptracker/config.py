@@ -48,6 +48,10 @@ class Settings:
     stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_STAC_URL"))
     collection: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_COLLECTION"))
     s3_stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_S3_STAC_URL"))
+    # Sentinel-3 source: auto (Copernicus Data Space when logged in, else Planetary Computer),
+    # cdse, or planetary-computer.
+    s3_source: str = field(default_factory=lambda: _env("SHIPTRACKER_S3_SOURCE", "auto"))
+    cdse_urls: dict | None = None  # endpoint overrides (tests, mirrors)
     # Regions scanned first (in order); see config/priority.geojson.
     priority_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_PRIORITY", str(ROOT / "config" / "priority.geojson"))))
 
@@ -82,6 +86,10 @@ class Settings:
         if self.s3_stac_url:
             cfg["stac_url"] = self.s3_stac_url
         return cfg
+
+    def cdse_config(self) -> dict:
+        from .cdse import CDSE
+        return {**CDSE, **(self.cdse_urls or {})}
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.tiles_dir, self.chips_dir):

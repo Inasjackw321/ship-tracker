@@ -90,7 +90,7 @@ When the detector changes, tiles analysed by an older version are redone automat
 
 ### Open sea: Sentinel-3 (`shiptracker/s3.py`)
 
-Sentinel-2 does not photograph most of the open Arabian Sea. After the Sentinel-2 part of a scan, the remaining sea is checked with **Sentinel-3 OLCI**. This is the 300 m full-resolution water product, from the last 7 days, served by Microsoft Planetary Computer with no account needed. The newest image of each part of that sea is used.
+Sentinel-2 does not photograph most of the open Arabian Sea. After the Sentinel-2 part of a scan, the remaining sea is checked with **Sentinel-3 OLCI**. This is the 300 m full-resolution water product, from the last 7 days, from Copernicus Data Space (free login) or Microsoft Planetary Computer, as described below. The newest image of each part of that sea is used.
 
 A 300 m pixel is larger than any ship, so this is a different, weaker kind of detection:
 
@@ -163,15 +163,39 @@ Even with several tiles downloading in parallel, nothing from a later region beg
 
 `py run.py --priority-only` stops after the priority regions. Edit the file, or set `SHIPTRACKER_PRIORITY`, to change the regions. Lower `order` values come first. The regions are always included in the search area. The map opens zoomed to them and draws them as dashed yellow outlines.
 
+## Sentinel-3 sources and login
+
+Two sources are supported. With the default `auto`, the scan uses Copernicus Data Space when a login is saved, and Planetary Computer otherwise.
+
+| Source | Account | How current |
+|---|---|---|
+| **Copernicus Data Space** (ESA, official) | free login needed to download | near-real-time images within hours, reprocessed ones a few days later |
+| Microsoft Planetary Computer | none | may lag far behind, or have no recent images at all |
+
+To set up Copernicus once:
+
+1. Register at <https://dataspace.copernicus.eu>. It's free.
+2. Run:
+
+   ```
+   py run.py --cdse-login
+   ```
+
+It asks for your e-mail and password and checks them. It then saves them on your computer in `data/cdse.json`, which is never committed; you can use the `CDSE_USERNAME` / `CDSE_PASSWORD` environment variables instead. Each sensing time exists twice on Copernicus, near-real-time (`_NR_`) and reprocessed (`_NT_`); the reprocessed one is used when available. Only the three files needed are downloaded, not the whole ~700 MB product. Force a source with `--s3-source cdse` or `--s3-source planetary-computer`.
+
 ## If Sentinel-3 finds nothing
 
 ```
 py run.py --s3-check
 ```
 
-This runs every step against Planetary Computer and prints OK, or the exact error, for each one: search, access token, downloading the three files, reading the reflectance, reading the quality flags and coordinates, and detection. Send that output if something fails.
+This prints:
 
-Planetary Computer usually publishes Sentinel-3 images 1–3 days after they are taken. A scan therefore looks back 7 days and uses the newest image of each part of the sea. Change this with `--s3-days 14`.
+- The date of the newest Sentinel-3 image Planetary Computer has, anywhere and over the first priority region.
+- How many images Copernicus has there. Its catalogue needs no login.
+- Then, through the source that will actually be used, OK or the exact error for each step: login, search, downloading the three files, reading reflectance, flags and coordinates, and detection.
+
+A scan looks back 7 days (`--s3-days 14` to change this) and uses the newest image of each part of the sea.
 
 ## Changing the area
 

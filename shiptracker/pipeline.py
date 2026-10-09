@@ -378,20 +378,18 @@ def _scan_sentinel3(settings: Settings, store: Store, region: BaseGeometry, dete
     ids of the images used for this region."""
     from . import s3
 
-    cfg = settings.s3_config()
     end = date.fromisoformat(opts.end[:10])
     start = (end - timedelta(days=max(opts.s3_days - 1, 0))).isoformat()
-    note(f"Sentinel-3: searching Planetary Computer for 300 m images of {area_km2(region):,.0f} km2 of open sea "
+    note(f"Sentinel-3: searching for 300 m images of {area_km2(region):,.0f} km2 of open sea "
          f"({start} .. {end.isoformat()})")
     try:
-        found = s3.search_granules(cfg, region, start, end.isoformat())
+        found = s3.find_granules(settings, region, start, end.isoformat(), note)
     except Exception as exc:
         log.exception("Sentinel-3 search failed")
         note(f"Sentinel-3: search failed: {exc}")
         return []
     if not found:
-        note(f"Sentinel-3: no images on Planetary Computer for {start} .. {end.isoformat()}. They usually "
-             f"appear 1-3 days after capture; try a longer look-back (--s3-days).")
+        note(f"Sentinel-3: no images found for {start} .. {end.isoformat()}.")
         return []
     granules = s3.select_granules(found, region)
     note(f"Sentinel-3: {len(found)} images found, {len(granules)} needed to cover this area")

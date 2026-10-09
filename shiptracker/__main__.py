@@ -33,6 +33,8 @@ def _settings(args) -> Settings:
         s.aoi_path = Path(args.aoi)
     if args.source:
         s.source = args.source
+    if getattr(args, "s3_source", None):
+        s.s3_source = args.s3_source
     return s
 
 
@@ -41,6 +43,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data", help="data directory (tiles, chips, database)")
     ap.add_argument("--aoi", help="AOI GeoJSON (default: config/aoi.geojson)")
     ap.add_argument("--source", choices=sorted(SOURCES), help="imagery source (default: earth-search)")
+    ap.add_argument("--s3-source", choices=["auto", "cdse", "planetary-computer"],
+                    help="Sentinel-3 source (default auto: Copernicus Data Space when logged in)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -77,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", type=float, default=1e-4)
     p.add_argument("--offset", type=float, default=-0.1, help="-0.1 for processing baseline >= 04.00, else 0")
     p.add_argument("--chips", help="directory to write chips into")
+
+    sub.add_parser("cdse-login", help="save a Copernicus Data Space login (for Sentinel-3)")
 
     p = sub.add_parser("s3-check", help="test Sentinel-3 step by step on this computer")
     p.add_argument("--days", type=int, default=7)
@@ -145,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
                 "confidence": g.det.confidence} for g in dets]
         print(json.dumps(out, indent=2))
         return 0
+
+    if args.cmd == "cdse-login":
+        from .cdse import login_interactive
+        return login_interactive(settings.data_dir, settings.cdse_config()["token_url"])
 
     if args.cmd == "s3-check":
         from .aoi import load_priority

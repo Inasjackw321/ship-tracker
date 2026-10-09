@@ -68,18 +68,65 @@ def _item(item_id, dt, base_url, sub, bounds, tile="41QKL"):
     }
 
 
+CDSE_NAME = "S3B_OL_2_WFR____20260930T060000_20260930T060300_20261002T120000_0179_100_200_2520_MAR_O_NT_003.SEN3"
+
+
 class Handler(SimpleHTTPRequestHandler):
+    """Fake STAC API + imagery bucket, plus a fake Copernicus Data Space (catalogue,
+    login and token-protected downloads that redirect, like the real service)."""
     pages: list = []
     s3_items: list = []
+    s3_geom: dict = {}
 
     def log_message(self, *a):
         pass
 
+    def _json(self, obj, code=200):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        u = urlparse(self.path)
+        if u.path == "/odata/v1/Products":  # open catalogue
+            flt = parse_qs(u.query)["$filter"][0]
+            assert "OL_2_WFR___" in flt and "OData.CSC.Intersects" in flt and "ContentDate/Start ge" in flt
+            base = {"Id": "abc-123", "ContentDate": {"Start": "2026-09-30T06:00:00.000Z"}, "GeoFootprint": self.s3_geom}
+            nr = {**base, "Id": "nr-999", "Name": CDSE_NAME.replace("_NT_", "_NR_")}
+            return self._json({"value": [nr, {**base, "Name": CDSE_NAME}]})
+        if u.path.startswith("/dl/") or u.path.startswith("/blob/"):
+            if self.headers.get("Authorization") != "Bearer tok":
+                return self._json({"detail": "unauthorized"}, 401)
+            if u.path.startswith("/dl/"):
+                path = unquote(u.path)
+                assert "Products(abc-123)" in path and f"Nodes({CDSE_NAME})" in path  # NT, not NR
+                fname = path.split("Nodes(")[-1].split(")")[0]
+                self.send_response(307)  # the real service redirects to another host
+                self.send_header("Location", f"/blob/{fname}")
+                self.end_headers()
+                return
+            self.path = "/s3/" + u.path.split("/blob/")[1]
+        return super().do_GET()
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length) or b"{}"
+        if self.path == "/token":
+            from urllib.parse import parse_qs
+
+            form = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+            if (form.get("username"), form.get("password"), form.get("client_id")) != ("me", "secret", "cdse-public"):
+                return self._json({"error": "invalid_grant"}, 401)
+            return self._json({"access_token": "tok", "expires_in": 600})
+        body = json.loads(raw)
         page = body.get("page", 0)
-        assert body["intersects"]["type"] in ("Polygon", "MultiPolygon")
+        if "intersects" in body:
+            assert body["intersects"]["type"] in ("Polygon", "MultiPolygon")
         if body["collections"] == ["sentinel-3-olci-wfr-l2-netcdf"]:
             out = {"type": "FeatureCollection", "features": self.s3_items, "links": []}
         else:
@@ -97,7 +144,9 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 @pytest.fixture()
-def world(tmp_path):
+def world(tmp_path, monkeypatch):
+    monkeypatch.delenv("CDSE_USERNAME", raising=False)  # tests decide about logins themselves
+    monkeypatch.delenv("CDSE_PASSWORD", raising=False)
     served = tmp_path / "served"
     x, y = Transformer.from_crs("EPSG:4326", f"EPSG:{EPSG}", always_xy=True).transform(LON, LAT)
     origin = (round(x, -1), round(y, -1))
@@ -115,13 +164,16 @@ def world(tmp_path):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     (served / "s3").mkdir()
     s3_truth, s3_geom = write_s3_granule(served / "s3")
+    Handler.s3_geom = s3_geom
     Handler.s3_items = [{
         "type": "Feature", "id": "S3A_OL_2_WFR____20260930T060000", "geometry": s3_geom,
         "properties": {"datetime": "2026-09-30T06:00:00Z"},
         "assets": {k: {"href": f"{base}/s3/{f}"} for k, f in
                    (("oa17", "Oa17_reflectance.nc"), ("geo", "geo_coordinates.nc"), ("wqsf", "wqsf.nc"))},
     }]
-    settings = Settings(data_dir=tmp_path / "data", stac_url=base, s3_stac_url=base)
+    settings = Settings(data_dir=tmp_path / "data", stac_url=base, s3_stac_url=base,
+                        cdse_urls={"catalogue": f"{base}/odata/v1", "download": f"{base}/dl/odata/v1",
+                                   "token_url": f"{base}/token"})
     yield settings, truth, tr
     server.shutdown()
 
@@ -288,6 +340,7 @@ def test_s3_check_runs_every_step(world, capsys):
     from shiptracker.s3 import diagnose
 
     settings, _, _ = world
+    settings.s3_source = "planetary-computer"
     lines = []
     code = diagnose(settings, box(60, 10, 70, 20), out=lines.append)
     text = "\n".join(lines)
@@ -295,3 +348,56 @@ def test_s3_check_runs_every_step(world, capsys):
     for step in ("search", "download Oa17_reflectance.nc", "read quality flags", "detect bright specks"):
         assert f"- {step} ..." in text
     assert "FAILED" not in text and "3 possible large ships" in text
+
+
+@pytest.fixture()
+def cdse_login(monkeypatch):
+    monkeypatch.setenv("CDSE_USERNAME", "me")
+    monkeypatch.setenv("CDSE_PASSWORD", "secret")
+
+
+def test_copernicus_used_when_logged_in(world, cdse_login):
+    from shapely.geometry import box
+
+    from shiptracker.s3 import diagnose
+
+    settings, _, _ = world
+    lines = []
+    code = diagnose(settings, box(60, 10, 70, 20), out=lines.append)
+    text = "\n".join(lines)
+    assert code == 0, text
+    assert "Testing with: Copernicus Data Space" in text and "Copernicus login ...\n  OK: token received" in text
+    assert "1 images over this area" in text  # near-real-time duplicate merged into the reprocessed one
+
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    assert rep.s3_granules == 1 and rep.s3_ships == 3
+    assert any("Sentinel-3 source: Copernicus Data Space" in m for m in rep.log)
+    feats = create_app(settings).test_client().get("/api/s3/detections").get_json()["features"]
+    assert len(feats) == 3 and feats[0]["properties"]["granule_id"] == CDSE_NAME
+
+
+def test_copernicus_wrong_password_is_reported(world, monkeypatch):
+    from shapely.geometry import box
+
+    from shiptracker.s3 import diagnose
+
+    monkeypatch.setenv("CDSE_USERNAME", "me")
+    monkeypatch.setenv("CDSE_PASSWORD", "wrong")
+    settings, _, _ = world
+    lines = []
+    assert diagnose(settings, box(60, 10, 70, 20), out=lines.append) == 1
+    assert "rejected the username/password" in "\n".join(lines)
+
+
+def test_without_login_copernicus_catalogue_is_still_reported(world, monkeypatch):
+    from shapely.geometry import box
+
+    from shiptracker.s3 import diagnose
+
+    monkeypatch.delenv("CDSE_USERNAME", raising=False)
+    settings, _, _ = world
+    lines = []
+    diagnose(settings, box(60, 10, 70, 20), out=lines.append)
+    text = "\n".join(lines)
+    assert "Planetary Computer: newest Sentinel-3 image anywhere ...\n  OK: 2026-09-30T06:00:00Z" in text
+    assert "1 images over this area, newest 2026-09-30T06:00" in text and "--cdse-login" in text

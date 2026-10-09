@@ -58,6 +58,7 @@ class Granule:
     datetime: str
     geometry: dict
     hrefs: dict  # refl / geo / flags -> URL
+    source: str = "planetary-computer"  # or "cdse" (Copernicus Data Space)
 
 
 @dataclass
@@ -105,6 +106,115 @@ def search_granules(cfg: dict, region: BaseGeometry, start: str, end: str) -> li
                            f"{sorted(cfg['files'].values())}; first image ({sample['id']}) has: {sorted(hrefs)}")
     out.sort(key=lambda g: g.datetime, reverse=True)
     return out
+
+
+# --------------------------------------------------------------------------- Copernicus Data Space
+
+
+def _wkt_polygon(region: BaseGeometry) -> str:
+    from shapely.geometry.polygon import orient
+
+    hull = orient(region.convex_hull.simplify(0.1), sign=1.0)  # few vertices, counter-clockwise
+    coords = ", ".join(f"{x:.4f} {y:.4f}" for x, y in hull.exterior.coords)
+    return f"POLYGON(({coords}))"
+
+
+def search_granules_cdse(cdse_cfg: dict, files: dict, region: BaseGeometry, start: str, end: str,
+                         max_items: int = 500) -> list[Granule]:
+    """OLCI Level-2 water (300 m) products from the Copernicus Data Space catalogue (open, no login).
+
+    Each sensing time is published twice: near-real-time ("_NR_", within hours) and
+    reprocessed ("_NT_", days later). The reprocessed one is kept when both exist.
+    """
+    import requests
+
+    flt = (f"Collection/Name eq 'SENTINEL-3' and Attributes/OData.CSC.StringAttribute/any("
+           f"att:att/Name eq 'productType' and att/OData.CSC.StringAttribute/Value eq '{cdse_cfg['product_type']}') "
+           f"and OData.CSC.Intersects(area=geography'SRID=4326;{_wkt_polygon(region)}') "
+           f"and ContentDate/Start ge {start}T00:00:00.000Z and ContentDate/Start le {end}T23:59:59.999Z")
+    url = cdse_cfg["catalogue"].rstrip("/") + "/Products"
+    params: dict | None = {"$filter": flt, "$orderby": "ContentDate/Start desc", "$top": 100}
+    products: list[dict] = []
+    session = requests.Session()
+    while url and len(products) < max_items:
+        r = session.get(url, params=params, timeout=90)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Copernicus catalogue error {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        products += data.get("value", [])
+        url, params = data.get("@odata.nextLink"), None
+
+    best: dict[str, dict] = {}
+    for p in products:
+        name = p["Name"]
+        key = name[:47]  # platform + product type + sensing start/stop
+        if key not in best or ("_NT_" in name and "_NT_" not in best[key]["Name"]):
+            best[key] = p
+    out = []
+    dl = cdse_cfg["download"].rstrip("/")
+    for p in best.values():
+        geom = p.get("GeoFootprint")
+        if not geom and p.get("Footprint"):
+            from shapely import wkt
+
+            geom = mapping(wkt.loads(p["Footprint"].split(";", 1)[-1].rstrip("'")))
+        if not geom:
+            continue
+        hrefs = {k: f"{dl}/Products({p['Id']})/Nodes({p['Name']})/Nodes({fname})/$value" for k, fname in files.items()}
+        out.append(Granule(p["Name"], p["ContentDate"]["Start"], geom, hrefs, source="cdse"))
+    out.sort(key=lambda g: g.datetime, reverse=True)
+    return out
+
+
+def newest_on_planetary_computer(cfg: dict, region: BaseGeometry | None = None) -> str | None:
+    """Date of the newest Sentinel-3 image Planetary Computer has (anywhere, or over ``region``)."""
+    body = {"collections": [cfg["collection"]], "limit": 1,
+            "sortby": [{"field": "properties.datetime", "direction": "desc"}]}
+    if region is not None:
+        body["intersects"] = mapping(region.convex_hull.simplify(0.05))
+    items = search_items(cfg["stac_url"], body, max_items=1)
+    return items[0]["properties"]["datetime"] if items else None
+
+
+def download_cfg(settings, source: str) -> dict:
+    """Download settings for a granule's source (Planetary Computer signing or CDSE login)."""
+    cfg = settings.s3_config()
+    if source != "cdse":
+        return cfg
+    from .cdse import CdseAuth, load_credentials
+
+    auth = getattr(settings, "_cdse_auth", None)
+    if auth is None:
+        creds = load_credentials(settings.data_dir)
+        if creds is None:
+            from .cdse import SIGNUP_HELP
+            raise PermissionError(SIGNUP_HELP)
+        auth = CdseAuth(*creds, token_url=settings.cdse_config()["token_url"])
+        settings._cdse_auth = auth
+    return {"files": cfg["files"], "auth": auth}
+
+
+def find_granules(settings, region: BaseGeometry, start: str, end: str, note=log.info) -> list[Granule]:
+    """Search the configured Sentinel-3 source(s).
+
+    auto: Copernicus Data Space when logged in (current, official), otherwise Planetary
+    Computer; if Planetary Computer has nothing, say how to switch.
+    """
+    from .cdse import SIGNUP_HELP, load_credentials
+
+    choice = settings.s3_source
+    have_login = load_credentials(settings.data_dir) is not None
+    if choice == "cdse" or (choice == "auto" and have_login):
+        if not have_login:
+            note("Sentinel-3: " + SIGNUP_HELP)
+            return []
+        note("Sentinel-3 source: Copernicus Data Space")
+        return search_granules_cdse(settings.cdse_config(), settings.s3_config()["files"], region, start, end)
+    note("Sentinel-3 source: Planetary Computer")
+    found = search_granules(settings.s3_config(), region, start, end)
+    if not found and choice == "auto":
+        note("Sentinel-3: Planetary Computer has no recent images here. " + SIGNUP_HELP)
+    return found
 
 
 def select_granules(granules: list[Granule], region: BaseGeometry, min_gain: float = 0.1) -> list[Granule]:
@@ -323,7 +433,7 @@ def detect_granule(refl_path: Path, geo_path: Path, flags_path: Path, region: Ba
 
 
 def process_granule(settings, store, g: Granule, region: BaseGeometry, keep_files: bool) -> int:
-    cfg = settings.s3_config()
+    cfg = download_cfg(settings, g.source)
     gdir = settings.tiles_dir / "s3" / g.id
     paths = {k: download_file(href, gdir / cfg["files"][k], cfg) for k, href in g.hrefs.items()}
     rejected: Counter = Counter()
@@ -340,18 +450,20 @@ def process_granule(settings, store, g: Granule, region: BaseGeometry, keep_file
 
 
 def diagnose(settings, region: BaseGeometry, days: int = 7, out=print) -> int:
-    """Step-by-step Sentinel-3 check against the live service; prints OK / FAILED per step.
+    """Step-by-step Sentinel-3 check against the live services; prints OK / FAILED per step.
 
     Returns 0 when a real image was downloaded, read and analysed.
     """
     import traceback
     from datetime import date, timedelta
 
+    from .cdse import SIGNUP_HELP, load_credentials
     from .stac import sign_href
 
-    cfg = settings.s3_config()
     end = date.today()
     start = end - timedelta(days=days)
+    pc_cfg = settings.s3_config()
+    have_login = load_credentials(settings.data_dir) is not None
 
     def step(name, fn):
         out(f"- {name} ...")
@@ -364,20 +476,48 @@ def diagnose(settings, region: BaseGeometry, days: int = 7, out=print) -> int:
             out("  " + traceback.format_exc().strip().splitlines()[-1])
             return None, False
 
-    out(f"Sentinel-3 check: {cfg['stac_url']} collection {cfg['collection']}, {start} .. {end}")
-    granules, ok = step("search", lambda: search_granules(cfg, region, start.isoformat(), end.isoformat()))
+    out(f"Sentinel-3 check for {start} .. {end} (source setting: {settings.s3_source})")
+    if settings.s3_source in ("auto", "planetary-computer"):
+        step("Planetary Computer: newest Sentinel-3 image anywhere",
+             lambda: newest_on_planetary_computer(pc_cfg) or "none at all")
+        step("Planetary Computer: newest image over this area",
+             lambda: newest_on_planetary_computer(pc_cfg, region) or "none")
+    if settings.s3_source in ("auto", "cdse"):
+        cdse_found, ok = step("Copernicus Data Space catalogue (open, no login needed)",
+                              lambda: search_granules_cdse(settings.cdse_config(), pc_cfg["files"], region,
+                                                           start.isoformat(), end.isoformat()))
+        if ok:
+            newest = cdse_found[0].datetime[:16] if cdse_found else "-"
+            out(f"    {len(cdse_found)} images over this area, newest {newest}")
+        out(f"    login: {'saved' if have_login else 'not set up. ' + SIGNUP_HELP}")
+
+    use_cdse = settings.s3_source == "cdse" or (settings.s3_source == "auto" and have_login)
+    out(f"Testing with: {'Copernicus Data Space' if use_cdse else 'Planetary Computer'}")
+    if use_cdse and not have_login:
+        out("  " + SIGNUP_HELP)
+        return 1
+    if use_cdse:
+        _, ok = step("Copernicus login", lambda: "token received" if download_cfg(settings, "cdse")["auth"].token() else "")
+        if not ok:
+            return 1
+        granules, ok = step("search", lambda: search_granules_cdse(settings.cdse_config(), pc_cfg["files"], region,
+                                                                   start.isoformat(), end.isoformat()))
+    else:
+        granules, ok = step("search", lambda: search_granules(pc_cfg, region, start.isoformat(), end.isoformat()))
     if not ok:
         return 1
     out(f"  {len(granules)} images with the needed files")
     for g in granules[:5]:
         out(f"    {g.datetime[:16]}  {g.id}")
     if not granules:
-        out("  Nothing to test: Planetary Computer has no images for this window yet. Try --days 14.")
+        out("  Nothing to test in this window." + ("" if use_cdse else " " + SIGNUP_HELP))
         return 1
     g = granules[0]
-    _, ok = step("access token", lambda: "signed" if "?" in sign_href(g.hrefs["flags"], cfg) else "not needed")
-    if not ok:
-        return 1
+    cfg = download_cfg(settings, g.source)
+    if not use_cdse:
+        _, ok = step("access token", lambda: "signed" if "?" in sign_href(g.hrefs["flags"], cfg) else "not needed")
+        if not ok:
+            return 1
     gdir = settings.tiles_dir / "s3" / g.id
     paths = {}
     for key in ("flags", "refl", "geo"):
@@ -390,13 +530,12 @@ def diagnose(settings, region: BaseGeometry, days: int = 7, out=print) -> int:
     refl, ok = step("read Oa17 reflectance", lambda: read_scaled(paths["refl"], "Oa17_reflectance"))
     if not ok:
         return 1
-    finite = np.isfinite(refl)
-    out(f"    {refl.shape[0]} x {refl.shape[1]} pixels, {finite.mean():.0%} valid, "
+    out(f"    {refl.shape[0]} x {refl.shape[1]} pixels, {np.isfinite(refl).mean():.0%} valid, "
         f"median {np.nanmedian(refl):.4f}, 99.9% {np.nanpercentile(refl, 99.9):.4f}")
     flags, ok = step("read quality flags", lambda: read_flags(paths["flags"]))
     if not ok:
         return 1
-    fl, table = flags
+    _, table = flags
     out(f"    flags: {', '.join(n for n in ('LAND', 'CLOUD', 'CLOUD_AMBIGUOUS', 'CLOUD_MARGIN', 'COASTLINE') if n in table)}"
         f"{'' if 'LAND' in table else '  (LAND flag missing!)'}")
     _, ok = step("read latitude / longitude", lambda: read_scaled(paths["geo"], "latitude").shape)
