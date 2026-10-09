@@ -44,6 +44,29 @@ CREATE TABLE IF NOT EXISTS detections (
     stationary INTEGER DEFAULT 0,  -- seen at the same spot on another date
     chip TEXT
 );
+CREATE TABLE IF NOT EXISTS s3_granules (
+    id TEXT PRIMARY KEY,
+    datetime TEXT NOT NULL,
+    ts REAL NOT NULL,
+    status TEXT NOT NULL,
+    note TEXT,
+    n_ships INTEGER DEFAULT 0,
+    processed_at REAL,
+    geometry TEXT
+);
+CREATE TABLE IF NOT EXISTS s3_detections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    granule_id TEXT NOT NULL,
+    datetime TEXT NOT NULL,
+    ts REAL NOT NULL,
+    lon REAL NOT NULL,
+    lat REAL NOT NULL,
+    contrast REAL,
+    snr REAL,
+    npix INTEGER,
+    confidence REAL,
+    chip TEXT
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -174,9 +197,14 @@ class Store:
 
     def detections(self, start: str | None = None, end: str | None = None, min_length: float = 0,
                    max_length: float = 1e9, min_confidence: float = 0, include_stationary: bool = True,
-                   limit: int = 20000) -> list[dict]:
+                   limit: int = 20000, scene_ids: set[str] | None = None) -> list[dict]:
         q = ["SELECT * FROM detections WHERE length_m BETWEEN ? AND ? AND confidence >= ?"]
         args: list = [min_length, max_length, min_confidence]
+        if scene_ids is not None:
+            if not scene_ids:
+                return []
+            q.append(f"AND scene_id IN ({','.join('?' * len(scene_ids))})")
+            args.extend(sorted(scene_ids))
         if start:
             q.append("AND ts >= ?")
             args.append(_ts(start if "T" in start else start + "T00:00:00+00:00"))
@@ -204,3 +232,65 @@ class Store:
             "first": one("SELECT MIN(datetime) FROM detections"),
             "last": one("SELECT MAX(datetime) FROM detections"),
         }
+
+    # Sentinel-3 ---------------------------------------------------------------
+
+    def s3_granule_status(self, granule_id: str) -> str | None:
+        rows = self._query("SELECT status FROM s3_granules WHERE id=?", (granule_id,))
+        return rows[0]["status"] if rows else None
+
+    def save_s3_granule(self, g, status: str, note: str = "", n_ships: int = 0) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO s3_granules (id, datetime, ts, status, note, n_ships, processed_at, geometry)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (g.id, g.datetime, _ts(g.datetime), status, note, n_ships, time.time(), json.dumps(g.geometry)))
+
+    def add_s3_detections(self, g, rows) -> int:
+        """rows: (S3Detection, chip). Skips specks already seen in an overlapping granule
+        of the same pass."""
+        ts = _ts(g.datetime)
+        added = 0
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM s3_detections WHERE granule_id=?", (g.id,))
+            for d, chip in rows:
+                dlat, dlon = _deg(600, d.lat)
+                dup = self.conn.execute(
+                    "SELECT 1 FROM s3_detections WHERE ABS(ts-?)<? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
+                    " AND granule_id<>? LIMIT 1",
+                    (ts, DUP_SECONDS, d.lat - dlat, d.lat + dlat, d.lon - dlon, d.lon + dlon, g.id)).fetchone()
+                if dup:
+                    continue
+                self.conn.execute(
+                    "INSERT INTO s3_detections (granule_id, datetime, ts, lon, lat, contrast, snr, npix, confidence, chip)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (g.id, g.datetime, ts, d.lon, d.lat, round(d.contrast, 4), round(d.snr, 1), d.npix,
+                     d.confidence, chip))
+                added += 1
+        return added
+
+    def s3_detections(self, granule_ids: set[str] | None = None, start: str | None = None,
+                      end: str | None = None) -> list[dict]:
+        q, args = ["SELECT * FROM s3_detections WHERE 1=1"], []
+        if granule_ids is not None:
+            if not granule_ids:
+                return []
+            q.append(f"AND granule_id IN ({','.join('?' * len(granule_ids))})")
+            args.extend(sorted(granule_ids))
+        if start:
+            q.append("AND ts >= ?")
+            args.append(_ts(start if "T" in start else start + "T00:00:00+00:00"))
+        if end:
+            q.append("AND ts <= ?")
+            args.append(_ts(end if "T" in end else end + "T23:59:59+00:00"))
+        q.append("ORDER BY ts DESC")
+        return [dict(r) for r in self._query(" ".join(q), args)]
+
+    def s3_granules(self) -> list[dict]:
+        rows = self._query("SELECT id, datetime, status, note, n_ships, geometry FROM s3_granules ORDER BY ts DESC")
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["geometry"] = json.loads(d["geometry"]) if d["geometry"] else None
+            out.append(d)
+        return out

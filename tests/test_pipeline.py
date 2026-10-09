@@ -21,7 +21,7 @@ from shiptracker.config import Settings
 from shiptracker.scene import apply_affine
 from shiptracker.pipeline import ScanOptions, scan
 from shiptracker.server import create_app
-from tests.synth import make_scene
+from tests.synth import make_scene, write_s3_granule
 
 EPSG = 32641            # UTM 41N
 LON, LAT = 61.0, 23.0   # Gulf of Oman, inside config/aoi.geojson
@@ -52,13 +52,13 @@ def _write_tiles(dirpath: Path, origin_xy):
     return truth, tr10, bounds
 
 
-def _item(item_id, dt, base_url, sub, bounds):
+def _item(item_id, dt, base_url, sub, bounds, tile="41QKL"):
     w, s, e, n = bounds
     return {
         "type": "Feature", "stac_version": "1.0.0", "id": item_id,
         "geometry": {"type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]},
         "bbox": [w, s, e, n],
-        "properties": {"datetime": dt, "eo:cloud_cover": 3.2, "s2:mgrs_tile": "41QKL", "proj:epsg": EPSG},
+        "properties": {"datetime": dt, "eo:cloud_cover": 3.2, "s2:mgrs_tile": tile, "proj:epsg": EPSG},
         "assets": {
             "nir": {"href": f"{base_url}/{sub}/B08.tif", "raster:bands": [{"scale": 0.0001, "offset": -0.1}]},
             "scl": {"href": f"{base_url}/{sub}/SCL.tif"},
@@ -70,6 +70,7 @@ def _item(item_id, dt, base_url, sub, bounds):
 
 class Handler(SimpleHTTPRequestHandler):
     pages: list = []
+    s3_items: list = []
 
     def log_message(self, *a):
         pass
@@ -78,10 +79,13 @@ class Handler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         page = body.get("page", 0)
-        assert body["collections"] == ["sentinel-2-c1-l2a"]
-        assert body["intersects"]["type"] == "Polygon"
-        out = {"type": "FeatureCollection", "features": self.pages[page], "links": []}
-        if page + 1 < len(self.pages):
+        assert body["intersects"]["type"] in ("Polygon", "MultiPolygon")
+        if body["collections"] == ["sentinel-3-olci-wfr-l2-netcdf"]:
+            out = {"type": "FeatureCollection", "features": self.s3_items, "links": []}
+        else:
+            assert body["collections"] == ["sentinel-2-c1-l2a"]
+            out = {"type": "FeatureCollection", "features": self.pages[page], "links": []}
+        if body["collections"] == ["sentinel-2-c1-l2a"] and page + 1 < len(self.pages):
             out["links"].append({"rel": "next", "href": f"http://{self.headers['Host']}/search",
                                  "method": "POST", "body": {"page": page + 1}, "merge": True})
         data = json.dumps(out).encode()
@@ -106,10 +110,18 @@ def world(tmp_path):
     base = f"http://127.0.0.1:{server.server_port}"
     Handler.pages = [
         [_item("S2A_41QKL_20260930_0_L2A", "2026-09-30T06:40:11Z", base, "a", bounds)],
-        [_item("S2A_41QKM_20260930_0_L2A", "2026-09-30T06:40:15Z", base, "b", bounds)],
+        [_item("S2A_41QKM_20260930_0_L2A", "2026-09-30T06:40:15Z", base, "b", bounds, tile="41QKM")],
     ]
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    settings = Settings(data_dir=tmp_path / "data", stac_url=base)
+    (served / "s3").mkdir()
+    s3_truth, s3_geom = write_s3_granule(served / "s3")
+    Handler.s3_items = [{
+        "type": "Feature", "id": "S3A_OL_2_WFR____20260930T060000", "geometry": s3_geom,
+        "properties": {"datetime": "2026-09-30T06:00:00Z"},
+        "assets": {k: {"href": f"{base}/s3/{f}"} for k, f in
+                   (("oa17", "Oa17_reflectance.nc"), ("geo", "geo_coordinates.nc"), ("wqsf", "wqsf.nc"))},
+    }]
+    settings = Settings(data_dir=tmp_path / "data", stac_url=base, s3_stac_url=base)
     yield settings, truth, tr
     server.shutdown()
 
@@ -143,8 +155,13 @@ def test_scan_end_to_end(world):
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/api/aoi").get_json()["geometry"]["type"] == "Polygon"
 
-    n_chips = len(list(settings.chips_dir.rglob("*.png")))
+    n_chips = len([p for p in settings.chips_dir.rglob("*.png") if "s3" not in p.parts])
     assert n_chips == len(SHIPS), "chips of de-duplicated detections should be removed"
+
+    # Sentinel-3 ran on the open sea Sentinel-2 did not cover
+    s3 = client.get("/api/s3/detections").get_json()["features"]
+    assert len(s3) == 3 and all(f["properties"]["chip_url"] for f in s3)
+    assert rep.s3_granules == 1 and rep.s3_ships == 3
 
     cov = client.get("/api/coverage").get_json()
     assert 0 < cov["fraction"] < 0.01  # one small synthetic tile in a huge area
@@ -164,8 +181,37 @@ def test_scan_end_to_end(world):
     assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)
 
 
-def test_latest_mode_uses_newest_image_per_tile(world):
+def test_latest_mode_processes_each_tile_and_latest_view(world):
     settings, _, _ = world
     rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
-    assert (rep.found, rep.processed) == (1, 1)  # both images are tile 41QKL: newest wins
+    assert (rep.found, rep.processed) == (2, 2)  # two overlapping tiles, one image each
     assert rep.area_imaged is not None
+    client = create_app(settings).test_client()
+    latest = client.get("/api/detections").get_json()["features"]
+    every = client.get("/api/detections?view=all").get_json()["features"]
+    assert len(latest) == len(every) == len(SHIPS)
+    assert len(client.get("/api/scenes").get_json()) == 2
+
+
+def test_tile_falls_back_to_older_pass_when_newest_is_cloud(world):
+    """Newest image of tile 41QKL is clouded over: use its previous pass instead, and
+    show that pass on the map."""
+    import shutil
+
+    settings, _, _ = world
+    served = settings.data_dir.parent / "served"
+    shutil.copytree(served / "a", served / "c")
+    with rasterio.open(served / "c" / "SCL.tif", "r+") as dst:
+        dst.write(np.full((dst.height, dst.width), 9, np.uint8), 1)  # all cloud
+    older = Handler.pages[0][0]
+    w, s, e, n = older["bbox"]
+    Handler.pages = [[_item("S2A_41QKL_20261005_0_L2A", "2026-10-05T06:40:11Z", settings.stac_url, "c",
+                            (w, s, e, n)), older]]
+
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-06", sentinel3=False))
+    assert (rep.skipped, rep.processed) == (1, 1)
+    assert rep.ships == len(SHIPS)
+    client = create_app(settings).test_client()
+    feats = client.get("/api/detections").get_json()["features"]
+    assert len(feats) == len(SHIPS)
+    assert {f["properties"]["scene_id"] for f in feats} == {"S2A_41QKL_20260930_0_L2A"}

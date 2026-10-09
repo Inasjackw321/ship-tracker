@@ -19,7 +19,8 @@ def _days_ago(n: int) -> str:
 def _add_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--start", default=None, help="start date YYYY-MM-DD (default: 7 days ago)")
     p.add_argument("--end", default=None, help="end date YYYY-MM-DD (default: today)")
-    p.add_argument("--days", type=int, default=7, help="look-back window when --start is omitted")
+    p.add_argument("--days", type=int, default=30,
+                   help="look-back window when --start is omitted (each tile uses its latest image in it)")
     p.add_argument("--max-cloud", type=float, default=30.0, help="max scene cloud cover %% (default 30)")
     p.add_argument("--limit", type=int, default=None, help="process at most N scenes (newest first)")
 
@@ -56,11 +57,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all-passes", action="store_true",
                    help="scan every pass in the date range, not just the newest image of each tile")
     p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
+    p.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
 
     p = sub.add_parser("watch", help="scan for new imagery repeatedly")
     p.add_argument("--every-hours", type=float, default=6.0)
     p.add_argument("--workers", type=int, default=3)
-    p.add_argument("--days", type=int, default=3, help="look-back window on each run")
+    p.add_argument("--days", type=int, default=30, help="look-back window on each run")
+    p.add_argument("--no-s3", action="store_true")
     p.add_argument("--max-cloud", type=float, default=30.0)
     p.add_argument("--no-rgb", action="store_true")
     p.add_argument("--delete-tiles", action="store_true")
@@ -104,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         opts.reprocess = args.reprocess
         opts.mode = "all" if args.all_passes else "latest"
         opts.workers = args.workers
+        opts.sentinel3 = not args.no_s3
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -114,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
             opts = ScanOptions(start=(now - timedelta(days=args.days)).date().isoformat(),
                                end=now.date().isoformat(), max_cloud=args.max_cloud,
                                rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles,
-                               workers=args.workers)
+                               workers=args.workers, sentinel3=not args.no_s3)
             try:
                 scan(settings, opts)
             except Exception:

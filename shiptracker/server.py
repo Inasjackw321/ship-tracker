@@ -9,10 +9,10 @@ from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_from_directory
 
-from .aoi import aoi_geojson
+from .aoi import aoi_geojson, load_aoi
 from .config import Settings
 from .db import Store
-from .pipeline import ScanOptions, ScanReport, scan
+from .pipeline import ScanOptions, ScanReport, current_scene_ids, scan
 
 log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
@@ -48,9 +48,13 @@ def create_app(settings: Settings | None = None) -> Flask:
     def aoi():
         return jsonify({"type": "Feature", "properties": {}, "geometry": aoi_geojson(settings.aoi_path)})
 
+    def latest_view() -> bool:
+        return request.args.get("view", "latest") != "all"
+
     @app.get("/api/detections")
     def detections():
         a = request.args
+        ids = current_scene_ids(store, load_aoi(settings.aoi_path)) if latest_view() else None
         try:
             rows = store.detections(
                 start=a.get("start") or None, end=a.get("end") or None,
@@ -59,6 +63,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 min_confidence=float(a.get("min_confidence", 0) or 0),
                 include_stationary=a.get("stationary", "1") != "0",
                 limit=int(a.get("limit", 20000)),
+                scene_ids=ids,
             )
         except ValueError as exc:
             abort(400, str(exc))
@@ -66,7 +71,25 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/api/scenes")
     def scenes():
-        return jsonify(store.scenes(int(request.args.get("limit", 500))))
+        rows = store.scenes(int(request.args.get("limit", 5000)))
+        if latest_view():
+            ids = current_scene_ids(store, load_aoi(settings.aoi_path))
+            rows = [r for r in rows if r["id"] in ids]
+        return jsonify(rows)
+
+    @app.get("/api/s3/detections")
+    def s3_detections():
+        ids = set(store.get_meta("s3_current", [])) if latest_view() else None
+        rows = store.s3_detections(ids, request.args.get("start") or None, request.args.get("end") or None)
+        return jsonify({"type": "FeatureCollection", "features": [_feature(r) for r in rows]})
+
+    @app.get("/api/s3/granules")
+    def s3_granules():
+        rows = store.s3_granules()
+        if latest_view():
+            ids = set(store.get_meta("s3_current", []))
+            rows = [r for r in rows if r["id"] in ids]
+        return jsonify(rows)
 
     @app.get("/api/coverage")
     def coverage():
@@ -98,7 +121,7 @@ def create_app(settings: Settings | None = None) -> Flask:
         today = date.today()
         try:
             opts = ScanOptions(
-                start=body.get("start") or (today - timedelta(days=7)).isoformat(),
+                start=body.get("start") or (today - timedelta(days=30)).isoformat(),
                 end=body.get("end") or today.isoformat(),
                 max_cloud=float(body.get("max_cloud", 30)),
                 limit=int(body["limit"]) if body.get("limit") else None,
@@ -106,6 +129,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 keep_tiles=bool(body.get("keep_tiles", True)),
                 mode="all" if body.get("all_passes") else "latest",
                 workers=int(body.get("workers", 3)),
+                sentinel3=bool(body.get("sentinel3", True)),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

@@ -33,7 +33,7 @@
   button:disabled { opacity: .5; cursor: default; }
   button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
   .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
   .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
   .stat b { display: block; font-size: 18px; }
   .stat span { font-size: 11px; color: var(--muted); }
@@ -72,6 +72,7 @@
         <div class="stat"><b id="s-ships">–</b><span>ships</span></div>
         <div class="stat"><b id="s-scenes">–</b><span>tiles analysed</span></div>
         <div class="stat"><b id="s-shown">–</b><span>shown</span></div>
+        <div class="stat" title="Possible large ships spotted by Sentinel-3 (300 m) at open sea; size not measurable"><b id="s-s3">–</b><span>open-sea (S3)</span></div>
         <div class="stat" title="Share of the search area Sentinel-2 photographed in the last scan's date window"><b id="s-imaged">–</b><span>area imaged</span></div>
       </div>
     </section>
@@ -82,7 +83,8 @@
         <label>To <input type="date" id="scan-end"></label>
         <label>Max cloud % <input type="number" id="scan-cloud" value="30" min="0" max="100"></label>
         <label>Max tiles <input type="number" id="scan-limit" placeholder="all" min="1"></label>
-        <label class="inline" title="Off: newest image of every tile, covering the whole area once. On: every satellite pass in the date range."><input type="checkbox" id="scan-all"> every pass</label>
+        <label class="inline" title="Off: most recent usable image of every tile. On: every satellite pass in the date range."><input type="checkbox" id="scan-all"> every pass</label>
+        <label class="inline" title="Check open sea that Sentinel-2 never images with Sentinel-3 (300 m): finds large ships only, without size"><input type="checkbox" id="scan-s3" checked> Sentinel-3 open sea</label>
       </div>
       <div class="row"><button id="scan-btn">Scan</button><span id="scan-state" class="meta"></span></div>
       <div id="status"></div>
@@ -96,6 +98,7 @@
         <label>Max length (m) <input type="number" id="f-max" placeholder="any" min="0"></label>
         <label>Min confidence <input type="number" id="f-conf" value="0" min="0" max="1" step="0.1"></label>
         <label class="inline"><input type="checkbox" id="f-stat" checked> show stationary</label>
+        <label class="inline" title="Only results from each tile's most recent analysed image"><input type="checkbox" id="f-latest" checked> latest image per tile</label>
       </div>
       <div class="row"><button class="ghost" id="f-apply">Apply</button></div>
     </section>

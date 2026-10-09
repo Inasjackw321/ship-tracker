@@ -40,7 +40,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 2
+DETECTOR_VERSION = 3
 
 
 @dataclass
@@ -69,6 +69,9 @@ class DetectParams:
     min_aspect: float = 2.0    # applied to objects >= aspect_from_m long
     aspect_from_m: float = 40.0
     # Context test: a ring around each object (gap px from the hull end, width px).
+    # No seeds this close to the edge of the image data (swath edges, tile borders and
+    # nodata gaps produce bright artifacts; overlapping neighbour tiles cover the strip).
+    edge_buffer_px: int = 30
     ring_gap_px: int = 10
     ring_width_px: int = 50
     max_ring_cloud: float = 0.05    # share of SCL cloud/shadow pixels allowed in the ring
@@ -138,8 +141,10 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
     land = valid & ~sea
     if p.coast_buffer_px and land.any():
         land = ndimage.maximum_filter(land, size=2 * p.coast_buffer_px + 1)
-    land_raw = valid & ~sea
+    land_raw = (valid & ~sea) | ~valid  # hulls may not touch land, big cloud or nodata
     search = sea & valid & aoi & ~land & ~cloud
+    if p.edge_buffer_px and (~valid).any():
+        search &= ~ndimage.maximum_filter(~valid, size=2 * p.edge_buffer_px + 1)
     return search, sea & valid & ~cloud, land_raw
 
 

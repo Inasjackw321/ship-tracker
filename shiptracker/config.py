@@ -29,6 +29,16 @@ SOURCES = {
 }
 
 
+# Sentinel-3 OLCI full-resolution (300 m) water product, used only for open sea that
+# Sentinel-2 does not image. Planetary Computer serves it anonymously (SAS-signed).
+SENTINEL3 = {
+    "stac_url": "https://planetarycomputer.microsoft.com/api/stac/v1",
+    "collection": "sentinel-3-olci-wfr-l2-netcdf",
+    "sas_url": "https://planetarycomputer.microsoft.com/api/sas/v1/token/{collection}",
+    "files": {"refl": "Oa17_reflectance.nc", "geo": "geo_coordinates.nc", "flags": "wqsf.nc"},
+}
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_DATA", str(ROOT / "data"))))
@@ -37,6 +47,7 @@ class Settings:
     # Overrides for the selected source (handy for mirrors and tests).
     stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_STAC_URL"))
     collection: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_COLLECTION"))
+    s3_stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_S3_STAC_URL"))
 
     @property
     def tiles_dir(self) -> Path:
@@ -58,6 +69,12 @@ class Settings:
             cfg["stac_url"] = self.stac_url
         if self.collection:
             cfg["collection"] = self.collection
+        return cfg
+
+    def s3_config(self) -> dict:
+        cfg = dict(SENTINEL3)
+        if self.s3_stac_url:
+            cfg["stac_url"] = self.s3_stac_url
         return cfg
 
     def ensure_dirs(self) -> None:

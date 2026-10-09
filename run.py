@@ -1,7 +1,7 @@
 """One-command launcher: sets up the environment, starts the map, scans recent imagery.
 
     python run.py                 (Windows: py run.py, or double-click run.bat)
-    python run.py --days 15 --max-cloud 50
+    python run.py --days 45 --max-cloud 50
     python run.py --no-scan       (just open the map with existing results)
 """
 from __future__ import annotations
@@ -61,7 +61,8 @@ def free_port(preferred: int, host: str = "127.0.0.1") -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Start the ship tracker map and scan recent Sentinel-2 imagery")
-    ap.add_argument("--days", type=int, default=10, help="scan imagery from the last N days (default 10)")
+    ap.add_argument("--days", type=int, default=30,
+                    help="look this many days back for each tile's most recent image (default 30)")
     ap.add_argument("--limit", type=int, default=0, help="max tiles to download this run (default 0 = whole area)")
     ap.add_argument("--all-passes", action="store_true",
                     help="scan every pass in the window instead of the newest image of each tile")
@@ -69,6 +70,7 @@ def main() -> int:
     ap.add_argument("--keep-tiles", action="store_true",
                     help="keep downloaded tiles (default: delete each after processing; chips are kept)")
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
+    ap.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
     ap.add_argument("--no-scan", action="store_true", help="don't scan, just open the map")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
@@ -102,6 +104,7 @@ def main() -> int:
             "all_passes": args.all_passes,
             "workers": args.workers,
             "keep_tiles": args.keep_tiles,
+            "sentinel3": not args.no_s3,
         }
         resp = app.test_client().post("/api/scan", json=body)
         if resp.status_code != 202:

@@ -14,9 +14,9 @@ py run.py          # Windows (or double-click run.bat)
 python3 run.py     # macOS / Linux
 ```
 
-The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the **whole area**: the newest image of every Sentinel-2 tile from the last 10 days. Ships appear on the map as each tile finishes.
+The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the **whole area**. Every Sentinel-2 tile uses its most recent usable image from the last 30 days. Open sea that Sentinel-2 never photographs is then checked with Sentinel-3. Ships appear on the map as each tile finishes.
 
-Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). Useful options are `--days 15`, `--max-cloud 50`, `--workers 4`, `--all-passes`, `--keep-tiles` and `--no-scan`.
+Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). Useful options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes`, `--no-s3`, `--keep-tiles` and `--no-scan`.
 
 ## Manual setup
 
@@ -62,6 +62,7 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 
 ## How detection and measurement work (`shiptracker/detect.py`, `shiptracker/verify.py`)
 
+0. **Image edges.** Seeds within 300 m of the edge of the image data are ignored, as is anything touching nodata. Swath edges and tile borders produce bright artifacts, and the overlapping neighbour tile sees that strip from its interior.
 1. **Sea mask.** Pixels count as sea if SCL calls them water or their NIR reflectance is very dark. Small enclosed non-water blobs, up to ship size, are filled back in, because SCL often labels the ships themselves as cloud or land. Vegetated patches are never filled, so mangrove islets and strips stay land. A 50 m coastal buffer is removed, as are SCL clouds and cloud shadows plus 100 m around them. Cloud blobs the size of a ship are not treated as cloud.
 2. **Candidates.** In the 10 m NIR band, open water is near zero and hulls are bright. Each pixel is compared with the mean and standard deviation of the water around it (a 610 m window). It must be at least 5σ brighter and at least 0.025 reflectance brighter. Bright objects are excluded from the background first, using a coarse median, so large ships don't hide themselves. The statistics are then recomputed without first-pass hits, which copes with sun glint gradients.
 3. **Hull extraction.** Each candidate is grown to every connected pixel brighter than 25 % of its peak, so the whole hull is captured rather than just the brightest part.
@@ -87,13 +88,27 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 
 When the detector changes, tiles analysed by an older version are redone automatically on the next scan. Their old results are replaced.
 
-### Why Sentinel-2 and not Sentinel-3
+### Open sea: Sentinel-3 (`shiptracker/s3.py`)
 
-Sentinel-3's sharpest images (OLCI) are 300 m per pixel. A 200 m ship is smaller than one pixel, so it can't be detected or measured, and Sentinel-3's cloud mask is far too coarse to remove the small clouds that cause false alarms. The ship-sized cloud and vegetation checks above use Sentinel-2's own colour bands at 10 m instead. For detection through cloud, the complementary sensor is the Sentinel-1 radar.
+Sentinel-2 does not photograph most of the open Arabian Sea. After the Sentinel-2 part of a scan, the remaining sea is checked with **Sentinel-3 OLCI**. This is the 300 m full-resolution water product, from the last 2 days, served by Microsoft Planetary Computer with no account needed. The newest image of each part of that sea is used.
+
+A 300 m pixel is larger than any ship, so this is a different, weaker kind of detection:
+
+- **Detected:** a large ship (roughly 150 m and up, in clear sky) brightens its pixel in the 865 nm band enough to stand out as an isolated **bright speck**, often helped by its wake. Specks are rejected if they are larger than about 6 pixels (cloud or land), close to land, or surrounded by cloud or clutter.
+- **Size:** **cannot be measured**, and position is good to about ±300 m. Small ships are invisible.
+- **On the map:** these show as purple rings labelled *possible large ship (Sentinel-3)*, in their own layer and with their own image chips.
+
+Each image downloads about 100–150 MB: the 865 nm band, latitude/longitude and quality flags. Turn this off with `--no-s3`, or untick it in the scan form.
 
 ## Covering the whole area
 
-By default a scan selects the **newest image of each MGRS tile** in the date window. Some tiles sit at the edge of a satellite swath, where each pass images only part of the tile. For those, older passes are added until the whole tile is covered. `--all-passes` processes every pass instead, which shows the same sea several times over.
+By default a scan uses the **most recent usable image of each MGRS tile** within the look-back window (30 days):
+
+- If a tile's newest image has no cloud-free sea, the scan falls back to the next older pass, up to 3 times.
+- Some tiles sit at the edge of a satellite swath, where each pass images only part of the tile. For those, older passes are added until the whole tile is covered.
+- `--all-passes` processes every pass instead.
+
+The map shows the **latest image per tile** by default: only results from each tile's most recent analysed image, not every pass ever scanned. Untick it under Filter to see everything.
 
 Each scan also measures how much of the search area Sentinel-2 photographed in the window. The figure appears in the log and as **area imaged** on the map, and the unimaged part is shaded dark.
 
@@ -105,10 +120,11 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 
 | Endpoint | |
 |---|---|
-| `GET /api/detections?start=&end=&min_length=&max_length=&min_confidence=&stationary=0\|1` | GeoJSON of ships: length/width/heading, bow and stern points, chip URL |
+| `GET /api/detections?view=latest\|all&start=&end=&min_length=&max_length=&min_confidence=&stationary=0\|1` | GeoJSON of ships: length/width/heading, bow and stern points, chip URL |
 | `GET /api/scenes` | Processed tiles with status and footprint |
 | `GET /api/stats` | Counts |
 | `GET /api/aoi` | Search area polygon |
+| `GET /api/s3/detections?view=latest\|all`, `GET /api/s3/granules` | Sentinel-3 possible large ships (no size) and the images used |
 | `GET /api/coverage` | Imaged and not-imaged parts of the area from the last scan's search |
 | `POST /api/scan` `{start, end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |

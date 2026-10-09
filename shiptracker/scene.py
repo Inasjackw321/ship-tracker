@@ -93,6 +93,17 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                     continue
                 dn = src.read(1, window=win)
                 valid = dn != nodata
+                # Treat the outer rim of the tile like nodata: edge artifacts live there,
+                # and the overlapping neighbour tile sees that strip from its interior.
+                e = p.edge_buffer_px
+                if rr0 < e:
+                    valid[: e - rr0] = False
+                if cc0 < e:
+                    valid[:, : e - cc0] = False
+                if rr1 > H - e:
+                    valid[H - e - rr1:] = False
+                if cc1 > W - e:
+                    valid[:, W - e - cc1:] = False
                 if not valid.any():
                     continue
                 scl = _read_scl(scl_src, win, src.transform, dn.shape)

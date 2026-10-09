@@ -10,18 +10,26 @@ const labels = L.tileLayer(
   { maxZoom: 19 }).addTo(map);
 
 const aoiLayer = L.geoJSON(null, { style: { color: '#39ff5a', weight: 3, fill: false } }).addTo(map);
+// Ships draw in their own pane above the tile outlines, so tiles never block clicks.
+map.createPane('ships').style.zIndex = 650;
+map.createPane('tiles').style.zIndex = 390;
+
 const gapLayer = L.geoJSON(null, {
+  pane: 'tiles',
   style: { color: '#000', weight: 0, fillColor: '#000', fillOpacity: 0.45 },
   onEachFeature: (f, l) => l.bindTooltip('No Sentinel-2 image of this part in the scan window — nothing to scan here', { sticky: true }),
 }).addTo(map);
 const sceneLayer = L.geoJSON(null, {
+  pane: 'tiles',
   style: (f) => ({ color: f.properties.status === 'done' ? '#58a6ff' : '#8b98a5', weight: 1, fillOpacity: 0.03 }),
   onEachFeature: (f, l) => l.bindTooltip(`${f.properties.id}<br>${f.properties.status}: ${f.properties.note || ''}`),
 }).addTo(map);
 const shipLayer = L.layerGroup().addTo(map);
 const rulerLayer = L.layerGroup().addTo(map);
+const s3Layer = L.layerGroup().addTo(map);
 L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Search area': aoiLayer,
-  'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships': shipLayer, 'Rulers': rulerLayer }).addTo(map);
+  'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships (Sentinel-2)': shipLayer,
+  'Rulers': rulerLayer, 'Possible large ships (Sentinel-3)': s3Layer }).addTo(map);
 
 function colorFor(len) {
   if (len >= 250) return '#ff4d4d';
@@ -33,7 +41,8 @@ const legend = L.control({ position: 'bottomright' });
 legend.onAdd = () => {
   const d = L.DomUtil.create('div', 'legend');
   d.innerHTML = [['#ff4d4d', '≥ 250 m'], ['#ff9f1a', '150–250 m'], ['#ffd60a', '80–150 m'], ['#4cc9f0', '< 80 m']]
-    .map(([c, t]) => `<i style="background:${c}"></i>${t}`).join('<br>');
+    .map(([c, t]) => `<i style="background:${c}"></i>${t}`).join('<br>')
+    + '<br><i style="background:transparent;border:3px solid #c77dff;box-sizing:border-box"></i>open sea, S3 (no size)';
   return d;
 };
 legend.addTo(map);
@@ -68,11 +77,11 @@ function drawRulers() {
     const [lon, lat] = f.geometry.coordinates;
     if (!bounds.contains([lat, lon])) continue;
     const line = L.polyline([[p.stern_lat, p.stern_lon], [p.bow_lat, p.bow_lon]],
-      { color: '#fff', weight: 3, opacity: 0.95 });
+      { pane: 'ships', color: '#fff', weight: 3, opacity: 0.95 });
     line.bindTooltip(`${p.length_m.toFixed(0)} m`, { permanent: true, direction: 'right', className: 'ruler-label' });
     rulerLayer.addLayer(line);
     for (const pt of [[p.stern_lat, p.stern_lon], [p.bow_lat, p.bow_lon]]) {
-      rulerLayer.addLayer(L.circleMarker(pt, { radius: 4, color: '#000', weight: 1, fillColor: '#fff', fillOpacity: 1 }));
+      rulerLayer.addLayer(L.circleMarker(pt, { pane: 'ships', radius: 4, color: '#000', weight: 1, fillColor: '#fff', fillOpacity: 1 }));
     }
   }
 }
@@ -87,6 +96,7 @@ function render() {
     const p = f.properties;
     const [lon, lat] = f.geometry.coordinates;
     const m = L.circleMarker([lat, lon], {
+      pane: 'ships',
       radius: Math.max(4, Math.min(12, p.length_m / 30)), color: '#000', weight: 1,
       fillColor: colorFor(p.length_m), fillOpacity: 0.9,
     }).bindPopup(popupHtml(p, lat, lon), { maxWidth: 320 });
@@ -127,6 +137,7 @@ async function loadDetections() {
   if ($('f-max').value) q.set('max_length', $('f-max').value);
   q.set('min_confidence', $('f-conf').value || 0);
   q.set('stationary', $('f-stat').checked ? '1' : '0');
+  q.set('view', $('f-latest').checked ? 'latest' : 'all');
   const fc = await getJSON('/api/detections?' + q);
   features = fc.features;
   render();
@@ -145,8 +156,36 @@ async function loadCoverage() {
   $('s-imaged').textContent = c.fraction == null ? '–' : `${Math.round(c.fraction * 100)}%`;
 }
 
+function s3PopupHtml(p, lat, lon) {
+  return `<div class="popup">
+    ${p.chip_url ? `<img src="${esc(p.chip_url)}" alt="Sentinel-3 chip">` : ''}
+    <table>
+      <tr><td>What</td><td><b>Possible large ship</b> (bright speck)</td></tr>
+      <tr><td>Size</td><td>not measurable: Sentinel-3 pixels are 300 m</td></tr>
+      <tr><td>Seen</td><td>${esc(fmtDate(p.datetime))}</td></tr>
+      <tr><td>Position</td><td>${lat.toFixed(4)}, ${lon.toFixed(4)} (± ~300 m)</td></tr>
+      <tr><td>Confidence</td><td>${(p.confidence * 100).toFixed(0)}%  (SNR ${p.snr})</td></tr>
+      <tr><td>Image</td><td style="font-size:11px">${esc(p.granule_id)}</td></tr>
+    </table></div>`;
+}
+
+let s3Features = [];
+async function loadS3() {
+  const view = $('f-latest').checked ? 'latest' : 'all';
+  const fc = await getJSON('/api/s3/detections?view=' + view);
+  s3Features = fc.features;
+  s3Layer.clearLayers();
+  for (const f of s3Features) {
+    const [lon, lat] = f.geometry.coordinates;
+    s3Layer.addLayer(L.circleMarker([lat, lon], {
+      pane: 'ships', radius: 7, color: '#c77dff', weight: 3, fillColor: '#c77dff', fillOpacity: 0.25,
+    }).bindPopup(s3PopupHtml(f.properties, lat, lon), { maxWidth: 360 }));
+  }
+  $('s-s3').textContent = s3Features.length;
+}
+
 async function loadScenes() {
-  const scenes = await getJSON('/api/scenes');
+  const scenes = await getJSON('/api/scenes?view=' + ($('f-latest').checked ? 'latest' : 'all'));
   sceneLayer.clearLayers();
   sceneLayer.addData(scenes.filter((s) => s.geometry).map((s) => ({
     type: 'Feature', geometry: s.geometry, properties: s })));
@@ -167,10 +206,10 @@ async function pollScan() {
   }
   if (running) {
     if (!polling) polling = setInterval(() => pollScan().catch(console.error), 3000);
-    loadDetections(); loadStats(); loadScenes(); loadCoverage();
+    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadS3();
   } else if (polling) {
     clearInterval(polling); polling = null;
-    loadDetections(); loadStats(); loadScenes(); loadCoverage();
+    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadS3();
   }
 }
 
@@ -183,22 +222,25 @@ $('scan-btn').onclick = async () => {
         max_cloud: Number($('scan-cloud').value || 30),
         limit: $('scan-limit').value ? Number($('scan-limit').value) : null,
         all_passes: $('scan-all').checked,
+        sentinel3: $('scan-s3').checked,
       }),
     });
   } catch (e) { $('scan-state').textContent = 'error: ' + e.message; }
   pollScan();
 };
-$('f-apply').onclick = () => loadDetections().catch((e) => alert(e.message));
+$('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes(), loadS3()]).catch((e) => alert(e.message));
+$('f-latest').onchange = $('f-apply').onclick;
 
 (function init() {
   const today = new Date();
-  const weekAgo = new Date(today - 10 * 864e5);
+  const weekAgo = new Date(today - 30 * 864e5);
   $('scan-end').value = today.toISOString().slice(0, 10);
   $('scan-start').value = weekAgo.toISOString().slice(0, 10);
   getJSON('/api/aoi').then((g) => { aoiLayer.addData(g); map.fitBounds(aoiLayer.getBounds()); });
   loadDetections().catch(console.error);
   loadStats().catch(console.error);
   loadScenes().catch(console.error);
+  loadS3().catch(console.error);
   loadCoverage().catch(console.error);
   pollScan().catch(console.error);
 })();

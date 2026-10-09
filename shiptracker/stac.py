@@ -138,6 +138,25 @@ def search_scenes(
     return scenes[:limit] if limit else scenes
 
 
+def search_items(stac_url: str, body: dict, max_items: int | None = None) -> list[dict]:
+    """POST a STAC search and follow pagination; returns raw items (de-duplicated)."""
+    session = _session()
+    url = stac_url.rstrip("/") + "/search"
+    items: list[dict] = []
+    seen: set[str] = set()
+    method, next_url, next_body = "POST", url, body
+    while next_url:
+        page = _request(session, method, next_url, json=next_body) if method == "POST" else _request(session, "GET", next_url)
+        for item in page.get("features", []):
+            if item["id"] not in seen:
+                seen.add(item["id"])
+                items.append(item)
+        if max_items and len(items) >= max_items:
+            break
+        method, next_url, next_body = _next_link(page, next_body)
+    return items
+
+
 def _next_link(page: dict, prev_body: dict | None) -> tuple[str, str | None, dict | None]:
     for link in page.get("links", []):
         if link.get("rel") != "next":

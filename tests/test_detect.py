@@ -94,3 +94,18 @@ def test_vegetation_strip_was_a_false_positive_with_old_settings():
     old = DetectParams(max_hole_px=3000, max_length_m=500, coast_buffer_px=3, fill_vegetation_holes=True)
     dets = detect_in_array(refl, scl, valid, valid, old)
     assert len(dets) == 1 and dets[0].length_m > 400
+
+
+def test_ignores_bright_artifacts_along_data_edge():
+    # Swath edge: nodata on the right, with a jagged bright rim on the last valid pixels.
+    refl, scl, _ = make_scene(ships=[(300, 200, 150, 25, 20)], land=False, cloud=False)
+    valid = np.ones(refl.shape, bool)
+    valid[:, 450:] = False
+    refl[:, 450:] = 0
+    scl[:, 450:] = 0
+    rng = np.random.default_rng(3)
+    for r in range(0, 600, 25):
+        refl[r:r + rng.integers(4, 15), 440:450] += 0.15
+    dets = detect_in_array(refl, scl, valid, valid | True, DetectParams())
+    assert len(dets) == 1
+    _match(dets, 299.5, 199.5)
