@@ -153,6 +153,16 @@ def test_scan_end_to_end(world):
     again = scan(settings, opts)
     assert again.already_done == 2 and again.ships == 0
 
+    # Results from an older detector version are recomputed, not kept or duplicated.
+    from shiptracker.db import Store
+    st = Store(settings.db_path)
+    with st.conn:
+        st.conn.execute("UPDATE scenes SET detector_version=1")
+    st.close()
+    redo = scan(settings, opts)
+    assert redo.processed == 2 and redo.already_done == 0
+    assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)
+
 
 def test_latest_mode_uses_newest_image_per_tile(world):
     settings, _, _ = world

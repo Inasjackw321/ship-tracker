@@ -70,7 +70,7 @@ def clear_sea_fraction(scl_path, aoi: BaseGeometry) -> float:
 
 
 def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_offset: float,
-                 params: DetectParams | None = None) -> list[GeoDetection]:
+                 params: DetectParams | None = None, rejected=None) -> list[GeoDetection]:
     p = params or DetectParams()
     results: list[GeoDetection] = []
     with rasterio.open(nir_path) as src, rasterio.open(scl_path) as scl_src:
@@ -101,7 +101,7 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                 refl = dn.astype(np.float32) * nir_scale + nir_offset
                 wt = window_transform(win, src.transform)
                 aoi_mask = geometry_mask([mapping(aoi_proj)], out_shape=dn.shape, transform=wt, invert=True)
-                dets = detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m)
+                dets = detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected)
                 for d in dets:
                     fr, fc = d.row + rr0, d.col + cc0
                     # Keep each ship once: only in the block whose core holds its centre.

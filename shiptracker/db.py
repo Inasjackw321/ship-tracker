@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS scenes (
     note TEXT,
     n_ships INTEGER DEFAULT 0,
     processed_at REAL,
+    detector_version INTEGER DEFAULT 1,
     geometry TEXT
 );
 CREATE TABLE IF NOT EXISTS detections (
@@ -73,6 +74,10 @@ class Store:
         self.lock = threading.RLock()  # one connection shared by scan workers and web requests
         with self.lock:
             self.conn.executescript(SCHEMA)
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(scenes)")}
+            if "detector_version" not in cols:  # databases from before versioning
+                self.conn.execute("ALTER TABLE scenes ADD COLUMN detector_version INTEGER DEFAULT 1")
+                self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -96,17 +101,21 @@ class Store:
         row = rows[0] if rows else None
         return row["status"] if row else None
 
+    def scene_version(self, scene_id: str) -> int:
+        rows = self._query("SELECT detector_version FROM scenes WHERE id=?", (scene_id,))
+        return int(rows[0]["detector_version"] or 1) if rows else 0
+
     def save_scene(self, scene, status: str, note: str = "", sea_fraction: float | None = None,
-                   n_ships: int = 0) -> None:
+                   n_ships: int = 0, detector_version: int = 1) -> None:
         with self.lock, self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO scenes
                    (id, datetime, ts, tile, cloud_cover, aoi_overlap, sea_fraction, status, note,
-                    n_ships, processed_at, geometry)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    n_ships, processed_at, detector_version, geometry)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scene.id, scene.datetime, _ts(scene.datetime), scene.tile, scene.cloud_cover,
                  scene.aoi_overlap, sea_fraction, status, note, n_ships, time.time(),
-                 json.dumps(scene.geometry)),
+                 detector_version, json.dumps(scene.geometry)),
             )
 
     def scenes(self, limit: int = 500) -> list[dict]:

@@ -6,3 +6,4 @@ shapely>=2.0
 requests>=2.31
 Pillow>=10.0
 flask>=3.0
+global-land-mask>=1.0

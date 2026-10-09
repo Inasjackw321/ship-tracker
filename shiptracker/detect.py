@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
+from collections import Counter
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -33,7 +35,12 @@ log = logging.getLogger(__name__)
 # 8 cloud medium prob, 9 cloud high prob, 10 thin cirrus, 11 snow.
 SCL_CLOUD = (1, 3, 8, 9, 10)
 SCL_WATER = 6
+SCL_VEGETATION = 4
 SCL_SHADOW = (2, 3)
+SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
+
+# Bump when detection changes enough that old results should be recomputed.
+DETECTOR_VERSION = 2
 
 
 @dataclass
@@ -47,17 +54,30 @@ class DetectParams:
     grow_frac: float = 0.25    # grow seeds to this fraction of the peak excess
     profile_frac: float = 0.3  # profile level used for the ends of the hull
     psf_sigma_px: float = 0.53  # Sentinel-2 10 m PSF (Gaussian sigma, px)
-    coast_buffer_px: int = 3
+    coast_buffer_px: int = 5
     cloud_buffer_px: int = 10
     min_cloud_px: int = 400    # SCL cloud blobs smaller than this may be ships
-    max_hole_px: int = 3000    # enclosed non-water blobs smaller than this are sea
+    # Enclosed non-water blobs up to this size are treated as sea (they are usually the
+    # ships themselves). Kept close to the largest hull (~400 x 60 m plus blur) so that
+    # islets, sandbars and mangrove patches stay land.
+    max_hole_px: int = 600
     water_nir_max: float = 0.04
     min_pixels: int = 3
     min_length_m: float = 25.0
-    max_length_m: float = 500.0
+    max_length_m: float = 420.0
     max_width_m: float = 90.0
     min_aspect: float = 2.0    # applied to objects >= aspect_from_m long
-    aspect_from_m: float = 50.0
+    aspect_from_m: float = 40.0
+    # Context test: a ring around each object (gap px from the hull end, width px).
+    ring_gap_px: int = 10
+    ring_width_px: int = 50
+    max_ring_cloud: float = 0.05    # share of SCL cloud/shadow pixels allowed in the ring
+    max_ring_clutter: float = 0.03  # share of other bright pixels allowed in the ring
+    # Hull ends are sharp; cloud puffs fade out. Ratio of the hull length measured at
+    # 30 % and at 70 % of the deck level: ~1.05-1.15 for hulls, ~1.4-1.5 for cloud puffs.
+    max_edge_softness: float = 1.35
+    edge_test_from_px: float = 8.0  # only for objects at least this long (px)
+    fill_vegetation_holes: bool = False  # never relabel vegetated islets/strips as sea
 
 
 @dataclass
@@ -94,7 +114,8 @@ def _component_sizes(mask: np.ndarray, structure=None) -> tuple[np.ndarray, np.n
 
 def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
                 p: DetectParams) -> tuple[np.ndarray, np.ndarray]:
-    """Return (search, sea): where to look for ship seeds, and where hulls may extend."""
+    """Return (search, sea, land): where to look for ship seeds, where hulls may extend,
+    and land (including large clouds) that a hull must not touch."""
     cloud_raw = np.isin(scl, SCL_CLOUD) & valid
     labels, sizes = _component_sizes(cloud_raw)
     cloud = (sizes >= p.min_cloud_px)[labels]
@@ -108,14 +129,18 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
     border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
     hole = sizes < p.max_hole_px
     hole[border] = False
+    if not p.fill_vegetation_holes:
+        veg = np.bincount(labels.ravel(), weights=(scl == SCL_VEGETATION).ravel(), minlength=sizes.size)
+        hole &= veg < 0.5 * np.maximum(sizes, 1)
     hole[0] = False
     sea = water | hole[labels]
 
     land = valid & ~sea
     if p.coast_buffer_px and land.any():
         land = ndimage.maximum_filter(land, size=2 * p.coast_buffer_px + 1)
+    land_raw = valid & ~sea
     search = sea & valid & aoi & ~land & ~cloud
-    return search, sea & valid & ~cloud
+    return search, sea & valid & ~cloud, land_raw
 
 
 def _local_stats(img: np.ndarray, mask: np.ndarray, win: int):
@@ -129,6 +154,26 @@ def _local_stats(img: np.ndarray, mask: np.ndarray, win: int):
         var = s2 / n - mean * mean
     std = np.sqrt(np.clip(var, 0, None))
     return np.nan_to_num(mean), np.nan_to_num(std), n
+
+
+def _coarse_background(refl: np.ndarray, mask: np.ndarray, block: int = 32) -> np.ndarray:
+    """Robust local water level: median per 32 px block, then a 3x3 median over blocks.
+
+    Unlike a moving mean, this is not pulled up by large bright objects (a 400 m ship
+    fills whole blocks, but not most of a 3x3 neighbourhood of them).
+    """
+    H, W = refl.shape
+    hb, wb = -(-H // block), -(-W // block)
+    pad = np.full((hb * block, wb * block), np.nan, np.float32)
+    pad[:H, :W] = np.where(mask, refl, np.nan)
+    blocks = pad.reshape(hb, block, wb, block).transpose(0, 2, 1, 3).reshape(hb, wb, -1)
+    with warnings.catch_warnings():  # all-NaN blocks (land, cloud) are expected
+        warnings.simplefilter("ignore", RuntimeWarning)
+        med = np.nanmedian(blocks, axis=2)
+    fill = np.nanmedian(med) if np.isfinite(med).any() else 0.0
+    med = np.where(np.isfinite(med), med, fill)
+    med = ndimage.median_filter(med, size=3, mode="nearest")
+    return np.repeat(np.repeat(med, block, 0), block, 1)[:H, :W]
 
 
 def _candidates(refl, search, bgmask, p: DetectParams):
@@ -210,6 +255,8 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
         return None
     s_lo, s_hi = ends
     length = max(s_hi - s_lo - corr, 1.0)
+    core = _crossings(along, s, 0.7 * _plateau(along))
+    softness = (s_hi - s_lo) / max(core[1] - core[0], 0.5) if core else 9.0
 
     inside = (S >= s_lo) & (S <= s_hi)
     across = np.where(inside, grid, 0).sum(axis=0)
@@ -225,6 +272,7 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
         "width_px": float(width),
         "axis_r": float(u[0]),
         "axis_c": float(u[1]),
+        "softness": float(softness),
     }
 
 
@@ -233,19 +281,32 @@ def _confidence(snr: float, aspect: float, length_m: float) -> float:
     return round(float(np.clip(c, 0, 1)), 3)
 
 
+def _ring(shape, r: float, c: float, inner: float, outer: float):
+    """Slices and boolean ring mask (inner <= distance <= outer) around (r, c)."""
+    H, W = shape
+    r0, r1 = max(int(r - outer), 0), min(int(r + outer) + 1, H)
+    c0, c1 = max(int(c - outer), 0), min(int(c + outer) + 1, W)
+    yy, xx = np.mgrid[r0:r1, c0:c1]
+    d = np.hypot(yy - r, xx - c)
+    return (slice(r0, r1), slice(c0, c1)), (d >= inner) & (d <= outer)
+
+
 def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
-                    p: DetectParams, pixel_m: float = 10.0) -> list[Detection]:
+                    p: DetectParams, pixel_m: float = 10.0, rejected: Counter | None = None) -> list[Detection]:
     """Detect and measure ships in one in-memory block.
 
     refl: NIR (B08) reflectance; scl: SCL classes resampled to the same grid;
     valid: data mask; aoi: True inside the area of interest.
+    ``rejected`` (optional) counts candidates dropped, by reason.
     """
-    search, sea = build_masks(refl, scl, valid, aoi, p)
+    rejected = rejected if rejected is not None else Counter()
+    search, sea, land = build_masks(refl, scl, valid, aoi, p)
     if not search.any():
         return []
 
-    cand, _, _ = _candidates(refl, search, search, p)
-    bgmask = search & ~ndimage.maximum_filter(cand, size=7) if cand.any() else search
+    water_ok = search & (refl < _coarse_background(refl, search) + p.min_contrast)
+    cand, _, _ = _candidates(refl, search, water_ok, p)
+    bgmask = water_ok & ~ndimage.maximum_filter(cand, size=7) if cand.any() else water_ok
     cand, excess, snr = _candidates(refl, search, bgmask, p)
     if not cand.any():
         return []
@@ -254,8 +315,9 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
     peaks = ndimage.maximum(excess, labels, index=np.arange(1, n + 1))
     claimed = np.zeros(refl.shape, bool)
     out: list[Detection] = []
-    max_px = p.max_length_m / pixel_m
-    pad = int(max_px / 2) + 6
+    # Window around each seed: the seed may be only the brightest part of the hull
+    # (e.g. the superstructure at one end), so allow a full hull length either side.
+    pad = int(p.max_length_m / pixel_m) + 6
     slices = ndimage.find_objects(labels)
     H, W = refl.shape
 
@@ -283,9 +345,34 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         length_m, width_m = m["length_px"] * pixel_m, m["width_px"] * pixel_m
         aspect = length_m / max(width_m, 1e-6)
         if not (p.min_length_m <= length_m <= p.max_length_m) or width_m > p.max_width_m:
+            rejected["size"] += 1
             continue
         if length_m >= p.aspect_from_m and aspect < p.min_aspect:
+            rejected["shape"] += 1
             continue
+        # Hulls are surrounded by water: an object running into land/cloud is an edge.
+        if m["length_px"] >= p.edge_test_from_px and m["softness"] > p.max_edge_softness:
+            rejected["soft edges (cloud)"] += 1
+            continue
+        if (ndimage.binary_dilation(hull, iterations=2) & land[r0:r1, c0:c1]).any():
+            rejected["touches land/cloud"] += 1
+            continue
+        # A ship sits in clean water; clouds come in fields with more cloud, haze and
+        # shadows around them. Look at a ring beyond the hull ends.
+        cr, cc_ = m["row"] + r0, m["col"] + c0
+        inner = m["length_px"] / 2 + p.ring_gap_px
+        sl2, ring = _ring(refl.shape, cr, cc_, inner, inner + p.ring_width_px)
+        # Only sea and cloud count: bright land near the coast is not "clutter".
+        ring &= valid[sl2] & ~(land[sl2] & ~np.isin(scl[sl2], SCL_CLOUDY))
+        if ring.sum() > 50:
+            cloud_frac = float(np.isin(scl[sl2], SCL_CLOUDY)[ring].mean())
+            clutter = float(((excess[sl2] > p.min_contrast) & ~claimed[sl2])[ring].mean())
+            if cloud_frac > p.max_ring_cloud:
+                rejected["cloud nearby"] += 1
+                continue
+            if clutter > p.max_ring_clutter:
+                rejected["cluttered (cloud/glint)"] += 1
+                continue
         rr, cc = np.nonzero(hull)
         s = float(snr[r0:r1, c0:c1][hull].max())
         heading = math.degrees(math.atan2(m["axis_c"], -m["axis_r"])) % 180.0

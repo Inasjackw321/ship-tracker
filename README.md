@@ -60,18 +60,36 @@ For each tile (an MGRS square about 110 × 110 km), files go to `data/tiles/<sce
 
 Downloads resume after an interruption (`.part` files with HTTP Range) and are retried with backoff. A scene that has already been processed is never processed again, so you can re-run `scan` safely. `--delete-tiles` removes each tile once it is processed, so disk use stays small.
 
-## How detection and measurement work (`shiptracker/detect.py`)
+## How detection and measurement work (`shiptracker/detect.py`, `shiptracker/verify.py`)
 
-1. **Sea mask.** Pixels count as sea if SCL calls them water or their NIR reflectance is very dark. Small enclosed non-water blobs are filled back in, because SCL often labels the ships themselves as cloud or land. A 30 m coastal buffer is removed, as are SCL clouds and cloud shadows plus 100 m around them. Cloud blobs the size of a ship are not treated as cloud.
-2. **Candidates.** In the 10 m NIR band, open water is near zero and hulls are bright. Each pixel is compared with the mean and standard deviation of the water around it (a 610 m window). It must be at least 5σ brighter and at least 0.025 reflectance brighter. This is computed in two passes, the second leaving out first-pass hits, and copes with sun glint gradients.
+1. **Sea mask.** Pixels count as sea if SCL calls them water or their NIR reflectance is very dark. Small enclosed non-water blobs, up to ship size, are filled back in, because SCL often labels the ships themselves as cloud or land. Vegetated patches are never filled, so mangrove islets and strips stay land. A 50 m coastal buffer is removed, as are SCL clouds and cloud shadows plus 100 m around them. Cloud blobs the size of a ship are not treated as cloud.
+2. **Candidates.** In the 10 m NIR band, open water is near zero and hulls are bright. Each pixel is compared with the mean and standard deviation of the water around it (a 610 m window). It must be at least 5σ brighter and at least 0.025 reflectance brighter. Bright objects are excluded from the background first, using a coarse median, so large ships don't hide themselves. The statistics are then recomputed without first-pass hits, which copes with sun glint gradients.
 3. **Hull extraction.** Each candidate is grown to every connected pixel brighter than 25 % of its peak, so the whole hull is captured rather than just the brightest part.
 4. **Measurement.** PCA gives the hull axis. The image is resampled onto a grid aligned with the hull, and the along-hull and across-hull brightness profiles give **length and beam**. Each end is placed where the profile drops to 30 % of the typical deck level, and the 10 m sensor blur is corrected for. The deck level is a median rather than the peak, so a bright superstructure does not cut off the bow. The hull axis is reported as a true-north bearing (0–180°, since bow and stern can't be told apart).
-5. **Filters.** Length must be 25–500 m and beam ≤ 90 m. Objects ≥ 50 m must be at least twice as long as they are wide, which rejects cloud puffs. A confidence score combines contrast, elongation and size.
-6. **Bookkeeping.**
+5. **Filters on the object.**
+   - Length must be 25–420 m and beam ≤ 90 m.
+   - Objects ≥ 40 m must be at least twice as long as they are wide.
+   - **Sharp ends:** objects ≥ 80 m need hull-like ends that drop off sharply. Cloud puffs fade out gradually.
+   - **Clear water:** the object must not touch land or a large cloud.
+   - **Clean surroundings:** a ring of water around it must hold almost no cloud, cloud shadow or other bright clutter. Ships sit in clean water, while clouds come in fields.
+   - A confidence score combines contrast, elongation and size.
+6. **Second-stage checks (`verify.py`).** These use the true-colour image, which is downloaded for the chips anyway, plus a global 1 km land map.
+   - **Vegetation:** objects much brighter in NIR than in red (NDVI > 0.5) are vegetation.
+   - **Cloud:** objects that are bright and grey-white in every band are cloud.
+   - **Inland:** objects with land 1 km away in every direction are inland, e.g. salt flats.
+
+   Each tile's log line, and its tooltip on the map, lists how many objects each rule rejected.
+7. **Bookkeeping.**
    - A ship seen in two overlapping tiles of the same satellite pass is stored once.
    - A detection at the same spot on another date is flagged **stationary**: oil platforms, anchored ships or islets. The map can hide these.
 
 **Accuracy.** On synthetic ships rendered with the Sentinel-2 10 m point-spread function, measured length is within about 5 % for 35–400 m vessels, e.g. a 121.5 m ship measures 116–122 m, and the hull axis is within 2°. Real-world error will be larger, roughly ±10–20 m. Causes include hull paint and cargo, wakes, and ships under 30 m that are only 2–3 pixels long. Beam is less reliable than length because most beams are only 2–5 pixels.
+
+When the detector changes, tiles analysed by an older version are redone automatically on the next scan. Their old results are replaced.
+
+### Why Sentinel-2 and not Sentinel-3
+
+Sentinel-3's sharpest images (OLCI) are 300 m per pixel. A 200 m ship is smaller than one pixel, so it can't be detected or measured, and Sentinel-3's cloud mask is far too coarse to remove the small clouds that cause false alarms. The ship-sized cloud and vegetation checks above use Sentinel-2's own colour bands at 10 m instead. For detection through cloud, the complementary sensor is the Sentinel-1 radar.
 
 ## Covering the whole area
 

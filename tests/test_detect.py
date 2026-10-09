@@ -59,3 +59,38 @@ def test_ignores_land_and_clouds():
     refl[80:84, 455:470] += 0.3
     refl += rng.normal(0, 0.001, refl.shape).astype(np.float32)
     assert _run(refl, scl) == []
+
+
+def test_rejects_cumulus_field_but_keeps_isolated_ship():
+    from tests.synth import add_cumulus_field
+
+    refl, scl, truth = make_scene(ships=[(480, 480, 150, 25, 30)], land=False, cloud=False)
+    refl, scl = add_cumulus_field(refl, scl, center=(180, 200), radius=120, n=60)
+    dets = _run(refl, scl)
+    assert len(dets) == 1, [(round(d.row), round(d.col), d.length_m) for d in dets]
+    _match(dets, *truth[0][:2])
+
+
+def _vegetation_strip():
+    # Mangrove forest shore with a detached 450 x 40 m vegetated strip just offshore,
+    # like the false positive at 22.393 N 69.070 E (459 m x 45 m along a mangrove edge).
+    refl, scl, _ = make_scene(ships=[], land=False, cloud=False)
+    refl[:, :150] = 0.30
+    scl[:, :150] = 4
+    refl[280:325, 156:160] = 0.30
+    scl[280:325, 156:160] = 4
+    return refl, scl
+
+
+def test_vegetation_strip_is_not_a_ship():
+    refl, scl = _vegetation_strip()
+    assert _run(refl, scl) == []
+
+
+def test_vegetation_strip_was_a_false_positive_with_old_settings():
+    # Guards the test above: the old sea mask turned the strip into a ~450 m "ship".
+    refl, scl = _vegetation_strip()
+    valid = np.ones(refl.shape, bool)
+    old = DetectParams(max_hole_px=3000, max_length_m=500, coast_buffer_px=3, fill_vegetation_holes=True)
+    dets = detect_in_array(refl, scl, valid, valid, old)
+    assert len(dets) == 1 and dets[0].length_m > 400

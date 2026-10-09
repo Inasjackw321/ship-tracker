@@ -63,3 +63,19 @@ def make_scene(shape=(600, 600), ships=(), seed=0, glint=True, land=True, cloud=
         scl[r0:r0 + size, c0:c0 + size][fp > 0.05] = 8
         truth.append((r - 0.5, c - 0.5, L, Wd, hd))
     return refl, scl, truth
+
+
+def add_cumulus_field(refl, scl, center, radius, n=40, seed=0):
+    """Scatter small fair-weather cumulus (Gaussian puffs) with SCL marking their cores."""
+    rng = np.random.default_rng(seed)
+    H, W = refl.shape
+    yy, xx = np.mgrid[0:H, 0:W]
+    for _ in range(n):
+        r = center[0] + rng.uniform(-radius, radius)
+        c = center[1] + rng.uniform(-radius, radius)
+        sy, sx = rng.uniform(1.5, 8, 2)
+        amp = rng.uniform(0.05, 0.5)
+        puff = amp * np.exp(-(((yy - r) / sy) ** 2 + ((xx - c) / sx) ** 2) / 2)
+        refl += puff.astype(np.float32)
+        scl[puff > 0.15] = 8
+    return refl, scl

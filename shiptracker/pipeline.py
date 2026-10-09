@@ -19,10 +19,13 @@ from .aoi import load_aoi
 from .chips import render_chips
 from .config import Settings
 from .db import Store
-from .detect import DetectParams
+from collections import Counter
+
+from .detect import DETECTOR_VERSION, DetectParams
 from .download import download_file, remove_scene, scene_dir
 from .scene import clear_sea_fraction, detect_scene
 from .stac import Scene, search_scenes
+from .verify import verify_detections
 
 log = logging.getLogger(__name__)
 
@@ -127,32 +130,41 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
     scl_path = download_file(scene.scl_href, sdir / "SCL.tif", src_cfg)
     sea = clear_sea_fraction(scl_path, aoi)
     if sea < opts.min_sea_fraction:
-        store.save_scene(scene, "skipped", f"clear sea {sea:.1%}", sea_fraction=sea)
+        store.save_scene(scene, "skipped", f"clear sea {sea:.1%}", sea_fraction=sea,
+                         detector_version=DETECTOR_VERSION)
         if not opts.keep_tiles:
             remove_scene(settings.tiles_dir, scene.id)
         return "skipped", 0
 
     nir_path = download_file(scene.nir_href, sdir / "B08.tif", src_cfg)
     log.info("  detecting ships (clear sea %.0f%%)", sea * 100)
-    dets = detect_scene(nir_path, scl_path, aoi, scene.nir_scale, scene.nir_offset, opts.params)
+    rejected: Counter = Counter()
+    dets = detect_scene(nir_path, scl_path, aoi, scene.nir_scale, scene.nir_offset, opts.params, rejected)
+
+    tci = None
+    if dets and opts.rgb_chips and scene.rgb_href:
+        try:
+            tci = download_file(scene.rgb_href, sdir / "TCI.tif", src_cfg)
+        except Exception as exc:
+            log.warning("  true-colour download failed (%s); colour checks skipped, chips use NIR", exc)
+    dets = verify_detections(dets, nir_path, tci, scene.nir_scale, scene.nir_offset, rejected)
+    if rejected:
+        log.info("  %s: %d ships kept; rejected %s", scene.id, len(dets),
+                 ", ".join(f"{n} {why}" for why, n in rejected.most_common()))
 
     chips: list = [None] * len(dets)
     if dets:
-        image = nir_path
-        if opts.rgb_chips and scene.rgb_href:
-            try:
-                image = download_file(scene.rgb_href, sdir / "TCI.tif", src_cfg)
-            except Exception as exc:
-                log.warning("  true-colour download failed (%s); chips will use NIR", exc)
+        image = tci or nir_path
         label = scene.datetime[:10]
         paths = render_chips(image, dets, settings.chips_dir / scene.id, label)
         chips = [str(p.relative_to(settings.chips_dir)) if p else None for p in paths]
 
-    if opts.reprocess:
-        store.delete_scene_detections(scene.id)
+    store.delete_scene_detections(scene.id)  # replaces results of an earlier run
     added = store.add_detections(scene, dets, chips)
     _prune_chips(settings, store, scene.id)
-    store.save_scene(scene, "done", f"{len(dets)} detected, {added} new", sea_fraction=sea, n_ships=added)
+    why = ", ".join(f"{n} {r}" for r, n in rejected.most_common())
+    store.save_scene(scene, "done", f"{len(dets)} detected, {added} new" + (f"; rejected {why}" if why else ""),
+                     sea_fraction=sea, n_ships=added, detector_version=DETECTOR_VERSION)
     if not opts.keep_tiles:
         remove_scene(settings.tiles_dir, scene.id)
     return "done", added
@@ -200,12 +212,21 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         note(f"Sentinel-2 imaged {cov['fraction']:.0%} of the search area in this window "
              f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2); the rest has no images to scan")
 
-        todo = []
+        todo, outdated = [], []
         for sc in scenes:
-            if not opts.reprocess and store.scene_status(sc.id) in ("done", "skipped"):
+            status = store.scene_status(sc.id)
+            current = store.scene_version(sc.id) >= DETECTOR_VERSION
+            if not opts.reprocess and status in ("done", "skipped") and current:
                 report.already_done += 1
             else:
                 todo.append(sc)
+                if status in ("done", "skipped") and not current:
+                    outdated.append(sc)
+        # Clear old results first so they can't shadow new detections as cross-tile duplicates.
+        for sc in outdated:
+            store.delete_scene_detections(sc.id)
+        if outdated:
+            note(f"{len(outdated)} tiles were analysed by an older detector and will be redone")
         if report.already_done:
             note(f"{report.already_done} already processed earlier; {len(todo)} to go")
 
