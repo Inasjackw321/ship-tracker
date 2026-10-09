@@ -1,6 +1,8 @@
 """Web map + JSON API for ship detections."""
 from __future__ import annotations
 
+import io
+import json
 import logging
 import threading
 from dataclasses import asdict
@@ -10,7 +12,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
 from shapely.geometry import mapping
 
-from .annotate import annotated_png, bundle_zip, file_stem, geotiff_path
+from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path
 from .aoi import aoi_geojson, load_priority
 from .config import Settings
 from .db import Store
@@ -25,6 +27,12 @@ def _feature(d: dict) -> dict:
     if d.get("chip"):
         props["chip"] = d["chip"].replace("\\", "/")  # rows written on Windows before paths were normalised
     props["chip_url"] = f"/chips/{props['chip']}" if d.get("chip") else None
+    if d.get("method") == "manual":  # re-drawn with the hand-placed ruler
+        props["chip_url"] = f"/api/detections/{d['id']}/chip.png?v={int(d.get('updated_at') or 0)}"
+    props["adjusted"] = d.get("method") == "manual"
+    props.pop("auto_json", None)
+    if d.get("auto_json"):
+        props["auto"] = json.loads(d["auto_json"])
     return {"type": "Feature", "geometry": {"type": "Point", "coordinates": [d["lon"], d["lat"]]},
             "properties": props}
 
@@ -95,6 +103,40 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/detections/<int:det_id>/image.png")
     def detection_png(det_id: int):
         return _png_response(store.get_detection(det_id))
+
+    @app.get("/api/detections/<int:det_id>/chip.png")
+    def detection_chip(det_id: int):
+        rec = store.get_detection(det_id)
+        if rec is None:
+            abort(404)
+        buf = io.BytesIO()
+        chip_image(rec, settings.chips_dir).save(buf, "PNG")
+        return Response(buf.getvalue(), mimetype="image/png")
+
+    def _feature_response(rec):
+        if rec is None:
+            abort(404)
+        f = _feature(rec)
+        f["properties"]["has_tif"] = geotiff_path(rec, settings.chips_dir) is not None
+        return jsonify(f)
+
+    @app.post("/api/detections/<int:det_id>/measurement")
+    def set_measurement(det_id: int):
+        """Body: {"stern": [lat, lon], "bow": [lat, lon], "width_m": optional}."""
+        body = request.get_json(silent=True) or {}
+        try:
+            stern = tuple(float(v) for v in body["stern"])
+            bow = tuple(float(v) for v in body["bow"])
+            width = float(body["width_m"]) if body.get("width_m") not in (None, "") else None
+            if len(stern) != 2 or len(bow) != 2 or (width is not None and not 0 < width < 200):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            abort(400, "expected stern and bow as [lat, lon], and an optional width_m")
+        return _feature_response(store.set_manual_measurement(det_id, stern, bow, width))
+
+    @app.post("/api/detections/<int:det_id>/measurement/reset")
+    def reset_measurement(det_id: int):
+        return _feature_response(store.reset_measurement(det_id))
 
     @app.get("/api/detections/<int:det_id>/image.tif")
     def detection_tif(det_id: int):

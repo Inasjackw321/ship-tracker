@@ -85,18 +85,61 @@ function popupHtml(p, lat, lon) {
   return `<div class="popup">
     ${p.chip_url ? `<img src="${esc(p.chip_url)}" alt="ship chip">` : ''}
     <table>
-      <tr><td>Length</td><td><b>${p.length_m.toFixed(0)} m</b></td></tr>
-      <tr><td>Beam</td><td>${p.width_m.toFixed(0)} m</td></tr>
+      <tr><td>Length</td><td><b>${lenText(p)}</b></td></tr>
+      <tr><td>Beam</td><td>${beamText(p)}</td></tr>
+      <tr><td>Measured</td><td>${esc(METHOD[p.method] || '')}${p.adjusted && p.auto
+        ? ` <span style="color:#666">(automatic: ${lenText(p.auto)} × ${beamText(p.auto)})</span>` : ''}</td></tr>
       <tr><td>Hull axis</td><td>${p.heading_deg.toFixed(0)}° / ${((p.heading_deg + 180) % 360).toFixed(0)}°</td></tr>
       <tr><td>Seen</td><td>${esc(fmtDate(p.datetime))}</td></tr>
       <tr><td>Position</td><td>${lat.toFixed(5)}, ${lon.toFixed(5)}</td></tr>
       <tr><td>Confidence</td><td>${(p.confidence * 100).toFixed(0)}%  (SNR ${p.snr})</td></tr>
       ${p.stationary ? '<tr><td>Note</td><td>also seen here on another date (platform / anchored?)</td></tr>' : ''}
       <tr><td>Tile</td><td style="font-size:11px">${esc(p.scene_id)}</td></tr>
-    </table>${coordsHtml(p, lat, lon)}</div>`;
+    </table>${coordsHtml(p, lat, lon)}
+    <div class="dl">
+      <button class="mini" data-adjust="${p.id}" title="Drag the ruler ends onto the bow and stern">Adjust measurement</button>
+      ${p.adjusted ? `<button class="mini ghost" data-reset="${p.id}">Reset to automatic</button>` : ''}
+    </div></div>`;
 }
 
+const METHOD = { fit: 'hull-model fit', profile: 'profile estimate (less precise)', manual: 'adjusted by hand' };
+const pm = (e) => (e ? ` ± ${Math.round(e)}` : '');
+const lenText = (p) => `${p.length_m.toFixed(0)}${pm(p.length_err_m)} m`;
+const beamText = (p) => `${p.width_m.toFixed(0)}${pm(p.width_err_m)} m`;
+// Geodesic distance on the WGS84 ellipsoid (Vincenty), matching the server's pyproj
+// lengths; Leaflet's map.distance uses a sphere and reads ~0.3 % differently.
+function geoDist(p1, p2) {
+  const a = 6378137, f = 1 / 298.257223563, b = a * (1 - f), rad = Math.PI / 180;
+  const L = (p2.lng - p1.lng) * rad;
+  const U1 = Math.atan((1 - f) * Math.tan(p1.lat * rad)), U2 = Math.atan((1 - f) * Math.tan(p2.lat * rad));
+  const sU1 = Math.sin(U1), cU1 = Math.cos(U1), sU2 = Math.sin(U2), cU2 = Math.cos(U2);
+  let lam = L, sinS, cosS, sig, cos2a, cos2sm;
+  for (let i = 0; i < 200; i++) {
+    const sl = Math.sin(lam), cl = Math.cos(lam);
+    sinS = Math.hypot(cU2 * sl, cU1 * sU2 - sU1 * cU2 * cl);
+    if (sinS === 0) return 0;
+    cosS = sU1 * sU2 + cU1 * cU2 * cl;
+    sig = Math.atan2(sinS, cosS);
+    const sa = (cU1 * cU2 * sl) / sinS;
+    cos2a = 1 - sa * sa;
+    cos2sm = cos2a ? cosS - (2 * sU1 * sU2) / cos2a : 0;
+    const C = (f / 16) * cos2a * (4 + f * (4 - 3 * cos2a));
+    const prev = lam;
+    lam = L + (1 - C) * f * sa * (sig + C * sinS * (cos2sm + C * cosS * (-1 + 2 * cos2sm * cos2sm)));
+    if (Math.abs(lam - prev) < 1e-12) break;
+  }
+  const u2 = (cos2a * (a * a - b * b)) / (b * b);
+  const A = 1 + (u2 / 16384) * (4096 + u2 * (-768 + u2 * (320 - 175 * u2)));
+  const B = (u2 / 1024) * (256 + u2 * (-128 + u2 * (74 - 47 * u2)));
+  const dS = B * sinS * (cos2sm + (B / 4) * (cosS * (-1 + 2 * cos2sm * cos2sm)
+    - (B / 6) * cos2sm * (-3 + 4 * sinS * sinS) * (-3 + 4 * cos2sm * cos2sm)));
+  return b * A * (sig - dS);
+}
+const fmtDist = (d) => (d < 1000 ? `${d.toFixed(1)} m` : `${(d / 1000).toFixed(3)} km`);
+
 let features = [];
+const featuresById = new Map();
+let editingId = null;
 
 function drawRulers() {
   rulerLayer.clearLayers();
@@ -104,11 +147,11 @@ function drawRulers() {
   const bounds = map.getBounds().pad(0.2);
   for (const f of features) {
     const p = f.properties;
-    if (p.bow_lat == null) continue;
+    if (p.bow_lat == null || p.id === editingId) continue;
     const [lon, lat] = f.geometry.coordinates;
     if (!bounds.contains([lat, lon])) continue;
     const line = L.polyline([[p.stern_lat, p.stern_lon], [p.bow_lat, p.bow_lon]],
-      { pane: 'ships', color: '#fff', weight: 3, opacity: 0.95 });
+      { pane: 'ships', color: p.adjusted ? '#ffd60a' : '#fff', weight: 3, opacity: 0.95 });
     line.bindTooltip(`${p.length_m.toFixed(0)} m`, { permanent: true, direction: 'right', className: 'ruler-label' });
     // The ruler lies over the ship: clicking it opens the ship like clicking the marker.
     line.on('click', () => openShip(f));
@@ -122,6 +165,8 @@ map.on('zoomend moveend', drawRulers);
 
 function render() {
   shipLayer.clearLayers();
+  featuresById.clear();
+  for (const f of features) featuresById.set(f.properties.id, f);
   const list = $('list');
   list.innerHTML = '';
   const sorted = [...features].sort((a, b) => b.properties.length_m - a.properties.length_m);
@@ -140,7 +185,7 @@ function render() {
     const p = f.properties;
     const li = document.createElement('li');
     li.innerHTML = `${p.chip_url ? `<img loading="lazy" src="${esc(p.chip_url)}" alt="">` : '<img alt="">'}
-      <div><div class="len">${p.length_m.toFixed(0)} m × ${p.width_m.toFixed(0)} m
+      <div><div class="len">${lenText(p)} × ${beamText(p)}${p.adjusted ? '<span class="tag">adjusted</span>' : ''}
       ${p.stationary ? '<span class="tag">stationary</span>' : ''}</div>
       <div class="meta">${esc(fmtDate(p.datetime))}</div>
       <div class="meta">${f.geometry.coordinates[1].toFixed(4)}, ${f.geometry.coordinates[0].toFixed(4)} · conf ${(p.confidence * 100).toFixed(0)}%</div></div>`;
@@ -163,11 +208,14 @@ const tray = new Map();
 const keyOf = (f) => String(f.properties.id);
 
 function openShip(f) {
+  if (measure.on) return; // clicks add ruler points while measuring
   const key = keyOf(f);
   const [lon, lat] = f.geometry.coordinates;
-  addToTray(f);
-  if (openPopups.has(key)) return;
-  const pop = L.popup({ autoClose: false, closeOnClick: false, maxWidth: 280, className: 'ship-popup' })
+  if (openPopups.has(key)) { addToTray(f); return; }
+  addToTray(f); // first, so the tray's height is known for panning
+  const trayH = $('tray').hidden ? 0 : $('tray').offsetHeight;
+  const pop = L.popup({ autoClose: false, closeOnClick: false, maxWidth: 280, className: 'ship-popup',
+    autoPanPaddingTopLeft: [20, 70], autoPanPaddingBottomRight: [20, trayH + 34] })
     .setLatLng([lat, lon])
     .setContent(popupHtml(f.properties, lat, lon));
   pop.on('remove', () => openPopups.delete(key));
@@ -194,7 +242,7 @@ function renderTray() {
     const p = f.properties;
     const [lon, lat] = f.geometry.coordinates;
     const c = coordText(lat, lon);
-    const title = `${p.length_m.toFixed(0)} m × ${p.width_m.toFixed(0)} m`;
+    const title = `${lenText(p)} × ${beamText(p)}${p.adjusted ? ' (adjusted)' : ''}`;
     const base = apiBase(p);
     const card = document.createElement('div');
     card.className = 'card';
@@ -237,7 +285,11 @@ document.addEventListener('click', (e) => {
   const copy = e.target.closest('[data-copy]');
   if (copy) { e.preventDefault(); copyText(copy.dataset.copy, copy); return; }
   const rm = e.target.closest('[data-remove]');
-  if (rm) { tray.delete(rm.dataset.remove); renderTray(); }
+  if (rm) { tray.delete(rm.dataset.remove); renderTray(); return; }
+  const adj = e.target.closest('[data-adjust]');
+  if (adj) { startAdjust(featuresById.get(Number(adj.dataset.adjust))); return; }
+  const rs = e.target.closest('[data-reset]');
+  if (rs) { saveMeasurement(Number(rs.dataset.reset), null); }
 }, true);
 
 function trayLines() {
@@ -280,6 +332,131 @@ $('tray-toggle').onclick = () => {
   body.hidden = !body.hidden;
   $('tray-toggle').textContent = body.hidden ? 'Show' : 'Hide';
 };
+
+// ---- Measure tool: click points on the map, like the Google Maps ruler ----
+const measure = { on: false, done: false, pts: [], layer: L.layerGroup().addTo(map) };
+map.createPane('measure').style.zIndex = 660;
+
+function measureRedraw() {
+  measure.layer.clearLayers();
+  const pts = measure.pts;
+  if (!pts.length) { $('measure-box').hidden = !measure.on; $('measure-total').textContent = '0 m'; return; }
+  L.polyline(pts, { pane: 'measure', color: '#000', weight: 6, opacity: 0.5, interactive: false }).addTo(measure.layer);
+  L.polyline(pts, { pane: 'measure', color: '#fff', weight: 3, interactive: false }).addTo(measure.layer);
+  let total = 0;
+  pts.forEach((pt, i) => {
+    if (i) total += geoDist(pts[i - 1], pt);
+    const m = L.circleMarker(pt, { pane: 'measure', radius: 5, color: '#000', weight: 2, fillColor: '#fff', fillOpacity: 1, interactive: false });
+    if (i) m.bindTooltip(fmtDist(total), { permanent: true, direction: 'right', className: 'ruler-label' });
+    m.addTo(measure.layer);
+  });
+  $('measure-box').hidden = false;
+  $('measure-total').textContent = fmtDist(total);
+  $('measure-help').textContent = measure.done ? 'Finished. Click Measure to start again.'
+    : 'Click to add points, double-click to finish, Esc to clear.';
+}
+
+function setMeasure(on) {
+  measure.on = on;
+  measure.done = false;
+  measure.pts = [];
+  map.getContainer().style.cursor = on ? 'crosshair' : '';
+  if (on) map.doubleClickZoom.disable(); else map.doubleClickZoom.enable();
+  document.querySelector('.measure-btn')?.classList.toggle('active', on);
+  measureRedraw();
+  if (!on) $('measure-box').hidden = true;
+}
+
+map.on('click', (e) => {
+  if (!measure.on || measure.done) return;
+  measure.pts.push(e.latlng);
+  measureRedraw();
+});
+map.on('dblclick', () => { if (measure.on) { measure.done = true; measureRedraw(); } });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && measure.on) setMeasure(false);
+  if (e.key === 'Escape' && editingId != null) stopAdjust();
+});
+
+const MeasureControl = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const box = L.DomUtil.create('div', 'leaflet-bar');
+    const a = L.DomUtil.create('a', 'measure-btn', box);
+    a.href = '#';
+    a.title = 'Measure a distance';
+    a.innerHTML = '&#128207;';
+    L.DomEvent.disableClickPropagation(box);
+    L.DomEvent.on(a, 'click', (e) => { L.DomEvent.preventDefault(e); setMeasure(!measure.on); });
+    return box;
+  },
+});
+new MeasureControl().addTo(map);
+$('measure-close').onclick = () => setMeasure(false);
+
+// ---- Adjust a ship's measurement by dragging its hull ends ----
+map.createPane('edit').style.zIndex = 680;
+const edit = { f: null, layer: L.layerGroup().addTo(map), ends: [] };
+
+function editRedraw() {
+  const [a, b] = edit.ends.map((m) => m.getLatLng());
+  edit.line.setLatLngs([a, b]);
+  $('adjust-length').textContent = fmtDist(geoDist(a, b));
+}
+
+function startAdjust(f) {
+  if (!f) return;
+  if (measure.on) setMeasure(false);
+  stopAdjust();
+  const p = f.properties;
+  const key = keyOf(f);
+  if (openPopups.has(key)) map.removeLayer(openPopups.get(key)); // it would cover the handles
+  edit.f = f;
+  editingId = p.id;
+  drawRulers();
+  const handle = (ll, label) => L.marker(ll, {
+    pane: 'edit', draggable: true, autoPan: true,
+    icon: L.divIcon({ className: 'edit-handle', iconSize: [16, 16] }), title: label,
+  }).on('drag', editRedraw).addTo(edit.layer);
+  edit.line = L.polyline([], { pane: 'edit', color: '#ffd60a', weight: 3, interactive: false }).addTo(edit.layer);
+  edit.ends = [handle([p.stern_lat, p.stern_lon], 'stern'), handle([p.bow_lat, p.bow_lon], 'bow')];
+  $('adjust-width').value = p.width_m.toFixed(0);
+  $('adjust-auto').textContent = p.adjusted && p.auto ? `automatic: ${lenText(p.auto)}` : `automatic: ${lenText(p)}`;
+  $('adjust-box').hidden = false;
+  editRedraw();
+  map.fitBounds(L.latLngBounds(edit.ends.map((m) => m.getLatLng())).pad(1.5), { maxZoom: 17 });
+}
+
+function stopAdjust() {
+  edit.layer.clearLayers();
+  edit.f = null;
+  editingId = null;
+  $('adjust-box').hidden = true;
+  drawRulers();
+}
+
+async function saveMeasurement(id, body) {
+  const url = `/api/detections/${id}/measurement` + (body ? '' : '/reset');
+  try {
+    const f = await getJSON(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}) });
+    const i = features.findIndex((x) => x.properties.id === id);
+    if (i >= 0) features[i] = f;
+    const key = keyOf(f);
+    if (openPopups.has(key)) map.removeLayer(openPopups.get(key));
+    if (tray.has(key)) tray.set(key, f);
+    stopAdjust();
+    render();
+    renderTray();
+    openShip(f);
+  } catch (e) { alert('Could not save the measurement: ' + e.message); }
+}
+
+$('adjust-save').onclick = () => {
+  const [a, b] = edit.ends.map((m) => m.getLatLng());
+  saveMeasurement(edit.f.properties.id, { stern: [a.lat, a.lng], bow: [b.lat, b.lng], width_m: $('adjust-width').value });
+};
+$('adjust-cancel').onclick = stopAdjust;
 
 async function getJSON(url, opts) {
   const r = await fetch(url, opts);

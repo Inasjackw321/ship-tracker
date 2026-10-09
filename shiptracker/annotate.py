@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import zipfile
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -48,13 +49,23 @@ def file_stem(rec: dict) -> str:
     return f"ship_{abs(lat):.5f}{ns}_{abs(lon):.5f}{ew}_{rec['datetime'][:10]}_{rec['length_m']:.0f}m"
 
 
+def size_text(rec: dict) -> str:
+    le, we = rec.get("length_err_m"), rec.get("width_err_m")
+    return (f"{rec['length_m']:.0f}{f' ± {le:.0f}' if le else ''} m x "
+            f"{rec['width_m']:.0f}{f' ± {we:.0f}' if we else ''} m")
+
+
 def _lines(rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int, tuple]]]:
     when = rec["datetime"].replace("T", " ")[:16] + " UTC"
     axis = rec.get("heading_deg") or 0.0
+    how = {"fit": "hull-model fit", "profile": "profile estimate", "manual": "adjusted by hand"}.get(rec.get("method"), "")
     header = [
-        (f"Ship  {rec['length_m']:.0f} m x {rec['width_m']:.0f} m   hull axis {axis:.0f}° / {(axis + 180) % 360:.0f}°", 20, FG),
-        (f"{when}   Sentinel-2 (10 m)   {rec['scene_id']}", 13, MUTED),
+        (f"Ship  {size_text(rec)}   hull axis {axis:.0f}° / {(axis + 180) % 360:.0f}°", 20, FG),
+        (f"{when}   Sentinel-2 (10 m)   {how}   {rec['scene_id']}", 13, MUTED),
     ]
+    if rec.get("method") == "manual" and rec.get("auto_json"):
+        auto = json.loads(rec["auto_json"])
+        header.append((f"Automatic measurement was {size_text(auto)}", 13, MUTED))
     footer = [
         (coord_text(rec["lat"], rec["lon"]), 26, ACCENT),
         (coord_dms(rec["lat"], rec["lon"]), 16, FG),
@@ -66,13 +77,22 @@ def _lines(rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int
     return header, footer
 
 
-def annotated_png(rec: dict, chips_dir: Path) -> bytes:
-    """The ship's image chip framed with its coordinates, as PNG bytes."""
+def chip_image(rec: dict, chips_dir: Path) -> Image.Image:
+    """The ship's chip with its current ruler: re-drawn from the GeoTIFF when the
+    measurement was adjusted by hand, otherwise the chip saved at detection time."""
+    tif = geotiff_path(rec, chips_dir)
+    if rec.get("method") == "manual" and tif is not None:
+        from .chips import render_from_geotiff
+        return render_from_geotiff(tif, rec)
     chip_path = chips_dir / rec["chip"].replace("\\", "/") if rec.get("chip") else None
     if chip_path is not None and chip_path.exists():
-        chip = Image.open(chip_path).convert("RGB")
-    else:
-        chip = Image.new("RGB", (360, 360), (0, 0, 0))
+        return Image.open(chip_path).convert("RGB")
+    return Image.new("RGB", (360, 360), (0, 0, 0))
+
+
+def annotated_png(rec: dict, chips_dir: Path) -> bytes:
+    """The ship's image chip framed with its coordinates, as PNG bytes."""
+    chip = chip_image(rec, chips_dir)
     chip = chip.resize((WIDTH, round(chip.height * WIDTH / chip.width)), Image.LANCZOS)
 
     header, footer = _lines(rec)
@@ -123,7 +143,9 @@ def bundle_zip(recs: list[dict], chips_dir: Path) -> bytes:
                 "latitude": f"{rec['lat']:.6f}", "longitude": f"{rec['lon']:.6f}",
                 "coordinates": coord_text(rec["lat"], rec["lon"]),
                 "coordinates_dms": coord_dms(rec["lat"], rec["lon"]),
-                "length_m": rec["length_m"], "beam_m": rec["width_m"],
+                "length_m": rec["length_m"], "length_err_m": rec.get("length_err_m") or "",
+                "beam_m": rec["width_m"], "beam_err_m": rec.get("width_err_m") or "",
+                "measured_by": rec.get("method") or "",
                 "hull_axis_deg": rec.get("heading_deg", ""),
                 "datetime_utc": rec["datetime"], "image": rec["scene_id"],
                 "file": f"{stem}.png",

@@ -42,6 +42,16 @@
     font: 600 11px system-ui, sans-serif; text-decoration: none; cursor: pointer; white-space: nowrap; }
   .mini.ghost { background: transparent; color: inherit; border: 1px solid #8b98a5; }
   .leaflet-container a.mini { color: #04130a; }
+  .measure-btn { font-size: 16px; line-height: 30px !important; text-align: center; cursor: pointer; }
+  .measure-btn.active { background: #ffd60a !important; }
+  .floatbox { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000; background: #0f1419ee;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: flex; gap: 10px; align-items: center;
+    flex-wrap: wrap; max-width: calc(100% - 140px); font-size: 13px; }
+  .floatbox[hidden] { display: none; }
+  .floatbox b { font-size: 18px; }
+  .floatbox .help { color: var(--muted); font-size: 12px; }
+  .floatbox input { width: 70px; padding: 3px 6px; }
+  .edit-handle { background: #ffd60a; border: 2px solid #000; border-radius: 50%; box-shadow: 0 0 0 2px #ffd60a66; cursor: grab; }
   .leaflet-container a.mini.ghost { color: #333; }
   .card .coords input { width: 100%; font-size: 11px; }
   .popup .mini.ghost { color: #333; }
@@ -134,6 +144,18 @@
   </aside>
   <div id="mapwrap">
     <div id="map"></div>
+    <div id="measure-box" class="floatbox" hidden>
+      <span>Distance <b id="measure-total">0 m</b></span>
+      <span class="help" id="measure-help">Click to add points, double-click to finish, Esc to clear.</span>
+      <button class="mini ghost" id="measure-close">Close</button>
+    </div>
+    <div id="adjust-box" class="floatbox" hidden>
+      <span>Length <b id="adjust-length">–</b></span>
+      <label class="inline">Beam <input type="number" id="adjust-width" min="1" max="199" step="1"> m</label>
+      <span class="help">Drag the yellow ends onto the stern and bow. <span id="adjust-auto"></span></span>
+      <button class="mini" id="adjust-save">Save</button>
+      <button class="mini ghost" id="adjust-cancel">Cancel</button>
+    </div>
     <div id="tray" hidden>
       <div class="bar">
         <b>Opened images (<span id="tray-count">0</span>)</b>

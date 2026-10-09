@@ -42,7 +42,12 @@ CREATE TABLE IF NOT EXISTS detections (
     npix INTEGER,
     confidence REAL,
     stationary INTEGER DEFAULT 0,  -- seen at the same spot on another date
-    chip TEXT
+    chip TEXT,
+    length_err_m REAL,             -- 1-sigma uncertainty
+    width_err_m REAL,
+    method TEXT,                   -- fit | profile | manual
+    auto_json TEXT,                -- the automatic measurement, kept when adjusted by hand
+    updated_at REAL
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -77,7 +82,12 @@ class Store:
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(scenes)")}
             if "detector_version" not in cols:  # databases from before versioning
                 self.conn.execute("ALTER TABLE scenes ADD COLUMN detector_version INTEGER DEFAULT 1")
-                self.conn.commit()
+            dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(detections)")}
+            for name, typ in (("length_err_m", "REAL"), ("width_err_m", "REAL"), ("method", "TEXT"),
+                              ("auto_json", "TEXT"), ("updated_at", "REAL")):
+                if name not in dcols:  # databases from before measurement uncertainties
+                    self.conn.execute(f"ALTER TABLE detections ADD COLUMN {name} {typ}")
+            self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -159,11 +169,12 @@ class Store:
                     """INSERT INTO detections
                        (scene_id, datetime, ts, lon, lat, length_m, width_m, heading_deg,
                         bow_lon, bow_lat, stern_lon, stern_lat, peak_reflectance, contrast, snr,
-                        npix, confidence, stationary, chip)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        npix, confidence, stationary, chip, length_err_m, width_err_m, method)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (scene.id, scene.datetime, ts, g.lon, g.lat, d.length_m, d.width_m, d.heading_deg,
                      g.bow_lon, g.bow_lat, g.stern_lon, g.stern_lat, round(d.peak_reflectance, 4),
-                     round(d.contrast, 4), round(d.snr, 1), d.npix, d.confidence, int(bool(seen)), chip),
+                     round(d.contrast, 4), round(d.snr, 1), d.npix, d.confidence, int(bool(seen)), chip,
+                     d.length_err_m, d.width_err_m, d.method),
                 )
                 added += 1
         return added
@@ -213,3 +224,41 @@ class Store:
     def get_detection(self, det_id: int) -> dict | None:
         rows = self._query("SELECT * FROM detections WHERE id=?", (det_id,))
         return dict(rows[0]) if rows else None
+
+    # hand corrections -----------------------------------------------------
+
+    _GEOM = ("lat", "lon", "length_m", "width_m", "heading_deg", "bow_lat", "bow_lon", "stern_lat",
+             "stern_lon", "length_err_m", "width_err_m", "method")
+
+    def set_manual_measurement(self, det_id: int, stern: tuple[float, float], bow: tuple[float, float],
+                               width_m: float | None = None) -> dict | None:
+        """Replace a ship's measurement with hull ends placed by hand (lat, lon each).
+        The automatic measurement is kept and can be restored."""
+        from pyproj import Geod
+
+        rec = self.get_detection(det_id)
+        if rec is None:
+            return None
+        az, _, dist = Geod(ellps="WGS84").inv(stern[1], stern[0], bow[1], bow[0])
+        auto = rec["auto_json"] or json.dumps({k: rec[k] for k in self._GEOM})
+        width = float(width_m) if width_m is not None else rec["width_m"]
+        with self.lock, self.conn:
+            self.conn.execute(
+                """UPDATE detections SET lat=?, lon=?, length_m=?, width_m=?, heading_deg=?, bow_lat=?, bow_lon=?,
+                   stern_lat=?, stern_lon=?, length_err_m=?, width_err_m=?, method='manual', auto_json=?, updated_at=?
+                   WHERE id=?""",
+                ((stern[0] + bow[0]) / 2, (stern[1] + bow[1]) / 2, round(dist, 1), round(width, 1), round(az % 180, 1),
+                 bow[0], bow[1], stern[0], stern[1], None, None, auto, time.time(), det_id))
+        return self.get_detection(det_id)
+
+    def reset_measurement(self, det_id: int) -> dict | None:
+        rec = self.get_detection(det_id)
+        if rec is None or not rec["auto_json"]:
+            return rec
+        auto = json.loads(rec["auto_json"])
+        sets = ", ".join(f"{k}=?" for k in auto)
+        with self.lock, self.conn:
+            self.conn.execute(f"UPDATE detections SET {sets}, auto_json=NULL, updated_at=? WHERE id=?",
+                              (*auto.values(), time.time(), det_id))
+        return self.get_detection(det_id)
+

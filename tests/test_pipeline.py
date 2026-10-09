@@ -263,3 +263,43 @@ def test_downloads_carry_coordinates(world, tmp_path):
     assert z.read("ships.kml").decode().count("<Placemark>") == len(s2_ids)
     assert client.post("/api/download.zip", json={}).status_code == 400
 
+
+
+def test_adjust_measurement_by_hand_and_reset(world):
+    import io
+
+    from PIL import Image
+    from pyproj import Geod
+
+    settings, _, _ = world
+    scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    client = create_app(settings).test_client()
+    ship = max(client.get("/api/detections").get_json()["features"], key=lambda f: f["properties"]["length_m"])
+    p = ship["properties"]
+    sid, auto_len = p["id"], p["length_m"]
+    assert p["method"] == "fit" and p["length_err_m"] > 0 and not p["adjusted"]
+
+    # move the bow ~20 m further out along the hull
+    g = Geod(ellps="WGS84")
+    az, _, _ = g.inv(p["stern_lon"], p["stern_lat"], p["bow_lon"], p["bow_lat"])
+    blon, blat, _ = g.fwd(p["bow_lon"], p["bow_lat"], az, 20)
+    r = client.post(f"/api/detections/{sid}/measurement",
+                    json={"stern": [p["stern_lat"], p["stern_lon"]], "bow": [blat, blon], "width_m": 55})
+    adj = r.get_json()["properties"]
+    assert r.status_code == 200 and adj["adjusted"] and adj["method"] == "manual"
+    assert adj["length_m"] == pytest.approx(auto_len + 20, abs=0.6) and adj["width_m"] == 55
+    assert adj["auto"]["length_m"] == auto_len
+    assert adj["chip_url"].startswith(f"/api/detections/{sid}/chip.png")
+
+    chip = client.get(adj["chip_url"])
+    assert chip.status_code == 200 and Image.open(io.BytesIO(chip.data)).size[0] == 360
+    png = Image.open(io.BytesIO(client.get(f"/api/detections/{sid}/image.png").data))
+    assert "adjusted by hand" in png.text["Description"] and "Automatic measurement was" in png.text["Description"]
+
+    # list and filters see the corrected length
+    lengths = {f["properties"]["id"]: f["properties"]["length_m"] for f in client.get("/api/detections").get_json()["features"]}
+    assert lengths[sid] == adj["length_m"]
+
+    back = client.post(f"/api/detections/{sid}/measurement/reset").get_json()["properties"]
+    assert back["length_m"] == auto_len and back["method"] == "fit" and not back["adjusted"]
+    assert client.post(f"/api/detections/{sid}/measurement", json={"stern": [1]}).status_code == 400

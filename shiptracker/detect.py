@@ -10,11 +10,14 @@ Method (per 10 m NIR band B08, where open water is dark and hulls are bright):
    the second excluding first-pass detections), giving a CFAR-style contrast test.
 3. Connected bright components are seeds; each seed is grown to all connected
    pixels brighter than a fraction of its peak excess, which captures the whole hull.
-4. Size: the hull orientation comes from PCA of the grown pixels. The excess image is
-   resampled onto a grid aligned with the hull; the along-axis and across-axis
-   intensity profiles give length and beam at a fixed fraction of the peak, with a
-   correction for the sensor's blur. This is the satellite equivalent of laying a
-   ruler bow-to-stern on the image.
+4. Size, first estimate: the hull orientation comes from PCA of the grown pixels; the
+   along- and across-hull intensity profiles give length and beam at a fixed fraction
+   of the deck level, corrected for the sensor's blur.
+5. Size, refined: a model of a hull (rectangle with a pointed bow, blurred exactly as
+   the 10 m sensor blurs) is fitted to the pixels by robust least squares, solving
+   for centre, axis, length, beam and brightness together. This removes the bias of
+   the profile method (pointed bows read short; narrow beams read wide) and gives
+   an uncertainty for each size from the fit, plus a calibrated model-error floor.
 """
 from __future__ import annotations
 
@@ -26,7 +29,8 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 from scipy import ndimage
-from scipy.special import ndtri
+from scipy.optimize import least_squares
+from scipy.special import ndtr, ndtri
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +44,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 3
+DETECTOR_VERSION = 4
 
 
 @dataclass
@@ -81,6 +85,13 @@ class DetectParams:
     max_edge_softness: float = 1.35
     edge_test_from_px: float = 8.0  # only for objects at least this long (px)
     fill_vegetation_holes: bool = False  # never relabel vegetated islets/strips as sea
+    # Hull model fit (refines length/beam; see fit_hull) and its error model. The floors
+    # were calibrated on synthetic ships and set conservatively for real imagery.
+    model_fit: bool = True
+    bow_taper: float = 0.12        # pointed part of the bow, as a fraction of length
+    length_err_floor_m: float = 4.0
+    length_err_rel: float = 0.015
+    width_err_floor_m: float = 3.0
 
 
 @dataclass
@@ -99,6 +110,9 @@ class Detection:
     width_m: float = 0.0
     heading_deg: float = 0.0  # hull axis, degrees from grid north, 0-180
     confidence: float = 0.0
+    length_err_m: float = 0.0  # 1-sigma uncertainty
+    width_err_m: float = 0.0
+    method: str = "profile"    # "fit" (hull model) or "profile" (fallback)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -281,6 +295,69 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
     }
 
 
+def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float) -> np.ndarray:
+    """Blurred hull: a rectangle with a pointed bow (at +s if sign=1), convolved with a
+    Gaussian of width ``sigma`` px. Separable in the hull frame, so it is evaluated
+    analytically at pixel centres (no supersampling)."""
+    r0, c0, th, L, W, A = params
+    ur, uc = -math.cos(th), math.sin(th)  # along hull; th = axis angle from north
+    s = (rr - r0) * ur + (cc - c0) * uc
+    t = (rr - r0) * uc - (cc - c0) * ur
+    bow0 = L / 2 - taper * L
+    sb = sign * s
+    w = np.where(sb > bow0, W * np.clip(1 - (sb - bow0) / max(taper * L, 1e-6), 0.05, 1), W)
+    gs = ndtr((s + L / 2) / sigma) - ndtr((s - L / 2) / sigma)
+    gt = ndtr((t + w / 2) / sigma) - ndtr((t - w / 2) / sigma)
+    return A * gs * gt
+
+
+def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) -> dict | None:
+    """Refine length, beam, centre and axis by fitting the blurred hull model.
+
+    Returns None (keep the profile estimate) when the fit fails or runs into its bounds.
+    """
+    region = ndimage.binary_dilation(mask, iterations=4)
+    around = region & ~ndimage.binary_dilation(mask, iterations=2)
+    vals = excess[around]
+    noise = float(1.4826 * np.median(np.abs(vals - np.median(vals)))) if vals.size > 10 else 0.003
+    rr, cc = np.nonzero(region)
+    y = excess[rr, cc].astype(np.float64)
+    sigma = math.sqrt(p.psf_sigma_px ** 2 + 1 / 12)  # optics + pixel footprint
+    th0 = math.atan2(init["axis_c"], -init["axis_r"])
+    L0, W0 = init["length_px"], max(init["width_px"], 1.0)
+    inside = mask[rr, cc]
+    A0 = max(float(np.percentile(y[inside], 60)) if inside.any() else float(y.max()), 0.01)
+    x0 = np.array([init["row"], init["col"], th0, L0 * 1.03, max(W0 * 0.7, 0.6), A0])
+    lb = np.array([x0[0] - 3, x0[1] - 3, th0 - 0.35, 1.5, 0.3, 0.003])
+    ub = np.array([x0[0] + 3, x0[1] + 3, th0 + 0.35, L0 * 1.6 + 4, max(W0 * 1.6, 3), 1.0])
+    x0 = np.clip(x0, lb + 1e-9, ub - 1e-9)
+    best = None
+    for sign in (1, -1):  # bow at either end
+        try:
+            res = least_squares(lambda q: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, x0,
+                                bounds=(lb, ub), loss="soft_l1", f_scale=max(2 * noise, 0.004), x_scale="jac")
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+        if best is None or res.cost < best.cost:
+            best = res
+    if best is None or not best.success:
+        return None
+    r0, c0, th, L, W, A = best.x
+    if L >= ub[3] * 0.99 or W >= ub[4] * 0.99 or L < W:
+        return None
+    dof = max(len(best.fun) - 6, 1)
+    try:
+        cov = np.linalg.pinv(best.jac.T @ best.jac) * float(np.sum(best.fun ** 2) / dof)
+        sl, sw = math.sqrt(max(cov[3, 3], 0.0)), math.sqrt(max(cov[4, 4], 0.0))
+    except np.linalg.LinAlgError:
+        sl = sw = 0.5
+    ar, ac = -math.cos(th), math.sin(th)
+    if ar > 0:  # same canonical direction as the profile estimate
+        ar, ac = -ar, -ac
+    return {"row": r0, "col": c0, "length_px": L, "width_px": W, "axis_r": ar, "axis_c": ac,
+            "sigma_length_px": sl, "sigma_width_px": sw}
+
+
 def _confidence(snr: float, aspect: float, length_m: float) -> float:
     c = 0.4 * min(snr / 15, 1) + 0.3 * min(max(aspect - 1, 0) / 4, 1) + 0.3 * min(length_m / 100, 1)
     return round(float(np.clip(c, 0, 1)), 3)
@@ -347,11 +424,24 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         m = measure(ex, hull, p)
         if m is None:
             continue
+        method = "profile"
+        f = fit_hull(ex, hull, m, p) if p.model_fit and hull.sum() >= p.min_pixels else None
+        if f is not None:
+            m.update(f)
+            method = "fit"
         length_m, width_m = m["length_px"] * pixel_m, m["width_px"] * pixel_m
-        aspect = length_m / max(width_m, 1e-6)
-        if not (p.min_length_m <= length_m <= p.max_length_m) or width_m > p.max_width_m:
+        if method == "fit":
+            length_err = math.hypot(m["sigma_length_px"] * pixel_m, p.length_err_floor_m, p.length_err_rel * length_m)
+            width_err = math.hypot(m["sigma_width_px"] * pixel_m, p.width_err_floor_m)
+        else:  # the profile method's own bias (bows short, beams wide) is folded in
+            length_err = math.hypot(1.5 * p.length_err_floor_m, 0.05 * length_m)
+            width_err = math.hypot(2 * p.width_err_floor_m, 0.3 * width_m)
+        # Size limits respect the uncertainty: drop only what is confidently outside them.
+        if (length_m + length_err < p.min_length_m or length_m - length_err > p.max_length_m
+                or width_m - width_err > p.max_width_m):
             rejected["size"] += 1
             continue
+        aspect = length_m / max(width_m, 1e-6)
         if length_m >= p.aspect_from_m and aspect < p.min_aspect:
             rejected["shape"] += 1
             continue
@@ -390,5 +480,6 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             length_m=round(length_m, 1), width_m=round(width_m, 1),
             heading_deg=round(heading, 1),
             confidence=_confidence(s, aspect, length_m),
+            length_err_m=round(length_err, 1), width_err_m=round(width_err, 1), method=method,
         ))
     return out

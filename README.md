@@ -66,7 +66,8 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
 1. **Sea mask.** Pixels count as sea if SCL calls them water or their NIR reflectance is very dark. Small enclosed non-water blobs, up to ship size, are filled back in, because SCL often labels the ships themselves as cloud or land. Vegetated patches are never filled, so mangrove islets and strips stay land. A 50 m coastal buffer is removed, as are SCL clouds and cloud shadows plus 100 m around them. Cloud blobs the size of a ship are not treated as cloud.
 2. **Candidates.** In the 10 m NIR band, open water is near zero and hulls are bright. Each pixel is compared with the mean and standard deviation of the water around it (a 610 m window). It must be at least 5σ brighter and at least 0.025 reflectance brighter. Bright objects are excluded from the background first, using a coarse median, so large ships don't hide themselves. The statistics are then recomputed without first-pass hits, which copes with sun glint gradients.
 3. **Hull extraction.** Each candidate is grown to every connected pixel brighter than 25 % of its peak, so the whole hull is captured rather than just the brightest part.
-4. **Measurement.** PCA gives the hull axis. The image is resampled onto a grid aligned with the hull, and the along-hull and across-hull brightness profiles give **length and beam**. Each end is placed where the profile drops to 30 % of the typical deck level, and the 10 m sensor blur is corrected for. The deck level is a median rather than the peak, so a bright superstructure does not cut off the bow. The hull axis is reported as a true-north bearing (0–180°, since bow and stern can't be told apart).
+4. **Measurement, first estimate.** PCA gives the hull axis. The along-hull and across-hull brightness profiles give a first length and beam: each end is placed where the profile drops to 30 % of the typical deck level, with a correction for blur.
+4b. **Measurement, refined (hull-model fit).** A model hull is fitted to the pixels by robust least squares. The model is a rectangle with a pointed bow, blurred exactly as the 10 m sensor blurs. The fit solves for centre, axis, length, beam and brightness together, which removes the profile method's biases (pointed bows read short, narrow beams read wide). Bright superstructures and hatch covers are down-weighted rather than trusted. Each size comes with a **± uncertainty**: the fit's own statistical error, plus a model-error floor of 4 m + 1.5 % of length for length and 3 m for beam. If a fit fails, the first estimate is kept, with wider error bars. The hull axis is a true-north bearing (0–180°, since bow and stern can't be told apart).
 5. **Filters on the object.**
    - Length must be 25–420 m and beam ≤ 90 m.
    - Objects ≥ 40 m must be at least twice as long as they are wide.
@@ -84,7 +85,16 @@ Downloads resume after an interruption (`.part` files with HTTP Range) and are r
    - A ship seen in two overlapping tiles of the same satellite pass is stored once.
    - A detection at the same spot on another date is flagged **stationary**: oil platforms, anchored ships or islets. The map can hide these.
 
-**Accuracy.** On synthetic ships rendered with the Sentinel-2 10 m point-spread function, measured length is within about 5 % for 35–400 m vessels, e.g. a 121.5 m ship measures 116–122 m, and the hull axis is within 2°. Real-world error will be larger, roughly ±10–20 m. Causes include hull paint and cargo, wakes, and ships under 30 m that are only 2–3 pixels long. Beam is less reliable than length because most beams are only 2–5 pixels.
+**Accuracy.** `tests/bench_ships.py` renders 200 synthetic ships through the Sentinel-2 10 m blur. They range from 25 to 400 m with random headings and sub-pixel positions, and include pointed or full bows, bright superstructures, hatch patterns, dim hulls and sensor noise. Typical (RMS) errors:
+
+| | length, before → now | beam, before → now |
+|---|---|---|
+| all ships | 8.3 m → **3.8 m** | 7.3 m → **2.8 m** |
+| < 60 m | 3.3 m → 3.8 m | 11.7 m → **4.1 m** |
+| 60–150 m | 4.2 m → **3.2 m** (3.9 %) | 7.0 m → **2.9 m** |
+| > 150 m | 12.3 m → **4.2 m** (1.5 %) | 1.7 m → 1.1 m |
+
+The reported ± brackets the true length for 84 % of ships and the true beam for 91 % (deliberately conservative). The hull axis is typically within 0.2°. Real imagery is messier than this: wakes, atmosphere, and boats under 30 m that are only 2–3 pixels long. Expect somewhat larger errors, and treat the ± as a guide. `tests/test_measure_accuracy.py` fails if accuracy regresses.
 
 When the detector changes, tiles analysed by an older version are redone automatically on the next scan. Their old results are replaced.
 
@@ -117,7 +127,19 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
 | `GET /api/detections/<id>/image.png[?dl=1]` | Ship image with coordinates printed on it (and in its metadata) |
 | `GET /api/detections/<id>/image.tif` | Georeferenced GeoTIFF of the ship chip |
+| `GET /api/detections/<id>/chip.png` | The ship's chip with its current ruler |
+| `POST /api/detections/<id>/measurement` `{stern: [lat, lon], bow: [lat, lon], width_m}` | Save a hand measurement |
+| `POST /api/detections/<id>/measurement/reset` | Back to the automatic measurement |
 | `POST /api/download.zip` `{ids: [...]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
+
+## Measuring on the map
+
+- **Ruler:** the 📏 button under the zoom buttons. Click points on the map to measure, like the Google Maps ruler. Each point shows the running distance and the panel shows the total. Double-click to finish, Esc to clear. Distances are geodesic, on the WGS84 ellipsoid.
+- **Adjust a ship's measurement:** click **Adjust measurement** in a ship's popup. Drag the yellow handles onto the stern and bow, optionally type the beam, and click **Save**. The length updates live as you drag.
+  - The ship is then marked *adjusted*, and its ruler turns yellow.
+  - Its image is re-drawn from the GeoTIFF with your ruler, for ships detected since GeoTIFFs were added.
+  - Downloads state "adjusted by hand" and still show the automatic value.
+  - **Reset to automatic** restores the automatic measurement.
 
 ## Opening several ships, copying coordinates, downloading images
 
