@@ -182,6 +182,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 workers=int(body.get("workers", 3)),
                 sentinel3=bool(body.get("sentinel3", True)),
                 priority_only=bool(body.get("priority_only", False)),
+                s3_days=int(body.get("s3_days", 7)),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

@@ -90,7 +90,7 @@ When the detector changes, tiles analysed by an older version are redone automat
 
 ### Open sea: Sentinel-3 (`shiptracker/s3.py`)
 
-Sentinel-2 does not photograph most of the open Arabian Sea. After the Sentinel-2 part of a scan, the remaining sea is checked with **Sentinel-3 OLCI**. This is the 300 m full-resolution water product, from the last 2 days, served by Microsoft Planetary Computer with no account needed. The newest image of each part of that sea is used.
+Sentinel-2 does not photograph most of the open Arabian Sea. After the Sentinel-2 part of a scan, the remaining sea is checked with **Sentinel-3 OLCI**. This is the 300 m full-resolution water product, from the last 7 days, served by Microsoft Planetary Computer with no account needed. The newest image of each part of that sea is used.
 
 A 300 m pixel is larger than any ship, so this is a different, weaker kind of detection:
 
@@ -144,16 +144,34 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 - **Download image:** a PNG of the ship with its coordinates printed on it. That covers the centre in decimal and DMS, plus the hull end points, size, date and source image. The coordinates are also stored in the PNG metadata (`Coordinates`, `Latitude`, `Longitude`) and in the file name, e.g. `ship_22.96002N_61.04447E_2026-09-30_382m.png`.
 - **GeoTIFF:** a clean, georeferenced copy of the image chip that opens in place in QGIS or Google Earth Pro. It is saved for ships detected from now on. Older detections only have the PNG.
 
-## Priority regions
+## Priority regions (scanned strictly in order)
 
-`config/priority.geojson` lists regions that are **scanned first, in order**:
+`config/priority.geojson` lists the regions, and a scan works through them **one at a time**:
 
-1. **Strait of Hormuz**: Bandar Abbas, Musandam, the UAE east coast and the western Gulf of Oman.
-2. **Gulf of Oman and Makran coast**: from Muscat east along the Iranian and Pakistani coast towards Karachi, and south to about 22° N.
+1. **Gulf of Oman mouth**: Ras al Hadd to Gwadar and south to about 19.5° N. This is mostly open sea, so it relies largely on Sentinel-3.
+2. **Strait of Hormuz**: Bandar Abbas, Musandam, the UAE east coast and the western Gulf of Oman.
+3. **Gulf of Oman and Makran coast**: Muscat to near Karachi.
+4. **The rest of the search area.**
 
-After these two, the rest of the search area follows. These regions are always included in the search, even where they extend beyond the AOI outline. The map opens zoomed to them and draws them as dashed yellow outlines.
+Each region is **finished completely before the next one starts**:
 
-To scan only these regions, use `py run.py --priority-only`, or tick *priority regions only* in the scan form. Edit the file, or set `SHIPTRACKER_PRIORITY`, to change the regions. Lower `order` values are scanned first.
+1. Its Sentinel-2 tiles.
+2. Older passes for any tile whose newest image was cloud.
+3. Sentinel-3 for the part of it that Sentinel-2 doesn't photograph.
+
+Even with several tiles downloading in parallel, nothing from a later region begins early. The log shows `=== Phase 1/4: … ===` and `=== Phase 1/4 done ===`.
+
+`py run.py --priority-only` stops after the priority regions. Edit the file, or set `SHIPTRACKER_PRIORITY`, to change the regions. Lower `order` values come first. The regions are always included in the search area. The map opens zoomed to them and draws them as dashed yellow outlines.
+
+## If Sentinel-3 finds nothing
+
+```
+py run.py --s3-check
+```
+
+This runs every step against Planetary Computer and prints OK, or the exact error, for each one: search, access token, downloading the three files, reading the reflectance, reading the quality flags and coordinates, and detection. Send that output if something fails.
+
+Planetary Computer usually publishes Sentinel-3 images 1–3 days after they are taken. A scan therefore looks back 7 days and uses the newest image of each part of the sea. Change this with `--s3-days 14`.
 
 ## Changing the area
 

@@ -58,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="scan every pass in the date range, not just the newest image of each tile")
     p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
     p.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
+    p.add_argument("--s3-days", type=int, default=7, help="Sentinel-3 look-back in days (default 7)")
     p.add_argument("--priority-only", action="store_true", help="scan only the priority regions")
 
     p = sub.add_parser("watch", help="scan for new imagery repeatedly")
@@ -76,6 +77,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", type=float, default=1e-4)
     p.add_argument("--offset", type=float, default=-0.1, help="-0.1 for processing baseline >= 04.00, else 0")
     p.add_argument("--chips", help="directory to write chips into")
+
+    p = sub.add_parser("s3-check", help="test Sentinel-3 step by step on this computer")
+    p.add_argument("--days", type=int, default=7)
 
     p = sub.add_parser("serve", help="web map and API")
     p.add_argument("--host", default="127.0.0.1")
@@ -110,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         opts.workers = args.workers
         opts.sentinel3 = not args.no_s3
         opts.priority_only = args.priority_only
+        opts.s3_days = args.s3_days
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -140,6 +145,13 @@ def main(argv: list[str] | None = None) -> int:
                 "confidence": g.det.confidence} for g in dets]
         print(json.dumps(out, indent=2))
         return 0
+
+    if args.cmd == "s3-check":
+        from .aoi import load_priority
+        from .s3 import diagnose
+        regions = load_priority(settings.priority_path)
+        region = regions[0][1] if regions else settings.search_area()
+        return diagnose(settings, region, args.days)
 
     if args.cmd == "serve":
         from .server import create_app

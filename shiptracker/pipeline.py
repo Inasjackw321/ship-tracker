@@ -52,7 +52,7 @@ class ScanOptions:
     fallback_rounds: int = 3     # older passes tried when a tile's newest image is clouded out
     priority_only: bool = False  # scan only the priority regions (config/priority.geojson)
     sentinel3: bool = True       # check open sea Sentinel-2 never images with Sentinel-3
-    s3_days: int = 2             # Sentinel-3 look-back (it passes daily)
+    s3_days: int = 7             # Sentinel-3 look-back; newest image of each part is used
     params: DetectParams = field(default_factory=DetectParams)
 
 
@@ -263,37 +263,54 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         note(f"Sentinel-2 imaged {cov['fraction']:.0%} of the search area in this window "
              f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2)")
 
+        # Strict phases: each priority region is finished completely (Sentinel-2 tiles,
+        # older passes for clouded tiles, then Sentinel-3 for its open sea) before the
+        # next region starts. The rest of the area comes last.
+        phases: list[tuple[str, BaseGeometry | None]] = list(regions)
+        if not opts.priority_only or not regions:
+            phases.append(("rest of the area" if regions else "whole area", None))
+        missing_all = shape(cov["missing"]) if cov.get("missing") else None
         statuses: dict[str, str] = {}
-        _run_batch(settings, store, scenes, opts, report, note, statuses, lock)
+        assigned: set[str] = set()
+        tried = {sc.id for sc in scenes}
+        s3_current: list[str] = []
+        for k, (name, region) in enumerate(phases, 1):
+            batch = [sc for sc in scenes if sc.id not in assigned
+                     and (region is None or shape(sc.geometry).intersects(region))]
+            assigned |= {sc.id for sc in batch}
+            note(f"=== Phase {k}/{len(phases)}: {name}: {len(batch)} Sentinel-2 images"
+                 + (", then Sentinel-3 for its open sea" if opts.sentinel3 else ""))
+            _run_batch(settings, store, batch, opts, report, note, statuses, lock)
 
-        # A tile whose newest image was all cloud: fall back to its next older pass.
-        if opts.mode == "latest" and not opts.limit:
-            tried = {sc.id for sc in scenes}
-            for _ in range(opts.fallback_rounds):
-                good_tiles = {sc.tile for sc in found if statuses.get(sc.id) == "done"}
-                need = {sc.tile for sc in found if sc.id in tried} - good_tiles
-                cands = [sc for sc in found if sc.tile in need and sc.id not in tried]
-                nxt = select_latest_coverage(cands, aoi)
-                if regions:
-                    nxt = prioritize(nxt, regions)
-                if not nxt:
-                    break
-                note(f"{len(need)} tiles had no clear sea in their newest image; trying {len(nxt)} older passes")
-                tried |= {sc.id for sc in nxt}
-                report.found += len(nxt)
-                _run_batch(settings, store, nxt, opts, report, note, statuses, lock)
+            # A tile whose newest image was all cloud: fall back to its next older pass.
+            if opts.mode == "latest" and not opts.limit:
+                phase_tiles = {sc.tile for sc in batch}
+                for _ in range(opts.fallback_rounds):
+                    good_tiles = {sc.tile for sc in found if statuses.get(sc.id) == "done"}
+                    need = phase_tiles - good_tiles
+                    cands = [sc for sc in found if sc.tile in need and sc.id not in tried]
+                    nxt = select_latest_coverage(cands, aoi)
+                    if not nxt:
+                        break
+                    note(f"{len(need)} tiles had no clear sea in their newest image; trying {len(nxt)} older passes")
+                    tried |= {sc.id for sc in nxt}
+                    report.found += len(nxt)
+                    _run_batch(settings, store, nxt, opts, report, note, statuses, lock)
 
-        note(f"Sentinel-2 finished: {report.processed} analysed, {report.skipped} cloud/land only, "
-             f"{report.failed} failed, {report.already_done} already done, {report.ships} ships")
+            if opts.sentinel3:
+                part = None
+                if missing_all is not None:
+                    part = missing_all if region is None else missing_all.intersection(region)
+                if part is None or part.is_empty or area_km2(part) < 100:
+                    note(f"Sentinel-3: nothing to do for {name}; Sentinel-2 covers it")
+                else:
+                    s3_current += _scan_sentinel3(settings, store, part, missing_all, opts, report, note)
+                    store.set_meta("s3_current", list(dict.fromkeys(s3_current)))
+            note(f"=== Phase {k}/{len(phases)} done: {name}")
 
-        if opts.sentinel3:
-            missing = shape(cov["missing"]) if cov.get("missing") else None
-            if missing is not None and regions and opts.priority_only:
-                missing = missing.intersection(unary_union([r for _, r in regions]))
-            if missing is None or area_km2(missing) < 100:
-                note("Sentinel-3: Sentinel-2 imaged the whole area, nothing left for Sentinel-3")
-            else:
-                _scan_sentinel3(settings, store, missing, opts, report, note, regions)
+        note(f"Finished. Sentinel-2: {report.processed} analysed, {report.skipped} cloud/land only, "
+             f"{report.failed} failed, {report.already_done} already done, {report.ships} ships. "
+             f"Sentinel-3: {report.s3_granules} images, {report.s3_ships} possible large ships")
         report.current = ""
     finally:
         if own_store:
@@ -354,32 +371,38 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
             note(f"{prefix}: " + ("no clear sea (cloud/land)" if status == "skipped" else f"{added} ships"))
 
 
-def _scan_sentinel3(settings: Settings, store: Store, region: BaseGeometry, opts: ScanOptions,
-                    report: ScanReport, note, priority=()) -> None:
+def _scan_sentinel3(settings: Settings, store: Store, region: BaseGeometry, detect_region: BaseGeometry,
+                    opts: ScanOptions, report: ScanReport, note) -> list[str]:
+    """Sentinel-3 for the open sea in ``region``. Each image is analysed over all of
+    ``detect_region`` so a later phase never has to download it again. Returns the
+    ids of the images used for this region."""
     from . import s3
 
     cfg = settings.s3_config()
     end = date.fromisoformat(opts.end[:10])
     start = (end - timedelta(days=max(opts.s3_days - 1, 0))).isoformat()
-    note(f"Sentinel-3: searching for 300 m images of the {area_km2(region):,.0f} km2 Sentinel-2 does not cover "
+    note(f"Sentinel-3: searching Planetary Computer for 300 m images of {area_km2(region):,.0f} km2 of open sea "
          f"({start} .. {end.isoformat()})")
     try:
-        granules = s3.select_granules(s3.search_granules(cfg, region, start, end.isoformat()), region)
+        found = s3.search_granules(cfg, region, start, end.isoformat())
     except Exception as exc:
         log.exception("Sentinel-3 search failed")
-        note(f"Sentinel-3: search failed ({exc}); skipped")
-        return
-    if priority:
-        granules = prioritize(granules, list(priority))
-    store.set_meta("s3_current", [g.id for g in granules])
-    note(f"Sentinel-3: {len(granules)} images selected")
+        note(f"Sentinel-3: search failed: {exc}")
+        return []
+    if not found:
+        note(f"Sentinel-3: no images on Planetary Computer for {start} .. {end.isoformat()}. They usually "
+             f"appear 1-3 days after capture; try a longer look-back (--s3-days).")
+        return []
+    granules = s3.select_granules(found, region)
+    note(f"Sentinel-3: {len(found)} images found, {len(granules)} needed to cover this area")
     for i, g in enumerate(granules, 1):
         if not opts.reprocess and store.s3_granule_status(g.id) == "done":
+            note(f"Sentinel-3 [{i}/{len(granules)}] {g.id[:60]}: already done")
             continue
         report.current = g.id
-        note(f"Sentinel-3 [{i}/{len(granules)}] {g.id[:60]}")
+        note(f"Sentinel-3 [{i}/{len(granules)}] {g.id[:60]} ({g.datetime[:16]}): downloading")
         try:
-            added = s3.process_granule(settings, store, g, region, opts.keep_tiles)
+            added = s3.process_granule(settings, store, g, detect_region, opts.keep_tiles)
         except Exception as exc:
             log.exception("Sentinel-3 granule %s failed", g.id)
             store.save_s3_granule(g, "failed", str(exc)[:500])
@@ -388,3 +411,4 @@ def _scan_sentinel3(settings: Settings, store: Store, region: BaseGeometry, opts
         report.s3_granules += 1
         report.s3_ships += added
         note(f"  {added} possible large ships")
+    return [g.id for g in granules]

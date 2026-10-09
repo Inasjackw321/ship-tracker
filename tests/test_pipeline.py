@@ -280,3 +280,18 @@ def test_downloads_carry_coordinates(world, tmp_path):
     assert f"{lat:.5f}, {lon:.5f}" in z.read("coordinates.csv").decode()
     assert z.read("ships.kml").decode().count("<Placemark>") == len(s2_ids) + 1
     assert client.post("/api/download.zip", json={}).status_code == 400
+
+
+def test_s3_check_runs_every_step(world, capsys):
+    from shapely.geometry import box
+
+    from shiptracker.s3 import diagnose
+
+    settings, _, _ = world
+    lines = []
+    code = diagnose(settings, box(60, 10, 70, 20), out=lines.append)
+    text = "\n".join(lines)
+    assert code == 0, text
+    for step in ("search", "download Oa17_reflectance.nc", "read quality flags", "detect bright specks"):
+        assert f"- {step} ..." in text
+    assert "FAILED" not in text and "3 possible large ships" in text

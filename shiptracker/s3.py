@@ -84,17 +84,25 @@ def _find_href(assets: dict, filename: str) -> str | None:
 
 
 def search_granules(cfg: dict, region: BaseGeometry, start: str, end: str) -> list[Granule]:
+    # A simple outline: the open-sea region can be a complicated multipolygon, which STAC
+    # APIs may reject; granules are matched against the real region afterwards.
     body = {
         "collections": [cfg["collection"]],
-        "intersects": mapping(region.simplify(0.05)),
+        "intersects": mapping(region.convex_hull.simplify(0.05)),
         "datetime": f"{start}T00:00:00Z/{end}T23:59:59Z",
         "limit": 100,
     }
     out = []
-    for item in search_items(cfg["stac_url"], body):
+    items = search_items(cfg["stac_url"], body)
+    for item in items:
         hrefs = {k: _find_href(item.get("assets", {}), name) for k, name in cfg["files"].items()}
         if all(hrefs.values()):
             out.append(Granule(item["id"], item["properties"]["datetime"], item["geometry"], hrefs))
+    if items and not out:
+        sample = items[0]
+        hrefs = [a.get("href", "").split("?")[0].rsplit("/", 1)[-1] for a in sample.get("assets", {}).values()]
+        raise RuntimeError(f"{len(items)} Sentinel-3 images found but none has the files "
+                           f"{sorted(cfg['files'].values())}; first image ({sample['id']}) has: {sorted(hrefs)}")
     out.sort(key=lambda g: g.datetime, reverse=True)
     return out
 
@@ -148,12 +156,26 @@ def read_scaled(path: Path, var: str) -> np.ndarray:
 
 
 def read_flags(path: Path) -> tuple[np.ndarray, dict[str, int]]:
-    with h5py.File(path, "r") as f:
-        ds = f["WQSF"]
-        flags = ds[...].astype(np.uint64)
+    """Quality flags and their bit masks. Handles both the single 64-bit ``WQSF``
+    variable and older products that split it into ``WQSF_lsb`` / ``WQSF_msb``."""
+    def table(ds, shift=0):
         names = str(_attr(ds, "flag_meanings", "")).split()
         masks = np.atleast_1d(ds.attrs.get("flag_masks", []))
-    return flags, {n: int(m) for n, m in zip(names, masks)}
+        return {n: int(m) << shift for n, m in zip(names, masks)}
+
+    with h5py.File(path, "r") as f:
+        if "WQSF" in f:
+            return f["WQSF"][...].astype(np.uint64), table(f["WQSF"])
+        if "WQSF_lsb" in f:
+            lsb = f["WQSF_lsb"]
+            flags = lsb[...].astype(np.uint64)
+            tab = table(lsb)
+            if "WQSF_msb" in f:
+                msb = f["WQSF_msb"]
+                flags |= msb[...].astype(np.uint64) << np.uint64(32)
+                tab.update(table(msb, 32))
+            return flags, tab
+        raise KeyError(f"no WQSF flags in {Path(path).name}; variables: {sorted(f.keys())}")
 
 
 def _flag(flags: np.ndarray, table: dict[str, int], *names: str) -> np.ndarray:
@@ -315,3 +337,77 @@ def process_granule(settings, store, g: Granule, region: BaseGeometry, keep_file
     if not keep_files:
         shutil.rmtree(gdir, ignore_errors=True)
     return added
+
+
+def diagnose(settings, region: BaseGeometry, days: int = 7, out=print) -> int:
+    """Step-by-step Sentinel-3 check against the live service; prints OK / FAILED per step.
+
+    Returns 0 when a real image was downloaded, read and analysed.
+    """
+    import traceback
+    from datetime import date, timedelta
+
+    from .stac import sign_href
+
+    cfg = settings.s3_config()
+    end = date.today()
+    start = end - timedelta(days=days)
+
+    def step(name, fn):
+        out(f"- {name} ...")
+        try:
+            res = fn()
+            out("  OK" + (f": {res}" if isinstance(res, str) and res else ""))
+            return res, True
+        except Exception as exc:
+            out(f"  FAILED: {type(exc).__name__}: {exc}")
+            out("  " + traceback.format_exc().strip().splitlines()[-1])
+            return None, False
+
+    out(f"Sentinel-3 check: {cfg['stac_url']} collection {cfg['collection']}, {start} .. {end}")
+    granules, ok = step("search", lambda: search_granules(cfg, region, start.isoformat(), end.isoformat()))
+    if not ok:
+        return 1
+    out(f"  {len(granules)} images with the needed files")
+    for g in granules[:5]:
+        out(f"    {g.datetime[:16]}  {g.id}")
+    if not granules:
+        out("  Nothing to test: Planetary Computer has no images for this window yet. Try --days 14.")
+        return 1
+    g = granules[0]
+    _, ok = step("access token", lambda: "signed" if "?" in sign_href(g.hrefs["flags"], cfg) else "not needed")
+    if not ok:
+        return 1
+    gdir = settings.tiles_dir / "s3" / g.id
+    paths = {}
+    for key in ("flags", "refl", "geo"):
+        p, ok = step(f"download {cfg['files'][key]}",
+                     lambda key=key: download_file(g.hrefs[key], gdir / cfg["files"][key], cfg))
+        if not ok:
+            return 1
+        paths[key] = p
+        out(f"    {p.stat().st_size / 1e6:.1f} MB")
+    refl, ok = step("read Oa17 reflectance", lambda: read_scaled(paths["refl"], "Oa17_reflectance"))
+    if not ok:
+        return 1
+    finite = np.isfinite(refl)
+    out(f"    {refl.shape[0]} x {refl.shape[1]} pixels, {finite.mean():.0%} valid, "
+        f"median {np.nanmedian(refl):.4f}, 99.9% {np.nanpercentile(refl, 99.9):.4f}")
+    flags, ok = step("read quality flags", lambda: read_flags(paths["flags"]))
+    if not ok:
+        return 1
+    fl, table = flags
+    out(f"    flags: {', '.join(n for n in ('LAND', 'CLOUD', 'CLOUD_AMBIGUOUS', 'CLOUD_MARGIN', 'COASTLINE') if n in table)}"
+        f"{'' if 'LAND' in table else '  (LAND flag missing!)'}")
+    _, ok = step("read latitude / longitude", lambda: read_scaled(paths["geo"], "latitude").shape)
+    if not ok:
+        return 1
+    rejected = Counter()
+    found, ok = step("detect bright specks", lambda: detect_granule(paths["refl"], paths["geo"], paths["flags"],
+                                                                    region, rejected=rejected))
+    if not ok:
+        return 1
+    out(f"    {len(found)} possible large ships in the area; rejected: "
+        f"{', '.join(f'{n} {r}' for r, n in rejected.most_common()) or 'none'}")
+    out("Sentinel-3 works on this computer.")
+    return 0
