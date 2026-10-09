@@ -1,0 +1,143 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "Strait of Hormuz",
+    "order": 1,
+    "note": "Traced from a hand-drawn sketch and widened ~15 km; land inside is masked automatically. Edit freely (lon, lat)."
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       56.271,
+       27.471
+      ],
+      [
+       56.701,
+       27.119
+      ],
+      [
+       57.235,
+       26.738
+      ],
+      [
+       58.104,
+       26.501
+      ],
+      [
+       59.022,
+       26.037
+      ],
+      [
+       59.885,
+       25.34
+      ],
+      [
+       59.744,
+       24.624
+      ],
+      [
+       58.309,
+       23.804
+      ],
+      [
+       56.684,
+       24.054
+      ],
+      [
+       55.389,
+       24.489
+      ],
+      [
+       55.057,
+       25.255
+      ],
+      [
+       55.134,
+       26.143
+      ],
+      [
+       55.605,
+       26.817
+      ],
+      [
+       56.271,
+       27.471
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "name": "Gulf of Oman and Makran coast",
+    "order": 2,
+    "note": "Traced from a hand-drawn sketch and widened ~15 km; land inside is masked automatically. Edit freely (lon, lat)."
+   },
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       58.69,
+       23.845
+      ],
+      [
+       59.046,
+       24.516
+      ],
+      [
+       59.994,
+       25.112
+      ],
+      [
+       61.588,
+       25.429
+      ],
+      [
+       64.041,
+       25.66
+      ],
+      [
+       66.179,
+       25.703
+      ],
+      [
+       66.315,
+       24.798
+      ],
+      [
+       65.72,
+       23.492
+      ],
+      [
+       64.112,
+       22.32
+      ],
+      [
+       61.626,
+       21.8
+      ],
+      [
+       59.571,
+       21.8
+      ],
+      [
+       58.325,
+       22.485
+      ],
+      [
+       58.69,
+       23.845
+      ]
+     ]
+    ]
+   }
+  }
+ ]
+}

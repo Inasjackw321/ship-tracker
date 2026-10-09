@@ -10,6 +10,11 @@ const labels = L.tileLayer(
   { maxZoom: 19 }).addTo(map);
 
 const aoiLayer = L.geoJSON(null, { style: { color: '#39ff5a', weight: 3, fill: false } }).addTo(map);
+const priorityLayer = L.geoJSON(null, {
+  pane: 'tiles',
+  style: { color: '#f8ff4d', weight: 2.5, dashArray: '8 6', fill: false },
+  onEachFeature: (f, l) => l.bindTooltip(`Priority ${f.properties.order}: ${f.properties.name} (scanned first)`, { sticky: true }),
+});
 // Ships draw in their own pane above the tile outlines, so tiles never block clicks.
 map.createPane('ships').style.zIndex = 650;
 map.createPane('tiles').style.zIndex = 390;
@@ -27,7 +32,7 @@ const sceneLayer = L.geoJSON(null, {
 const shipLayer = L.layerGroup().addTo(map);
 const rulerLayer = L.layerGroup().addTo(map);
 const s3Layer = L.layerGroup().addTo(map);
-L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Search area': aoiLayer,
+L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Search area': aoiLayer, 'Priority regions': priorityLayer,
   'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships (Sentinel-2)': shipLayer,
   'Rulers': rulerLayer, 'Possible large ships (Sentinel-3)': s3Layer }).addTo(map);
 
@@ -223,6 +228,7 @@ $('scan-btn').onclick = async () => {
         limit: $('scan-limit').value ? Number($('scan-limit').value) : null,
         all_passes: $('scan-all').checked,
         sentinel3: $('scan-s3').checked,
+        priority_only: $('scan-priority').checked,
       }),
     });
   } catch (e) { $('scan-state').textContent = 'error: ' + e.message; }
@@ -236,7 +242,13 @@ $('f-latest').onchange = $('f-apply').onclick;
   const weekAgo = new Date(today - 30 * 864e5);
   $('scan-end').value = today.toISOString().slice(0, 10);
   $('scan-start').value = weekAgo.toISOString().slice(0, 10);
-  getJSON('/api/aoi').then((g) => { aoiLayer.addData(g); map.fitBounds(aoiLayer.getBounds()); });
+  getJSON('/api/aoi').then((g) => {
+    aoiLayer.addData(g);
+    return getJSON('/api/priority');
+  }).then((fc) => {
+    priorityLayer.addData(fc).addTo(map);
+    map.fitBounds((fc.features.length ? priorityLayer : aoiLayer).getBounds(), { padding: [20, 20] });
+  }).catch(console.error);
   loadDetections().catch(console.error);
   loadStats().catch(console.error);
   loadScenes().catch(console.error);

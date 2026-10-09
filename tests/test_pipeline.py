@@ -215,3 +215,18 @@ def test_tile_falls_back_to_older_pass_when_newest_is_cloud(world):
     feats = client.get("/api/detections").get_json()["features"]
     assert len(feats) == len(SHIPS)
     assert {f["properties"]["scene_id"] for f in feats} == {"S2A_41QKL_20260930_0_L2A"}
+
+
+def test_priority_only_skips_tiles_outside_priority_regions(world, tmp_path):
+    import json
+
+    settings, _, _ = world
+    far_away = tmp_path / "priority.geojson"
+    far_away.write_text(json.dumps({"type": "FeatureCollection", "features": [{
+        "type": "Feature", "properties": {"name": "Hormuz only"},
+        "geometry": {"type": "Polygon", "coordinates": [[[56, 26], [57, 26], [57, 27], [56, 27], [56, 26]]]}}]}))
+    settings.priority_path = far_away
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", priority_only=True, sentinel3=False))
+    assert rep.found == 0 and rep.processed == 0
+    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", sentinel3=False))
+    assert rep.processed == 2  # without priority_only the rest of the area still follows

@@ -48,6 +48,8 @@ class Settings:
     stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_STAC_URL"))
     collection: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_COLLECTION"))
     s3_stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_S3_STAC_URL"))
+    # Regions scanned first (in order); see config/priority.geojson.
+    priority_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_PRIORITY", str(ROOT / "config" / "priority.geojson"))))
 
     @property
     def tiles_dir(self) -> Path:
@@ -70,6 +72,10 @@ class Settings:
         if self.collection:
             cfg["collection"] = self.collection
         return cfg
+
+    def search_area(self):
+        from .aoi import search_area
+        return search_area(self.aoi_path, self.priority_path)
 
     def s3_config(self) -> dict:
         cfg = dict(SENTINEL3)

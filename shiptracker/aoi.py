@@ -25,5 +25,31 @@ def load_aoi(path: Path) -> BaseGeometry:
     return geom
 
 
-def aoi_geojson(path: Path) -> dict:
-    return mapping(load_aoi(path))
+def load_priority(path: Path) -> list[tuple[str, BaseGeometry]]:
+    """Priority regions, scanned first, in their ``order`` property (then file order)."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    feats = data.get("features", [data] if data.get("type") == "Feature" else [])
+    feats = sorted(enumerate(feats), key=lambda t: (t[1].get("properties", {}).get("order", 1e9), t[0]))
+    out = []
+    for i, f in feats:
+        g = shape(f["geometry"])
+        out.append((f.get("properties", {}).get("name") or f"region {i + 1}", g if g.is_valid else g.buffer(0)))
+    return out
+
+
+def search_area(aoi_path: Path, priority_path: Path | None = None) -> BaseGeometry:
+    """The AOI plus the priority regions, so a priority region is always fully scanned
+    even where it reaches beyond the AOI outline."""
+    geom = load_aoi(aoi_path)
+    if priority_path is not None:
+        regions = [g for _, g in load_priority(priority_path)]
+        if regions:
+            geom = unary_union([geom, *regions])
+    return geom if geom.is_valid else geom.buffer(0)
+
+
+def aoi_geojson(path: Path, priority_path: Path | None = None) -> dict:
+    return mapping(search_area(path, priority_path))

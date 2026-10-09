@@ -8,8 +8,9 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_from_directory
+from shapely.geometry import mapping
 
-from .aoi import aoi_geojson, load_aoi
+from .aoi import aoi_geojson, load_priority
 from .config import Settings
 from .db import Store
 from .pipeline import ScanOptions, ScanReport, current_scene_ids, scan
@@ -46,7 +47,7 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/api/aoi")
     def aoi():
-        return jsonify({"type": "Feature", "properties": {}, "geometry": aoi_geojson(settings.aoi_path)})
+        return jsonify({"type": "Feature", "properties": {}, "geometry": aoi_geojson(settings.aoi_path, settings.priority_path)})
 
     def latest_view() -> bool:
         return request.args.get("view", "latest") != "all"
@@ -54,7 +55,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/api/detections")
     def detections():
         a = request.args
-        ids = current_scene_ids(store, load_aoi(settings.aoi_path)) if latest_view() else None
+        ids = current_scene_ids(store, settings.search_area()) if latest_view() else None
         try:
             rows = store.detections(
                 start=a.get("start") or None, end=a.get("end") or None,
@@ -73,7 +74,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     def scenes():
         rows = store.scenes(int(request.args.get("limit", 5000)))
         if latest_view():
-            ids = current_scene_ids(store, load_aoi(settings.aoi_path))
+            ids = current_scene_ids(store, settings.search_area())
             rows = [r for r in rows if r["id"] in ids]
         return jsonify(rows)
 
@@ -90,6 +91,12 @@ def create_app(settings: Settings | None = None) -> Flask:
             ids = set(store.get_meta("s3_current", []))
             rows = [r for r in rows if r["id"] in ids]
         return jsonify(rows)
+
+    @app.get("/api/priority")
+    def priority():
+        return jsonify({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"name": name, "order": i + 1}, "geometry": mapping(g)}
+            for i, (name, g) in enumerate(load_priority(settings.priority_path))]})
 
     @app.get("/api/coverage")
     def coverage():
@@ -130,6 +137,7 @@ def create_app(settings: Settings | None = None) -> Flask:
                 mode="all" if body.get("all_passes") else "latest",
                 workers=int(body.get("workers", 3)),
                 sentinel3=bool(body.get("sentinel3", True)),
+                priority_only=bool(body.get("priority_only", False)),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

@@ -22,7 +22,7 @@ from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
-from .aoi import load_aoi
+from .aoi import load_priority
 from .chips import render_chips
 from .config import Settings
 from .db import Store
@@ -50,6 +50,7 @@ class ScanOptions:
     keep_tiles: bool = True
     reprocess: bool = False
     fallback_rounds: int = 3     # older passes tried when a tile's newest image is clouded out
+    priority_only: bool = False  # scan only the priority regions (config/priority.geojson)
     sentinel3: bool = True       # check open sea Sentinel-2 never images with Sentinel-3
     s3_days: int = 2             # Sentinel-3 look-back (it passes daily)
     params: DetectParams = field(default_factory=DetectParams)
@@ -109,6 +110,23 @@ def select_latest_coverage(scenes, aoi: BaseGeometry, min_gain: float = 0.02) ->
     return chosen
 
 
+def prioritize(items, regions: list[tuple[str, BaseGeometry]]) -> list:
+    """Order items (anything with a ``geometry``) by the first priority region they touch;
+    items outside every region go last. Order within a region is kept."""
+    def rank(it) -> int:
+        g = shape(it.geometry)
+        for i, (_, region) in enumerate(regions):
+            if g.intersects(region):
+                return i
+        return len(regions)
+    return sorted(items, key=rank)
+
+
+def in_priority(item, regions) -> bool:
+    g = shape(item.geometry)
+    return any(g.intersects(r) for _, r in regions)
+
+
 def current_scene_ids(store: Store, aoi: BaseGeometry) -> set[str]:
     """Scenes making up the "latest picture" view: per tile, the most recent analysed
     image(s) that had clear sea."""
@@ -117,7 +135,7 @@ def current_scene_ids(store: Store, aoi: BaseGeometry) -> set[str]:
 
 
 def find_scenes(settings: Settings, opts: ScanOptions) -> list[Scene]:
-    aoi = load_aoi(settings.aoi_path)
+    aoi = settings.search_area()
     scenes = search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud)
     if opts.mode == "latest":
         scenes = select_latest_coverage(scenes, aoi)
@@ -142,7 +160,7 @@ def imagery_coverage(scenes: list[Scene], aoi: BaseGeometry) -> dict:
 def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions) -> tuple[str, int]:
     """Download and analyse one scene. Returns (status, ships_added)."""
     src_cfg = settings.source_config()
-    aoi = load_aoi(settings.aoi_path)
+    aoi = settings.search_area()
     sdir = scene_dir(settings.tiles_dir, scene.id)
 
     scl_path = download_file(scene.scl_href, sdir / "SCL.tif", src_cfg)
@@ -214,13 +232,26 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
 
     try:
         note(f"Searching {settings.source} for Sentinel-2 images {opts.start} .. {opts.end} (cloud <= {opts.max_cloud}%)")
-        aoi = load_aoi(settings.aoi_path)
+        aoi = settings.search_area()
         found = search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud)
         cov = imagery_coverage(found, aoi)
         cov.update(start=opts.start, end=opts.end, max_cloud=opts.max_cloud)
         store.set_meta("coverage", cov)
         report.area_imaged = cov["fraction"]
         scenes = select_latest_coverage(found, aoi) if opts.mode == "latest" else list(found)
+        regions = load_priority(settings.priority_path)
+        if regions:
+            if opts.priority_only:
+                scenes = [sc for sc in scenes if in_priority(sc, regions)]
+            scenes = prioritize(scenes, regions)
+            counts = Counter()
+            for sc in scenes:
+                g = shape(sc.geometry)
+                counts[next((n for n, r in regions if g.intersects(r)), "rest of the area")] += 1
+            note("Scan order: " + ", then ".join(f"{name} ({counts[name]} images)"
+                                                 for name in [n for n, _ in regions] + ["rest of the area"]
+                                                 if counts[name])
+                 + (" (priority regions only)" if opts.priority_only else ""))
         if opts.limit:
             scenes = scenes[: opts.limit]
         report.found = len(scenes)
@@ -242,6 +273,8 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
                 need = {sc.tile for sc in found if sc.id in tried} - good_tiles
                 cands = [sc for sc in found if sc.tile in need and sc.id not in tried]
                 nxt = select_latest_coverage(cands, aoi)
+                if regions:
+                    nxt = prioritize(nxt, regions)
                 if not nxt:
                     break
                 note(f"{len(need)} tiles had no clear sea in their newest image; trying {len(nxt)} older passes")
@@ -254,10 +287,12 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
 
         if opts.sentinel3:
             missing = shape(cov["missing"]) if cov.get("missing") else None
+            if missing is not None and regions and opts.priority_only:
+                missing = missing.intersection(unary_union([r for _, r in regions]))
             if missing is None or area_km2(missing) < 100:
                 note("Sentinel-3: Sentinel-2 imaged the whole area, nothing left for Sentinel-3")
             else:
-                _scan_sentinel3(settings, store, missing, opts, report, note)
+                _scan_sentinel3(settings, store, missing, opts, report, note, regions)
         report.current = ""
     finally:
         if own_store:
@@ -319,7 +354,7 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
 
 
 def _scan_sentinel3(settings: Settings, store: Store, region: BaseGeometry, opts: ScanOptions,
-                    report: ScanReport, note) -> None:
+                    report: ScanReport, note, priority=()) -> None:
     from . import s3
 
     cfg = settings.s3_config()
@@ -333,6 +368,8 @@ def _scan_sentinel3(settings: Settings, store: Store, region: BaseGeometry, opts
         log.exception("Sentinel-3 search failed")
         note(f"Sentinel-3: search failed ({exc}); skipped")
         return
+    if priority:
+        granules = prioritize(granules, list(priority))
     store.set_meta("s3_current", [g.id for g in granules])
     note(f"Sentinel-3: {len(granules)} images selected")
     for i, g in enumerate(granules, 1):

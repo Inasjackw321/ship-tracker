@@ -129,6 +129,17 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `POST /api/scan` `{start, end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
 
+## Priority regions
+
+`config/priority.geojson` lists regions that are **scanned first, in order**:
+
+1. **Strait of Hormuz**: Bandar Abbas, Musandam, the UAE east coast and the western Gulf of Oman.
+2. **Gulf of Oman and Makran coast**: from Muscat east along the Iranian and Pakistani coast towards Karachi, and south to about 22° N.
+
+After these two, the rest of the search area follows. These regions are always included in the search, even where they extend beyond the AOI outline. The map opens zoomed to them and draws them as dashed yellow outlines.
+
+To scan only these regions, use `py run.py --priority-only`, or tick *priority regions only* in the scan form. Edit the file, or set `SHIPTRACKER_PRIORITY`, to change the regions. Lower `order` values are scanned first.
+
 ## Changing the area
 
 Edit `config/aoi.geojson` (lon, lat order) or pass `--aoi other.geojson`. The default polygon traces the hand-drawn region. It can overlap land because land is masked automatically.

@@ -58,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="scan every pass in the date range, not just the newest image of each tile")
     p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
     p.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
+    p.add_argument("--priority-only", action="store_true", help="scan only the priority regions")
 
     p = sub.add_parser("watch", help="scan for new imagery repeatedly")
     p.add_argument("--every-hours", type=float, default=6.0)
@@ -108,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         opts.mode = "all" if args.all_passes else "latest"
         opts.workers = args.workers
         opts.sentinel3 = not args.no_s3
+        opts.priority_only = args.priority_only
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -127,10 +129,10 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(args.every_hours * 3600)
 
     if args.cmd == "detect":
-        from .aoi import load_aoi
+
         from .chips import render_chips
         from .scene import detect_scene
-        dets = detect_scene(args.nir, args.scl, load_aoi(settings.aoi_path), args.scale, args.offset)
+        dets = detect_scene(args.nir, args.scl, settings.search_area(), args.scale, args.offset)
         if args.chips:
             render_chips(Path(args.rgb or args.nir), dets, Path(args.chips))
         out = [{"lon": round(g.lon, 6), "lat": round(g.lat, 6), "length_m": g.det.length_m,

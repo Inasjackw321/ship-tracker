@@ -71,6 +71,8 @@ def main() -> int:
                     help="keep downloaded tiles (default: delete each after processing; chips are kept)")
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
     ap.add_argument("--no-s3", action="store_true", help="skip the Sentinel-3 open-sea check")
+    ap.add_argument("--priority-only", action="store_true",
+                    help="scan only the priority regions in config/priority.geojson (they are always scanned first)")
     ap.add_argument("--no-scan", action="store_true", help="don't scan, just open the map")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
@@ -105,6 +107,7 @@ def main() -> int:
             "workers": args.workers,
             "keep_tiles": args.keep_tiles,
             "sentinel3": not args.no_s3,
+            "priority_only": args.priority_only,
         }
         resp = app.test_client().post("/api/scan", json=body)
         if resp.status_code != 202:

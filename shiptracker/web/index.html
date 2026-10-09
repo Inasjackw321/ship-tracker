@@ -84,6 +84,7 @@
         <label>Max cloud % <input type="number" id="scan-cloud" value="30" min="0" max="100"></label>
         <label>Max tiles <input type="number" id="scan-limit" placeholder="all" min="1"></label>
         <label class="inline" title="Off: most recent usable image of every tile. On: every satellite pass in the date range."><input type="checkbox" id="scan-all"> every pass</label>
+        <label class="inline" title="Scan only the priority regions (dashed yellow). They are always scanned first."><input type="checkbox" id="scan-priority"> priority regions only</label>
         <label class="inline" title="Check open sea that Sentinel-2 never images with Sentinel-3 (300 m): finds large ships only, without size"><input type="checkbox" id="scan-s3" checked> Sentinel-3 open sea</label>
       </div>
       <div class="row"><button id="scan-btn">Scan</button><span id="scan-state" class="meta"></span></div>
