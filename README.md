@@ -7,7 +7,16 @@ STAC search ──► download tiles ──► sea/cloud masks ──► bright-
 (Earth Search)  (SCL, B08, TCI)    (SCL + NIR)          (local CFAR, NIR B08)    (profiles)             + chips
 ```
 
-## Quick start
+## Quick start: one command
+
+```
+py run.py          # Windows (or double-click run.bat)
+python3 run.py     # macOS / Linux
+```
+
+The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the newest 10 tiles from the last 5 days. Ships appear on the map as each tile finishes. Change the scan with `--days 10 --limit 20`, or open the map without scanning with `--no-scan`.
+
+## Manual setup
 
 ```bash
 python3 -m venv .venv
