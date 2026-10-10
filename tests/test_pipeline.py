@@ -240,6 +240,41 @@ def test_tile_shared_by_two_areas_is_analysed_whole(world, tmp_path):
     assert areas["west"]["ships"] and areas["east"]["ships"]
 
 
+def test_reset_starts_fresh(world):
+    settings, _, _ = world
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    client = create_app(settings).test_client()
+    assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)
+    assert list(settings.chips_dir.rglob("*.png")) and list(settings.tiles_dir.iterdir())
+
+    r = client.post("/api/reset")
+    assert r.status_code == 200 and r.get_json()["ships"] == len(SHIPS) and r.get_json()["tiles"] == 2
+    assert client.get("/api/detections?view=all").get_json()["features"] == []
+    assert client.get("/api/scenes").get_json() == [] and client.get("/api/coverage").get_json() == {}
+    assert client.get("/api/stats").get_json()["detections"] == 0
+    areas = {f["properties"]["id"]: f["properties"] for f in client.get("/api/areas").get_json()["features"]}
+    assert "status" not in areas[AREA] and areas[AREA]["ships"] == 0
+    assert not list(settings.chips_dir.rglob("*")) and not list(settings.tiles_dir.iterdir())
+
+    # the next scan analyses everything again instead of skipping it as already done
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    assert rep.processed == 2 and rep.already_done == 0 and rep.ships == len(SHIPS)
+    assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)
+
+
+def test_reset_from_the_command_line(world, monkeypatch, capsys):
+    from shiptracker.__main__ import main as cli
+
+    settings, _, _ = world
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    assert cli(["--data", str(settings.data_dir), "reset"]) == 1
+    assert create_app(settings).test_client().get("/api/stats").get_json()["detections"] == len(SHIPS)
+    assert cli(["--data", str(settings.data_dir), "reset", "--yes"]) == 0
+    assert f"Deleted {len(SHIPS)} ships" in capsys.readouterr().out
+    assert create_app(settings).test_client().get("/api/stats").get_json()["detections"] == 0
+
+
 def test_scan_api_requires_an_area(world):
     settings, _, _ = world
     client = create_app(settings).test_client()

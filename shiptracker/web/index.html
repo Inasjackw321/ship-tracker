@@ -70,6 +70,8 @@
     font: 600 13px system-ui, sans-serif; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button.ghost.danger { color: var(--err); border-color: #6e2b2b; font-weight: 500; }
+  button.ghost.danger:hover:not(:disabled) { background: #2a1416; }
   .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
@@ -137,6 +139,7 @@
       </div>
       <div class="row"><span id="scan-state" class="meta"></span></div>
       <div id="status"></div>
+      <div class="row"><button class="ghost danger" id="reset-btn" title="Delete every tracked ship, its images and the scan history">Reset ships &amp; start fresh</button></div>
     </section>
     <section>
       <h2>Filter</h2>

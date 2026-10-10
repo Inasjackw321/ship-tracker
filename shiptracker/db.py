@@ -180,6 +180,15 @@ class Store:
                 added += 1
         return added
 
+    def reset(self) -> dict:
+        """Forget every ship, analysed tile and area status. Returns what was removed."""
+        with self.lock, self.conn:
+            ships = self.conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+            scenes = self.conn.execute("SELECT COUNT(*) FROM scenes").fetchone()[0]
+            for table in ("detections", "scenes", "meta"):
+                self.conn.execute(f"DELETE FROM {table}")
+        return {"ships": ships, "tiles": scenes}
+
     def delete_scene_detections(self, scene_id: str) -> None:
         with self.lock, self.conn:
             self.conn.execute("DELETE FROM detections WHERE scene_id=?", (scene_id,))

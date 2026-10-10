@@ -32,6 +32,8 @@ The first run creates `.venv` and installs everything. After that it starts the 
 
 Each area shows when it was last scanned, the image dates, how much of it Sentinel-2 photographed and how many ships it holds. Pressing **Scan again** later picks up only the new images. One area is scanned at a time. **Look back (days)** and **Max cloud %** in the sidebar apply to the next scan.
 
+**To start fresh**, press **Reset ships & start fresh** under the area list (or run `py run.py --reset`). It deletes every tracked ship, their images and the scan history, so the next scan of an area analyses all of its tiles again. You'll be asked to confirm first, and hand-adjusted measurements are deleted too.
+
 Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). `py run.py --scan gulf-of-oman` also starts scanning that area straight away, and `py run.py --areas` lists the ids. Other options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes` and `--keep-tiles`; they also apply to scans started from the map.
 
 ## Manual setup
@@ -62,6 +64,7 @@ You don't need any accounts or API keys. Imagery comes from the public [Element 
 | Command | What it does |
 |---|---|
 | `areas` | List the area ids |
+| `reset [--yes]` | Delete all tracked ships, images and scan history (asks first unless `--yes`) |
 | `search AREA [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
 | `scan AREA [same] [--limit N] [--all-passes] [--workers 3] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the area once. |
 | `watch AREA [--every-hours 6] [--days 3]` | Keep scanning an area for new passes |
@@ -152,6 +155,7 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/scenes` | Processed tiles with status and footprint |
 | `GET /api/stats` | Counts |
 | `GET /api/areas` | The areas as GeoJSON, with last-scan status, image window, share imaged and ship count |
+| `POST /api/reset` | Delete all tracked ships and start fresh (refused while a scan runs) |
 | `GET /api/coverage` | `{area: {...}}` imaged and not-imaged parts of each scanned area |
 | `POST /api/scan` `{area, days \| start+end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan of one area (required) or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |

@@ -6,6 +6,7 @@ uses its most recent usable image, falling back to older passes when that is clo
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 import time
 from collections import Counter, defaultdict
@@ -110,6 +111,17 @@ def current_scene_ids(store: Store, aoi: BaseGeometry) -> set[str]:
     image(s) that had clear sea."""
     done = [SimpleNamespace(**r) for r in store.scenes(limit=1_000_000) if r["status"] == "done" and r["geometry"]]
     return {sc.id for sc in select_latest_coverage(done, aoi)}
+
+
+def reset_data(settings: Settings, store: Store) -> dict:
+    """Start fresh: delete every tracked ship, its images, the analysed-tile records and
+    the downloaded tiles, so the next scan of an area analyses everything again."""
+    removed = store.reset()
+    for d in (settings.chips_dir, settings.tiles_dir):
+        shutil.rmtree(d, ignore_errors=True)
+    settings.ensure_dirs()
+    log.info("Reset: removed %d ships from %d tiles", removed["ships"], removed["tiles"])
+    return removed
 
 
 def scan_region(settings: Settings, opts: ScanOptions) -> BaseGeometry:

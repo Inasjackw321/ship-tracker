@@ -16,7 +16,7 @@ from shapely.geometry import mapping
 from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path
 from .config import Settings
 from .db import Store
-from .pipeline import ScanOptions, ScanReport, current_scene_ids, scan
+from .pipeline import ScanOptions, ScanReport, current_scene_ids, reset_data, scan
 
 log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
@@ -197,6 +197,15 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
             "report": asdict(rep) if rep else None,
             "defaults": {"days": defaults["days"], "max_cloud": defaults["max_cloud"]},
         })
+
+    @app.post("/api/reset")
+    def reset():
+        """Delete all tracked ships and start fresh."""
+        if job["thread"] and job["thread"].is_alive():
+            return jsonify({"error": "wait for the running scan to finish first"}), 409
+        removed = reset_data(settings, store)
+        job.update(report=None, error=None, options=None)
+        return jsonify({"reset": True, **removed})
 
     @app.post("/api/scan")
     def scan_start():

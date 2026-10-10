@@ -3,6 +3,7 @@
     python run.py                      (Windows: py run.py, or double-click run.bat)
     python run.py --areas              list the areas
     python run.py --scan gulf-of-oman  also start scanning that area right away
+    python run.py --reset              delete all tracked ships first and start fresh
 
 Normally you pick an area on the map and press Scan.
 """
@@ -65,6 +66,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Open the ship tracker map; click an area and press Scan")
     ap.add_argument("--scan", metavar="AREA", help="also start scanning this area (ids: --areas)")
     ap.add_argument("--areas", action="store_true", help="list the area ids and exit")
+    ap.add_argument("--reset", action="store_true", help="delete all tracked ships first and start fresh")
     ap.add_argument("--days", type=int, default=30,
                     help="look this many days back for each tile's most recent image (default 30)")
     ap.add_argument("--limit", type=int, default=0, help="max tiles to download this run (default 0 = whole area)")
@@ -81,6 +83,10 @@ def main() -> int:
     if args.areas:
         from shiptracker.__main__ import main as cli
         return cli(["areas"])
+    if args.reset:
+        from shiptracker.__main__ import main as cli
+        if cli(["reset"]) != 0:
+            return 1
 
     import logging
     from werkzeug.serving import make_server

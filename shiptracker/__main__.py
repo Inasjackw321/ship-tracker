@@ -45,6 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("areas", help="list the areas you can scan")
+    p = sub.add_parser("reset", help="delete all tracked ships and start fresh")
+    p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
 
     p = sub.add_parser("search", help="list Sentinel-2 scenes over an area (no download)")
     p.add_argument("area", help="area id (see: shiptracker areas)")
@@ -91,6 +93,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "areas":
         for a in settings.areas():
             print(f"  {a.id:18s} {a.name}  ({a.group})")
+        return 0
+
+    if args.cmd == "reset":
+        from .db import Store
+        from .pipeline import reset_data
+        store = Store(settings.db_path)
+        n = store.stats()["detections"]
+        if not args.yes and input(f"Delete all {n} tracked ships, their images and scan history? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing deleted.")
+            return 1
+        removed = reset_data(settings, store)
+        store.close()
+        print(f"Deleted {removed['ships']} ships from {removed['tiles']} tiles. Starting fresh.")
         return 0
 
     if args.cmd in ("search", "scan", "watch"):

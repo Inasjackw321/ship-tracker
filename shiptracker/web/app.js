@@ -625,6 +625,7 @@ async function pollScan() {
     $('status').scrollTop = 1e9;
   }
   renderAreas();
+  $('reset-btn').disabled = running;
   if (running) {
     if (!polling) polling = setInterval(() => pollScan().catch(console.error), 3000);
     loadDetections(); loadStats(); loadScenes(); loadCoverage();
@@ -649,6 +650,21 @@ async function startScan(id) {
   } catch (e) { $('scan-state').textContent = 'error: ' + e.message; }
   pollScan().catch(console.error);
 }
+
+async function resetAll() {
+  const n = Number($('s-ships').textContent) || 0;
+  if (!confirm(`Delete all ${n} tracked ships, their images and the scan history of every area?\n\n`
+    + 'Hand-adjusted measurements are lost too. This cannot be undone.')) return;
+  try {
+    const r = await getJSON('/api/reset', { method: 'POST' });
+    closeAllPopups();
+    tray.clear(); renderTray();
+    $('status').textContent = '';
+    $('scan-state').textContent = `Reset: deleted ${r.ships} ships. Press an area to scan it.`;
+    await Promise.all([loadDetections(), loadStats(), loadScenes(), loadCoverage(), loadAreas()]);
+  } catch (e) { alert('Reset failed: ' + e.message); }
+}
+$('reset-btn').onclick = resetAll;
 
 $('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes()]).catch((e) => alert(e.message));
 $('f-latest').onchange = $('f-apply').onclick;
