@@ -1,8 +1,10 @@
-"""One-command launcher: sets up the environment, starts the map, scans recent imagery.
+"""One-command launcher: sets up the environment and opens the map.
 
-    python run.py                 (Windows: py run.py, or double-click run.bat)
-    python run.py --days 45 --max-cloud 50
-    python run.py --no-scan       (just open the map with existing results)
+    python run.py                      (Windows: py run.py, or double-click run.bat)
+    python run.py --areas              list the areas
+    python run.py --scan gulf-of-oman  also start scanning that area right away
+
+Normally you pick an area on the map and press Scan.
 """
 from __future__ import annotations
 
@@ -60,7 +62,9 @@ def free_port(preferred: int, host: str = "127.0.0.1") -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Start the ship tracker map and scan recent Sentinel-2 imagery")
+    ap = argparse.ArgumentParser(description="Open the ship tracker map; click an area and press Scan")
+    ap.add_argument("--scan", metavar="AREA", help="also start scanning this area (ids: --areas)")
+    ap.add_argument("--areas", action="store_true", help="list the area ids and exit")
     ap.add_argument("--days", type=int, default=30,
                     help="look this many days back for each tile's most recent image (default 30)")
     ap.add_argument("--limit", type=int, default=0, help="max tiles to download this run (default 0 = whole area)")
@@ -70,16 +74,15 @@ def main() -> int:
     ap.add_argument("--keep-tiles", action="store_true",
                     help="keep downloaded tiles (default: delete each after processing; chips are kept)")
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
-    ap.add_argument("--priority-only", action="store_true",
-                    help="scan only the priority regions in config/priority.geojson (they are always scanned first)")
-    ap.add_argument("--no-scan", action="store_true", help="don't scan, just open the map")
+    ap.add_argument("--no-scan", action="store_true", help=argparse.SUPPRESS)  # the default now
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
+    if args.areas:
+        from shiptracker.__main__ import main as cli
+        return cli(["areas"])
 
     import logging
-    from datetime import date, timedelta
-
     from werkzeug.serving import make_server
 
     from shiptracker.server import create_app
@@ -87,7 +90,11 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-    app = create_app()
+    # Scans started from the map use these options too.
+    app = create_app(scan_defaults={
+        "days": args.days, "max_cloud": args.max_cloud, "limit": args.limit or None,
+        "all_passes": args.all_passes, "workers": args.workers, "keep_tiles": args.keep_tiles,
+    })
     port = free_port(args.port)
     if port != args.port:
         print(f"Port {args.port} is unavailable on this computer; using {port} instead.", flush=True)
@@ -96,20 +103,13 @@ def main() -> int:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"\n  Ship Tracker map: {url}   (press Ctrl+C to stop)\n", flush=True)
 
-    if not args.no_scan:
-        body = {
-            "start": (date.today() - timedelta(days=args.days)).isoformat(),
-            "end": date.today().isoformat(),
-            "max_cloud": args.max_cloud,
-            "limit": args.limit or None,
-            "all_passes": args.all_passes,
-            "workers": args.workers,
-            "keep_tiles": args.keep_tiles,
-            "priority_only": args.priority_only,
-        }
+    if args.scan:
+        body = {"area": args.scan}
         resp = app.test_client().post("/api/scan", json=body)
         if resp.status_code != 202:
             print("Could not start scan:", resp.get_json(), flush=True)
+    else:
+        print("  Click an area on the map (or in the sidebar) and press Scan to analyse it.\n", flush=True)
     if not args.no_browser:
         webbrowser.open(url)
 

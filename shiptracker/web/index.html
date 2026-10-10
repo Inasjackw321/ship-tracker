@@ -15,7 +15,7 @@
     font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
   #app { display: flex; height: 100%; }
   #side { width: 360px; min-width: 300px; background: var(--panel); border-right: 1px solid var(--line);
-    display: flex; flex-direction: column; overflow: hidden; }
+    display: flex; flex-direction: column; overflow-y: auto; }
   #mapwrap { flex: 1; position: relative; min-height: 0; }
   #map { position: absolute; inset: 0; }
   /* Only as wide as its cards, so the rest of the map stays clickable. */
@@ -77,7 +77,21 @@
   .stat span { font-size: 11px; color: var(--muted); }
   #status { font: 11px/1.4 ui-monospace, monospace; color: var(--muted); white-space: pre-wrap;
     max-height: 120px; overflow: auto; margin-top: 8px; }
-  #list { flex: 1; overflow: auto; padding: 0; margin: 0; list-style: none; }
+  #areas { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+  #areas .grp { font-size: 11px; color: var(--muted); margin: 6px 0 2px; }
+  #areas .area { display: flex; gap: 8px; align-items: center; padding: 5px 6px; border-radius: 6px; cursor: pointer; }
+  #areas .area:hover { background: #1c242d; }
+  #areas .area.sel { background: #1c2a1f; outline: 1px solid #2f6b3a; }
+  #areas .area .nm { flex: 1; min-width: 0; }
+  #areas .area .nm b { display: block; font-size: 13px; font-weight: 600; }
+  #areas .area .nm span { display: block; font-size: 11px; color: var(--muted); }
+  #areas .area.scanning .nm span { color: var(--warn); }
+  #areas .area button { padding: 4px 10px; font-size: 12px; }
+  .area-pop b { font-size: 14px; }
+  .area-pop .st { color: #555; font-size: 12px; margin: 4px 0 8px; }
+  .area-pop button { background: #39d353; color: #04130a; border: 0; border-radius: 6px; padding: 6px 12px; font: 600 13px system-ui, sans-serif; cursor: pointer; }
+  .area-pop button:disabled { opacity: .5; cursor: default; }
+  #list { flex: 1; min-height: 180px; overflow: auto; padding: 0; margin: 0; list-style: none; }
   #list li { display: flex; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
   #list li:hover { background: #1c242d; }
   #list img { width: 56px; height: 56px; border-radius: 4px; object-fit: cover; background: #000; }
@@ -104,27 +118,24 @@
   <aside id="side">
     <header>
       <h1>Ship Tracker</h1>
-      <p>Sentinel-2 ship detection &amp; sizing · Hormuz / Gulf of Oman / Arabian Sea</p>
+      <p>Sentinel-2 ship detection &amp; sizing · click an area on the map to scan it</p>
     </header>
     <section>
       <div class="stats">
         <div class="stat"><b id="s-ships">–</b><span>ships</span></div>
         <div class="stat"><b id="s-scenes">–</b><span>tiles analysed</span></div>
         <div class="stat"><b id="s-shown">–</b><span>shown</span></div>
-        <div class="stat" title="Share of the search area Sentinel-2 photographed in the last scan's date window"><b id="s-imaged">–</b><span>area imaged</span></div>
+        <div class="stat" title="Areas that have been scanned at least once"><b id="s-areas">–</b><span>areas scanned</span></div>
       </div>
     </section>
     <section>
-      <h2>Download &amp; scan imagery</h2>
-      <div class="grid">
-        <label>From <input type="date" id="scan-start"></label>
-        <label>To <input type="date" id="scan-end"></label>
+      <h2>Areas · press one to analyse it</h2>
+      <ul id="areas"></ul>
+      <div class="grid" style="margin-top:8px">
+        <label title="Use the newest image of each tile taken in this many days">Look back (days) <input type="number" id="scan-days" value="30" min="1" max="365"></label>
         <label>Max cloud % <input type="number" id="scan-cloud" value="30" min="0" max="100"></label>
-        <label>Max tiles <input type="number" id="scan-limit" placeholder="all" min="1"></label>
-        <label class="inline" title="Off: most recent usable image of every tile. On: every satellite pass in the date range."><input type="checkbox" id="scan-all"> every pass</label>
-        <label class="inline" title="Scan only the priority regions (dashed yellow). They are always scanned first."><input type="checkbox" id="scan-priority"> priority regions only</label>
       </div>
-      <div class="row"><button id="scan-btn">Scan</button><span id="scan-state" class="meta"></span></div>
+      <div class="row"><span id="scan-state" class="meta"></span></div>
       <div id="status"></div>
     </section>
     <section>

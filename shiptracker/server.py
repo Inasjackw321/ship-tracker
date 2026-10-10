@@ -10,10 +10,10 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
+from shapely import contains_xy
 from shapely.geometry import mapping
 
 from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path
-from .aoi import aoi_geojson, load_priority
 from .config import Settings
 from .db import Store
 from .pipeline import ScanOptions, ScanReport, current_scene_ids, scan
@@ -37,8 +37,11 @@ def _feature(d: dict) -> dict:
             "properties": props}
 
 
-def create_app(settings: Settings | None = None) -> Flask:
+def create_app(settings: Settings | None = None, scan_defaults: dict | None = None) -> Flask:
+    """``scan_defaults`` fill in whatever a scan request from the map leaves out
+    (``days``, ``max_cloud``, ``workers``, ``keep_tiles``, ``all_passes``, ``limit``)."""
     settings = settings or Settings()
+    defaults = {"days": 30, "max_cloud": 30, "keep_tiles": False, **(scan_defaults or {})}
     settings.ensure_dirs()
     store = Store(settings.db_path)
     app = Flask(__name__, static_folder=None)
@@ -55,10 +58,6 @@ def create_app(settings: Settings | None = None) -> Flask:
     @app.get("/chips/<path:name>")
     def chips(name):
         return send_from_directory(settings.chips_dir, name)
-
-    @app.get("/api/aoi")
-    def aoi():
-        return jsonify({"type": "Feature", "properties": {}, "geometry": aoi_geojson(settings.aoi_path, settings.priority_path)})
 
     def latest_view() -> bool:
         return request.args.get("view", "latest") != "all"
@@ -159,18 +158,29 @@ def create_app(settings: Settings | None = None) -> Flask:
         return Response(bundle_zip(ships, settings.chips_dir), mimetype="application/zip",
                         headers={"Content-Disposition": f'attachment; filename="ships_{len(ships)}.zip"'})
 
-    @app.get("/api/priority")
-    def priority():
-        return jsonify({"type": "FeatureCollection", "features": [
-            {"type": "Feature", "properties": {"name": name, "order": i + 1}, "geometry": mapping(g)}
-            for i, (name, g) in enumerate(load_priority(settings.priority_path))]})
-
     @app.get("/api/coverage")
     def coverage():
-        cov = store.get_meta("coverage")
-        if cov is None:
-            return jsonify({"fraction": None, "imaged": None, "missing": None})
-        return jsonify(cov)
+        """Imaged / not-imaged parts of each scanned area (from its last scan's search)."""
+        return jsonify({a.id: store.get_meta(f"coverage:{a.id}") for a in settings.areas()
+                        if store.get_meta(f"coverage:{a.id}")})
+
+    @app.get("/api/areas")
+    def areas():
+        """The areas, with their scan status and how many ships the map currently shows in each."""
+        ids = current_scene_ids(store, settings.search_area())
+        ships = store.detections(scene_ids=ids)
+        lons = [r["lon"] for r in ships]
+        lats = [r["lat"] for r in ships]
+        running = job["thread"] is not None and job["thread"].is_alive()
+        feats = []
+        for a in settings.areas():
+            status = store.get_meta(f"area:{a.id}") or {}
+            if status.get("status") == "scanning" and not (running and job["options"].get("area") == a.id):
+                status["status"] = "interrupted"  # the app was closed during that scan
+            n = int(contains_xy(a.geom, lons, lats).sum()) if ships else 0
+            feats.append({"type": "Feature", "geometry": mapping(a.geom), "properties": {
+                "id": a.id, "name": a.name, "group": a.group, "ships": n, **status}})
+        return jsonify({"type": "FeatureCollection", "features": feats})
 
     @app.get("/api/stats")
     def stats():
@@ -185,25 +195,32 @@ def create_app(settings: Settings | None = None) -> Flask:
             "options": job["options"],
             "error": job["error"],
             "report": asdict(rep) if rep else None,
+            "defaults": {"days": defaults["days"], "max_cloud": defaults["max_cloud"]},
         })
 
     @app.post("/api/scan")
     def scan_start():
         if job["thread"] and job["thread"].is_alive():
             return jsonify({"error": "a scan is already running"}), 409
-        body = request.get_json(silent=True) or {}
+        body = {**defaults, **{k: v for k, v in (request.get_json(silent=True) or {}).items() if v is not None}}
         today = date.today()
         try:
+            settings.area(body.get("area") or "")
+        except KeyError:
+            return jsonify({"error": "choose an area to scan", "areas": [a.id for a in settings.areas()]}), 400
+        try:
+            if body.get("days") and not body.get("start"):
+                body["start"] = (today - timedelta(days=int(body["days"]))).isoformat()
             opts = ScanOptions(
+                area=body["area"],
                 start=body.get("start") or (today - timedelta(days=30)).isoformat(),
                 end=body.get("end") or today.isoformat(),
                 max_cloud=float(body.get("max_cloud", 30)),
                 limit=int(body["limit"]) if body.get("limit") else None,
                 rgb_chips=bool(body.get("rgb_chips", True)),
-                keep_tiles=bool(body.get("keep_tiles", True)),
+                keep_tiles=bool(body.get("keep_tiles")),
                 mode="all" if body.get("all_passes") else "latest",
                 workers=int(body.get("workers", 3)),
-                priority_only=bool(body.get("priority_only", False)),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

@@ -9,15 +9,36 @@ const labels = L.tileLayer(
   'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
   { maxZoom: 19 }).addTo(map);
 
-const aoiLayer = L.geoJSON(null, { style: { color: '#39ff5a', weight: 3, fill: false } }).addTo(map);
-const priorityLayer = L.geoJSON(null, {
-  pane: 'tiles',
-  style: { color: '#f8ff4d', weight: 2.5, dashArray: '8 6', fill: false },
-  onEachFeature: (f, l) => l.bindTooltip(`Priority ${f.properties.order}: ${f.properties.name} (scanned first)`, { sticky: true }),
-});
 // Ships draw in their own pane above the tile outlines, so tiles never block clicks.
 map.createPane('ships').style.zIndex = 650;
 map.createPane('tiles').style.zIndex = 390;
+map.createPane('areas').style.zIndex = 395; // above tile outlines so areas stay clickable
+
+// The areas you can scan. Click one (on the map or in the sidebar) to analyse it.
+let areas = [];          // GeoJSON features from /api/areas
+let scanJob = { running: false, area: null };
+const areaById = new Map();
+const AREA_STYLE = {
+  idle: { color: '#39ff5a', weight: 2, fillColor: '#39ff5a', fillOpacity: 0.06 },
+  scanning: { color: '#ffb000', weight: 3, dashArray: '8 6', fillColor: '#ffb000', fillOpacity: 0.12 },
+  hover: { weight: 3.5, fillOpacity: 0.16 },
+};
+const areaLayer = L.geoJSON(null, {
+  pane: 'areas',
+  style: (f) => (f.properties.id === scanJob.area && scanJob.running ? AREA_STYLE.scanning : AREA_STYLE.idle),
+  onEachFeature: (f, l) => {
+    areaById.set(f.properties.id, l);
+    l.bindTooltip(() => `<b>${esc(f.properties.name)}</b><br>${esc(areaStatus(currentArea(f.properties.id)))}<br><i>click to scan</i>`, { sticky: true });
+    l.on('mouseover', () => l.setStyle(AREA_STYLE.hover));
+    l.on('mouseout', () => areaLayer.resetStyle(l));
+    l.on('click', (e) => {
+      if (measure.on || editingId != null) return;
+      L.DomEvent.stopPropagation(e);
+      l.closeTooltip();
+      openAreaPopup(f.properties.id, e.latlng);
+    });
+  },
+}).addTo(map);
 
 const gapLayer = L.geoJSON(null, {
   pane: 'tiles',
@@ -31,7 +52,7 @@ const sceneLayer = L.geoJSON(null, {
 }).addTo(map);
 const shipLayer = L.layerGroup().addTo(map);
 const rulerLayer = L.layerGroup().addTo(map);
-L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Search area': aoiLayer, 'Priority regions': priorityLayer,
+L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Areas': areaLayer,
   'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships': shipLayer,
   'Rulers': rulerLayer }).addTo(map);
 
@@ -290,7 +311,11 @@ document.addEventListener('click', (e) => {
   const adj = e.target.closest('[data-adjust]');
   if (adj) { startAdjust(featuresById.get(Number(adj.dataset.adjust))); return; }
   const rs = e.target.closest('[data-reset]');
-  if (rs) { saveMeasurement(Number(rs.dataset.reset), null); }
+  if (rs) { saveMeasurement(Number(rs.dataset.reset), null); return; }
+  const sc = e.target.closest('[data-scan-area]');
+  if (sc) { e.preventDefault(); e.stopPropagation(); startScan(sc.dataset.scanArea); return; }
+  const zm = e.target.closest('[data-zoom-area]');
+  if (zm) { zoomArea(zm.dataset.zoomArea); }
 }, true);
 
 function trayLines() {
@@ -487,10 +512,85 @@ async function loadStats() {
 }
 
 async function loadCoverage() {
-  const c = await getJSON('/api/coverage');
+  const all = await getJSON('/api/coverage');
   gapLayer.clearLayers();
-  if (c.missing) gapLayer.addData({ type: 'Feature', geometry: c.missing, properties: {} });
-  $('s-imaged').textContent = c.fraction == null ? '–' : `${Math.round(c.fraction * 100)}%`;
+  for (const c of Object.values(all)) {
+    if (c && c.missing) gapLayer.addData({ type: 'Feature', geometry: c.missing, properties: {} });
+  }
+}
+
+const currentArea = (id) => areas.find((f) => f.properties.id === id)?.properties || {};
+const dayText = (t) => new Date(t * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+
+function areaStatus(p) {
+  if (scanJob.running && scanJob.area === p.id) return scanJob.text || 'scanning…';
+  switch (p.status) {
+    case 'done': {
+      const imaged = p.imaged == null ? '' : `, ${p.imaged > 0 && p.imaged < 0.01 ? '<1' : Math.round(p.imaged * 100)}% imaged`;
+      return `scanned ${dayText(p.finished)} (images ${p.start} → ${p.end}${imaged}) · ${p.ships} ships`;
+    }
+    case 'failed': return `last scan failed${p.error ? ': ' + p.error : ''}`;
+    case 'interrupted': return `last scan was interrupted · ${p.ships} ships`;
+    default: return p.ships ? `${p.ships} ships` : 'not scanned yet';
+  }
+}
+
+function openAreaPopup(id, latlng) {
+  const p = currentArea(id);
+  const layer = areaById.get(id);
+  if (!layer) return;
+  const busy = scanJob.running;
+  const html = `<div class="area-pop"><b>${esc(p.name)}</b>
+    <div class="st">${esc(areaStatus(p))}</div>
+    <button data-scan-area="${esc(id)}" ${busy ? 'disabled' : ''}>${busy ? (scanJob.area === id ? 'Scanning…' : 'Another scan is running') : (p.status === 'done' ? 'Scan again' : 'Scan this area')}</button>
+    <div class="st">Newest image of each tile from the last ${Number($('scan-days').value || 30)} days.</div></div>`;
+  L.popup({ autoPan: true }).setLatLng(latlng || layer.getBounds().getCenter()).setContent(html).openOn(map);
+}
+
+function zoomArea(id) {
+  const layer = areaById.get(id);
+  if (layer) map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+}
+
+function renderAreas() {
+  const ul = $('areas');
+  ul.innerHTML = '';
+  let group = null;
+  let scanned = 0;
+  for (const f of areas) {
+    const p = f.properties;
+    if (p.status === 'done') scanned += 1;
+    if (p.group !== group) {
+      group = p.group;
+      const g = document.createElement('li');
+      g.className = 'grp';
+      g.textContent = group;
+      ul.appendChild(g);
+    }
+    const li = document.createElement('li');
+    const scanningThis = scanJob.running && scanJob.area === p.id;
+    li.className = 'area' + (scanningThis ? ' scanning' : '');
+    li.dataset.zoomArea = p.id;
+    li.title = 'Click to zoom to this area';
+    li.innerHTML = `<div class="nm"><b>${esc(p.name)}</b><span>${esc(areaStatus(p))}</span></div>
+      <button data-scan-area="${esc(p.id)}" ${scanJob.running ? 'disabled' : ''}>${scanningThis ? '…' : 'Scan'}</button>`;
+    ul.appendChild(li);
+  }
+  $('s-areas').textContent = `${scanned}/${areas.length}`;
+  areaLayer.eachLayer((l) => areaLayer.resetStyle(l));
+}
+
+async function loadAreas() {
+  const fc = await getJSON('/api/areas');
+  const first = !areas.length;
+  areas = fc.features;
+  if (first) {
+    areaById.clear();
+    areaLayer.clearLayers();
+    areaLayer.addData(fc);
+  }
+  renderAreas();
+  return first;
 }
 
 async function loadScenes() {
@@ -501,60 +601,65 @@ async function loadScenes() {
 }
 
 let polling = null;
+let defaultsSet = false;
 async function pollScan() {
   const s = await getJSON('/api/scan');
+  if (!defaultsSet && s.defaults) {  // the look-back and cloud limit run.py was started with
+    defaultsSet = true;
+    $('scan-days').value = s.defaults.days;
+    $('scan-cloud').value = s.defaults.max_cloud;
+  }
   const running = s.running;
-  $('scan-btn').disabled = running;
   const r = s.report;
+  const area = s.options?.area || null;
+  const name = currentArea(area).name || area || '';
+  scanJob = {
+    running, area,
+    text: running && r ? `scanning… ${r.processed + r.skipped + r.failed + r.already_done}/${r.found || '?'} tiles, ${r.ships} ships` : 'scanning…',
+  };
   $('scan-state').textContent = running
-    ? `running… ${r ? `${r.processed + r.skipped + r.failed + r.already_done}/${r.found} tiles, ${r.ships} ships` : ''}`
-    : (s.error ? `error: ${s.error}` : (r ? 'finished' : ''));
+    ? `${name}: ${scanJob.text}`
+    : (s.error ? `error: ${s.error}` : (r && area ? `${name}: finished` : 'Press an area to scan it.'));
   if (r) {
     $('status').textContent = r.log.slice(-12).join('\n');
     $('status').scrollTop = 1e9;
   }
+  renderAreas();
   if (running) {
     if (!polling) polling = setInterval(() => pollScan().catch(console.error), 3000);
     loadDetections(); loadStats(); loadScenes(); loadCoverage();
   } else if (polling) {
     clearInterval(polling); polling = null;
-    loadDetections(); loadStats(); loadScenes(); loadCoverage();
+    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadAreas();
   }
 }
 
-$('scan-btn').onclick = async () => {
+async function startScan(id) {
+  map.closePopup();
   try {
     await getJSON('/api/scan', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        start: $('scan-start').value, end: $('scan-end').value,
+        area: id,
+        days: Number($('scan-days').value || 30),
         max_cloud: Number($('scan-cloud').value || 30),
-        limit: $('scan-limit').value ? Number($('scan-limit').value) : null,
-        all_passes: $('scan-all').checked,
-        priority_only: $('scan-priority').checked,
       }),
     });
+    zoomArea(id);
   } catch (e) { $('scan-state').textContent = 'error: ' + e.message; }
-  pollScan();
-};
+  pollScan().catch(console.error);
+}
+
 $('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes()]).catch((e) => alert(e.message));
 $('f-latest').onchange = $('f-apply').onclick;
 
 (function init() {
-  const today = new Date();
-  const weekAgo = new Date(today - 30 * 864e5);
-  $('scan-end').value = today.toISOString().slice(0, 10);
-  $('scan-start').value = weekAgo.toISOString().slice(0, 10);
-  getJSON('/api/aoi').then((g) => {
-    aoiLayer.addData(g);
-    return getJSON('/api/priority');
-  }).then((fc) => {
-    priorityLayer.addData(fc).addTo(map);
-    map.fitBounds((fc.features.length ? priorityLayer : aoiLayer).getBounds(), { padding: [20, 20] });
+  loadAreas().then(() => {
+    if (areaLayer.getLayers().length) map.fitBounds(areaLayer.getBounds(), { padding: [20, 20] });
+    return pollScan();
   }).catch(console.error);
   loadDetections().catch(console.error);
   loadStats().catch(console.error);
   loadScenes().catch(console.error);
   loadCoverage().catch(console.error);
-  pollScan().catch(console.error);
 })();

@@ -34,13 +34,12 @@ SOURCES = {
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_DATA", str(ROOT / "data"))))
-    aoi_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_AOI", str(ROOT / "config" / "aoi.geojson"))))
+    # The areas ships are tracked in; each is scanned when chosen (config/areas.geojson).
+    areas_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_AREAS", str(ROOT / "config" / "areas.geojson"))))
     source: str = field(default_factory=lambda: _env("SHIPTRACKER_SOURCE", "earth-search"))
     # Overrides for the selected source (handy for mirrors and tests).
     stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_STAC_URL"))
     collection: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_COLLECTION"))
-    # Regions scanned first (in order); see config/priority.geojson.
-    priority_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_PRIORITY", str(ROOT / "config" / "priority.geojson"))))
 
     @property
     def tiles_dir(self) -> Path:
@@ -65,8 +64,17 @@ class Settings:
         return cfg
 
     def search_area(self):
-        from .aoi import search_area
-        return search_area(self.aoi_path, self.priority_path)
+        """All areas together (used for the map's "latest image" view)."""
+        from .aoi import all_areas
+        return all_areas(self.areas_path)
+
+    def area(self, area_id: str):
+        from .aoi import get_area
+        return get_area(self.areas_path, area_id)
+
+    def areas(self):
+        from .aoi import load_areas
+        return load_areas(self.areas_path)
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.tiles_dir, self.chips_dir):

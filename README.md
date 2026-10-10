@@ -1,6 +1,6 @@
 # Ship Tracker: Sentinel-2 ship detection and sizing
 
-This tool finds ships at sea in free **Sentinel-2** satellite imagery and measures each one: length, beam and hull axis. You get the same kind of number as laying the Google Maps ruler bow to stern. It covers the **Strait of Hormuz, the Gulf of Oman and the Arabian Sea** (`config/aoi.geojson`). Results are stored in SQLite and shown on a web map, with an image chip of every ship that has a ruler drawn along the hull.
+This tool finds ships at sea in free **Sentinel-2** satellite imagery and measures each one: length, beam and hull axis. You get the same kind of number as laying the Google Maps ruler bow to stern. It covers seven areas (`config/areas.geojson`), and **you choose which one to analyse** by clicking it on the map. Results are stored in SQLite and shown on a web map, with an image chip of every ship that has a ruler drawn along the hull.
 
 ```
 STAC search ──► download tiles ──► sea/cloud masks ──► bright-hull detection ──► measure ──► SQLite ──► web map
@@ -14,9 +14,25 @@ py run.py          # Windows (or double-click run.bat)
 python3 run.py     # macOS / Linux
 ```
 
-The first run creates `.venv` and installs everything. After that it starts the map, opens your browser at http://127.0.0.1:8000 and scans the **whole area**. Every Sentinel-2 tile uses its most recent usable image from the last 30 days. Ships appear on the map as each tile finishes.
+The first run creates `.venv` and installs everything. After that it starts the map and opens your browser at http://127.0.0.1:8000. **Nothing is downloaded until you pick an area:**
 
-Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). Useful options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes`, `--priority-only`, `--keep-tiles` and `--no-scan`.
+1. Click an area on the map (the green outlines), or find it in the **Areas** list in the sidebar.
+2. Press **Scan this area** (or **Scan** in the list).
+3. Each Sentinel-2 tile of that area uses its most recent usable image from the last 30 days. Ships appear on the map as each tile finishes, and the area turns orange and dashed while it is being scanned.
+
+| Group | Area (id) |
+|---|---|
+| Middle East | Persian Gulf & Strait of Hormuz (`persian-gulf`) |
+| | Gulf of Oman & Makran coast (`gulf-of-oman`) |
+| | Southern Red Sea & Bab-el-Mandeb (`red-sea-south`) |
+| Europe | Dover Strait & Thames (`dover-strait`) |
+| | Baltic: Danish straits to St Petersburg (`baltic`) |
+| | Black Sea north: Crimea, Kerch & Azov (`black-sea-north`) |
+| East Asia | Yellow Sea, East China Sea & Taiwan (`east-china-sea`) |
+
+Each area shows when it was last scanned, the image dates, how much of it Sentinel-2 photographed and how many ships it holds. Pressing **Scan again** later picks up only the new images. One area is scanned at a time. **Look back (days)** and **Max cloud %** in the sidebar apply to the next scan.
+
+Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). `py run.py --scan gulf-of-oman` also starts scanning that area straight away, and `py run.py --areas` lists the ids. Other options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes` and `--keep-tiles`; they also apply to scans started from the map.
 
 ## Manual setup
 
@@ -24,17 +40,20 @@ Three tiles are processed in parallel, and each tile is deleted once it is proce
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# list available imagery over the area for the last 5 days (no download)
-.venv/bin/python -m shiptracker search --days 5
+# the areas you can scan
+.venv/bin/python -m shiptracker areas
+
+# list available imagery over one area for the last 5 days (no download)
+.venv/bin/python -m shiptracker search dover-strait --days 5
 
 # download tiles and detect ships (newest 10 tiles in the last 5 days)
-.venv/bin/python -m shiptracker scan --days 5 --limit 10
+.venv/bin/python -m shiptracker scan dover-strait --days 5 --limit 10
 
 # open the map at http://127.0.0.1:8000
 .venv/bin/python -m shiptracker serve
 ```
 
-You can also start scans from the web page: pick dates and click **Scan**. Progress shows live and ships appear on the map as each tile finishes.
+Scans can also be started from the web page by clicking an area and pressing **Scan**. Progress shows live and ships appear on the map as each tile finishes.
 
 You don't need any accounts or API keys. Imagery comes from the public [Element 84 Earth Search](https://earth-search.aws.element84.com/v1) catalogue (`sentinel-2-c1-l2a` on AWS). Add `--source planetary-computer` to use Microsoft Planetary Computer instead; it signs URLs anonymously.
 
@@ -42,13 +61,14 @@ You don't need any accounts or API keys. Imagery comes from the public [Element 
 
 | Command | What it does |
 |---|---|
-| `search [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
-| `scan  [same] [--limit N] [--all-passes] [--workers 3] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the whole area once. |
-| `watch [--every-hours 6] [--days 3]` | Keep scanning for new passes |
+| `areas` | List the area ids |
+| `search AREA [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
+| `scan AREA [same] [--limit N] [--all-passes] [--workers 3] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the area once. |
+| `watch AREA [--every-hours 6] [--days 3]` | Keep scanning an area for new passes |
 | `serve [--host --port]` | Web map and JSON API |
 | `detect B08.tif SCL.tif [--rgb TCI.tif --chips DIR]` | Run detection on GeoTIFFs you already have |
 
-Global options are `--data DIR` (default `./data`), `--aoi file.geojson` and `--source earth-search|planetary-computer`.
+Global options are `--data DIR` (default `./data`), `--areas-file file.geojson` and `--source earth-search|planetary-computer`.
 
 ### What gets downloaded
 
@@ -118,11 +138,11 @@ By default a scan uses the **most recent usable image of each MGRS tile** within
 
 The map shows the **latest image per tile** by default: only results from each tile's most recent analysed image, not every pass ever scanned. Untick it under Filter to see everything.
 
-Each scan also measures how much of the search area Sentinel-2 photographed in the window. The figure appears in the log and as **area imaged** on the map, and the unimaged part is shaded dark.
+Each scan also measures how much of the area Sentinel-2 photographed in the window. The figure appears in the log and in the area's status line, and the unimaged part is shaded dark.
 
 ## Coverage caveat
 
-Sentinel-2 does **not** image the whole open ocean. It images land, coastal water out to about 20 km, enclosed seas and some extra areas. The Strait of Hormuz, the Gulf of Oman and the coastal strips are covered regularly, about every 5 days. Much of the central Arabian Sea is rarely or never imaged. `search` shows what is actually available. On the map, the dark **Not imaged** layer marks sea that had no image to scan, and **Scanned tiles** outlines what has been analysed.
+Sentinel-2 does **not** image the whole open ocean. It images land, coastal water out to about 20 km, enclosed seas and some extra areas. All seven areas are mostly coastal or enclosed seas and are covered regularly, about every 5 days. Open water far from land (the middle of the Gulf of Oman mouth, the outer East China Sea) can be imaged less often. `search` shows what is actually available. On the map, the dark **Not imaged** layer marks sea that had no image to scan, and **Scanned tiles** outlines what has been analysed.
 
 ## API
 
@@ -131,9 +151,9 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/detections?view=latest\|all&start=&end=&min_length=&max_length=&min_confidence=&stationary=0\|1` | GeoJSON of ships: length/width/heading, bow and stern points, chip URL |
 | `GET /api/scenes` | Processed tiles with status and footprint |
 | `GET /api/stats` | Counts |
-| `GET /api/aoi` | Search area polygon |
-| `GET /api/coverage` | Imaged and not-imaged parts of the area from the last scan's search |
-| `POST /api/scan` `{start, end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan or check its progress |
+| `GET /api/areas` | The areas as GeoJSON, with last-scan status, image window, share imaged and ship count |
+| `GET /api/coverage` | `{area: {...}}` imaged and not-imaged parts of each scanned area |
+| `POST /api/scan` `{area, days \| start+end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan of one area (required) or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
 | `GET /api/detections/<id>/image.png[?dl=1]` | Ship image with coordinates printed on it (and in its metadata) |
 | `GET /api/detections/<id>/image.tif` | Georeferenced GeoTIFF of the ship chip |
@@ -162,24 +182,9 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 - **Download image:** a PNG of the ship with its coordinates printed on it. That covers the centre in decimal and DMS, plus the hull end points, size, date and source image. The coordinates are also stored in the PNG metadata (`Coordinates`, `Latitude`, `Longitude`) and in the file name, e.g. `ship_22.96002N_61.04447E_2026-09-30_382m.png`.
 - **GeoTIFF:** a clean, georeferenced copy of the image chip that opens in place in QGIS or Google Earth Pro. It is saved for ships detected from now on. Older detections only have the PNG.
 
-## Priority regions (scanned strictly in order)
+## Changing the areas
 
-`config/priority.geojson` lists the regions, and a scan works through them **one at a time**:
-
-1. **Gulf of Oman mouth**: Ras al Hadd to Gwadar and south to about 19.5° N. Much of it is open sea that Sentinel-2 rarely photographs; only the parts it does image can be scanned (see the dark *Not imaged* shading).
-2. **Strait of Hormuz**: Bandar Abbas, Musandam, the UAE east coast and the western Gulf of Oman.
-3. **Gulf of Oman and Makran coast**: Muscat to near Karachi.
-4. **The rest of the search area.**
-
-Each region is **finished completely before the next one starts**: first its Sentinel-2 tiles, then older passes for any tile whose newest image was cloud.
-
-Even with several tiles downloading in parallel, nothing from a later region begins early. The log shows `=== Phase 1/4: … ===` and `=== Phase 1/4 done ===`.
-
-`py run.py --priority-only` stops after the priority regions. Edit the file, or set `SHIPTRACKER_PRIORITY`, to change the regions. Lower `order` values come first. The regions are always included in the search area. The map opens zoomed to them and draws them as dashed yellow outlines.
-
-## Changing the area
-
-Edit `config/aoi.geojson` (lon, lat order) or pass `--aoi other.geojson`. The default polygon traces the hand-drawn region. It can overlap land because land is masked automatically.
+Edit `config/areas.geojson` (lon, lat order), or set `SHIPTRACKER_AREAS` / pass `--areas-file other.geojson`. Each feature needs `id`, `name` and `group` properties; the map picks up changes on reload. Polygons can overlap land because land is masked automatically.
 
 ## Tests
 

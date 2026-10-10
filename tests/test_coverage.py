@@ -35,22 +35,3 @@ def test_coverage_reports_unimaged_part():
     assert 0.45 < cov["fraction"] < 0.55
     assert cov["missing"] is not None
     assert imagery_coverage([], AOI)["fraction"] == 0.0
-
-
-def test_priority_regions_scanned_first_in_order():
-    from pathlib import Path
-
-    from shiptracker.aoi import load_priority
-    from shiptracker.pipeline import in_priority, prioritize
-
-    regions = load_priority(Path(__file__).resolve().parent.parent / "config" / "priority.geojson")
-    assert [n for n, _ in regions] == ["Gulf of Oman mouth (Ras al Hadd to Gwadar)", "Strait of Hormuz",
-                                       "Gulf of Oman and Makran coast"]
-    scenes = [
-        _scene("central-sea", "2026-10-08T06:00:00Z", "42QXX", box(62.5, 17.5, 63.5, 18.5)),
-        _scene("gwadar", "2026-10-07T06:00:00Z", "41RNH", box(61.8, 24.5, 62.8, 25.3)),
-        _scene("hormuz", "2026-10-06T06:00:00Z", "40RDQ", box(56.0, 26.0, 57.0, 27.0)),
-        _scene("chabahar", "2026-10-05T06:00:00Z", "41RLH", box(60.2, 24.7, 61.0, 25.4)),
-    ]
-    assert [s.id for s in prioritize(scenes, regions)] == ["gwadar", "chabahar", "hormuz", "central-sea"]
-    assert [s.id for s in scenes if in_priority(s, regions)] == ["gwadar", "hormuz", "chabahar"]

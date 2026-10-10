@@ -29,8 +29,8 @@ def _settings(args) -> Settings:
     s = Settings()
     if args.data:
         s.data_dir = Path(args.data)
-    if args.aoi:
-        s.aoi_path = Path(args.aoi)
+    if args.areas_file:
+        s.areas_path = Path(args.areas_file)
     if args.source:
         s.source = args.source
     return s
@@ -39,17 +39,21 @@ def _settings(args) -> Settings:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="shiptracker", description="Sentinel-2 ship detection and sizing")
     ap.add_argument("--data", help="data directory (tiles, chips, database)")
-    ap.add_argument("--aoi", help="AOI GeoJSON (default: config/aoi.geojson)")
+    ap.add_argument("--areas-file", help="areas GeoJSON (default: config/areas.geojson)")
     ap.add_argument("--source", choices=sorted(SOURCES), help="imagery source (default: earth-search)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("search", help="list Sentinel-2 scenes over the area (no download)")
+    sub.add_parser("areas", help="list the areas you can scan")
+
+    p = sub.add_parser("search", help="list Sentinel-2 scenes over an area (no download)")
+    p.add_argument("area", help="area id (see: shiptracker areas)")
     _add_scan_args(p)
     p.add_argument("--json", action="store_true")
     p.add_argument("--all-passes", action="store_true", help="list every pass, not just the newest per tile")
 
-    p = sub.add_parser("scan", help="download tiles, detect and measure ships")
+    p = sub.add_parser("scan", help="download tiles of one area, detect and measure ships")
+    p.add_argument("area", help="area id (see: shiptracker areas)")
     _add_scan_args(p)
     p.add_argument("--no-rgb", action="store_true", help="skip the true-colour download; chips use NIR")
     p.add_argument("--delete-tiles", action="store_true", help="delete each tile after it is processed")
@@ -57,9 +61,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all-passes", action="store_true",
                    help="scan every pass in the date range, not just the newest image of each tile")
     p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
-    p.add_argument("--priority-only", action="store_true", help="scan only the priority regions")
 
-    p = sub.add_parser("watch", help="scan for new imagery repeatedly")
+    p = sub.add_parser("watch", help="scan one area for new imagery repeatedly")
+    p.add_argument("area", help="area id (see: shiptracker areas)")
     p.add_argument("--every-hours", type=float, default=6.0)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--days", type=int, default=30, help="look-back window on each run")
@@ -84,11 +88,23 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     settings = _settings(args)
 
+    if args.cmd == "areas":
+        for a in settings.areas():
+            print(f"  {a.id:18s} {a.name}  ({a.group})")
+        return 0
+
+    if args.cmd in ("search", "scan", "watch"):
+        try:
+            settings.area(args.area)
+        except KeyError as exc:
+            print(exc.args[0])
+            return 2
+
     if args.cmd in ("search", "scan"):
         from .pipeline import ScanOptions, find_scenes, scan
         opts = ScanOptions(
             start=args.start or _days_ago(args.days), end=args.end or date.today().isoformat(),
-            max_cloud=args.max_cloud, limit=args.limit,
+            max_cloud=args.max_cloud, limit=args.limit, area=args.area,
         )
         if args.cmd == "search":
             opts.mode = "all" if args.all_passes else "latest"
@@ -106,7 +122,6 @@ def main(argv: list[str] | None = None) -> int:
         opts.reprocess = args.reprocess
         opts.mode = "all" if args.all_passes else "latest"
         opts.workers = args.workers
-        opts.priority_only = args.priority_only
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -117,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             opts = ScanOptions(start=(now - timedelta(days=args.days)).date().isoformat(),
                                end=now.date().isoformat(), max_cloud=args.max_cloud,
                                rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles,
-                               workers=args.workers)
+                               workers=args.workers, area=args.area)
             try:
                 scan(settings, opts)
             except Exception:

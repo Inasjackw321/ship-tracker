@@ -1,12 +1,13 @@
 """Search -> download tiles -> detect & measure ships -> store.
 
-Each Sentinel-2 MGRS tile uses its most recent usable image; priority regions are
-finished one at a time before the rest of the area.
+A scan covers one chosen area (config/areas.geojson). Each Sentinel-2 MGRS tile in it
+uses its most recent usable image, falling back to older passes when that is clouded out.
 """
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -20,7 +21,6 @@ from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
-from .aoi import load_priority
 from .chips import render_chips
 from .config import Settings
 from .db import Store
@@ -48,7 +48,7 @@ class ScanOptions:
     keep_tiles: bool = True
     reprocess: bool = False
     fallback_rounds: int = 3     # older passes tried when a tile's newest image is clouded out
-    priority_only: bool = False  # scan only the priority regions (config/priority.geojson)
+    area: str | None = None      # id of the area to scan (config/areas.geojson); None = all areas
     params: DetectParams = field(default_factory=DetectParams)
 
 
@@ -61,7 +61,8 @@ class ScanReport:
     already_done: int = 0
     ships: int = 0
     current: str = ""
-    area_imaged: float | None = None  # share of the search area with any Sentinel-2 imagery
+    area: str = ""
+    area_imaged: float | None = None  # share of the area with any Sentinel-2 imagery
     log: list[str] = field(default_factory=list)
 
 
@@ -104,23 +105,6 @@ def select_latest_coverage(scenes, aoi: BaseGeometry, min_gain: float = 0.02) ->
     return chosen
 
 
-def prioritize(items, regions: list[tuple[str, BaseGeometry]]) -> list:
-    """Order items (anything with a ``geometry``) by the first priority region they touch;
-    items outside every region go last. Order within a region is kept."""
-    def rank(it) -> int:
-        g = shape(it.geometry)
-        for i, (_, region) in enumerate(regions):
-            if g.intersects(region):
-                return i
-        return len(regions)
-    return sorted(items, key=rank)
-
-
-def in_priority(item, regions) -> bool:
-    g = shape(item.geometry)
-    return any(g.intersects(r) for _, r in regions)
-
-
 def current_scene_ids(store: Store, aoi: BaseGeometry) -> set[str]:
     """Scenes making up the "latest picture" view: per tile, the most recent analysed
     image(s) that had clear sea."""
@@ -128,8 +112,12 @@ def current_scene_ids(store: Store, aoi: BaseGeometry) -> set[str]:
     return {sc.id for sc in select_latest_coverage(done, aoi)}
 
 
+def scan_region(settings: Settings, opts: ScanOptions) -> BaseGeometry:
+    return settings.area(opts.area).geom if opts.area else settings.search_area()
+
+
 def find_scenes(settings: Settings, opts: ScanOptions) -> list[Scene]:
-    aoi = settings.search_area()
+    aoi = scan_region(settings, opts)
     scenes = search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud)
     if opts.mode == "latest":
         scenes = select_latest_coverage(scenes, aoi)
@@ -154,6 +142,8 @@ def imagery_coverage(scenes: list[Scene], aoi: BaseGeometry) -> dict:
 def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions) -> tuple[str, int]:
     """Download and analyse one scene. Returns (status, ships_added)."""
     src_cfg = settings.source_config()
+    # Every area the tile touches, not just the one being scanned: a tile is analysed
+    # once, so a scan of the neighbouring area must not find it half done.
     aoi = settings.search_area()
     sdir = scene_dir(settings.tiles_dir, scene.id)
 
@@ -226,27 +216,21 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
             on_progress(report)
 
     try:
-        note(f"Searching {settings.source} for Sentinel-2 images {opts.start} .. {opts.end} (cloud <= {opts.max_cloud}%)")
-        aoi = settings.search_area()
+        area = settings.area(opts.area) if opts.area else None
+        aoi = area.geom if area else settings.search_area()
+        name = area.name if area else "all areas"
+        report.area = opts.area or ""
+        note(f"{name}: searching {settings.source} for Sentinel-2 images {opts.start} .. {opts.end} "
+             f"(cloud <= {opts.max_cloud}%)")
         found = search_scenes(settings.source_config(), aoi, opts.start, opts.end, opts.max_cloud)
         cov = imagery_coverage(found, aoi)
         cov.update(start=opts.start, end=opts.end, max_cloud=opts.max_cloud)
-        store.set_meta("coverage", cov)
+        if area:
+            store.set_meta(f"coverage:{area.id}", cov)
+            store.set_meta(f"area:{area.id}", {"status": "scanning", "started": time.time(),
+                                               "start": opts.start, "end": opts.end})
         report.area_imaged = cov["fraction"]
         scenes = select_latest_coverage(found, aoi) if opts.mode == "latest" else list(found)
-        regions = load_priority(settings.priority_path)
-        if regions:
-            if opts.priority_only:
-                scenes = [sc for sc in scenes if in_priority(sc, regions)]
-            scenes = prioritize(scenes, regions)
-            counts = Counter()
-            for sc in scenes:
-                g = shape(sc.geometry)
-                counts[next((n for n, r in regions if g.intersects(r)), "rest of the area")] += 1
-            note("Scan order: " + ", then ".join(f"{name} ({counts[name]} images)"
-                                                 for name in [n for n, _ in regions] + ["rest of the area"]
-                                                 if counts[name])
-                 + (" (priority regions only)" if opts.priority_only else ""))
         if opts.limit:
             scenes = scenes[: opts.limit]
         report.found = len(scenes)
@@ -254,44 +238,41 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         note(f"Found {len(found)} images of {n_tiles} tiles; {len(scenes)} selected "
              f"({'most recent per tile' if opts.mode == 'latest' else 'every pass'}"
              f"{f', limited to {opts.limit}' if opts.limit else ''})")
-        note(f"Sentinel-2 imaged {cov['fraction']:.0%} of the search area in this window "
+        note(f"Sentinel-2 imaged {cov['fraction']:.0%} of {name} in this window "
              f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2)")
 
-        # Strict phases: each priority region is finished completely (its tiles, plus older
-        # passes for clouded tiles) before the next region starts. The rest comes last.
-        phases: list[tuple[str, BaseGeometry | None]] = list(regions)
-        if not opts.priority_only or not regions:
-            phases.append(("rest of the area" if regions else "whole area", None))
         statuses: dict[str, str] = {}
-        assigned: set[str] = set()
-        tried = {sc.id for sc in scenes}
-        for k, (name, region) in enumerate(phases, 1):
-            batch = [sc for sc in scenes if sc.id not in assigned
-                     and (region is None or shape(sc.geometry).intersects(region))]
-            assigned |= {sc.id for sc in batch}
-            note(f"=== Phase {k}/{len(phases)}: {name}: {len(batch)} Sentinel-2 images")
-            _run_batch(settings, store, batch, opts, report, note, statuses, lock)
+        _run_batch(settings, store, scenes, opts, report, note, statuses, lock)
 
-            # A tile whose newest image was all cloud: fall back to its next older pass.
-            if opts.mode == "latest" and not opts.limit:
-                phase_tiles = {sc.tile for sc in batch}
-                for _ in range(opts.fallback_rounds):
-                    good_tiles = {sc.tile for sc in found if statuses.get(sc.id) == "done"}
-                    need = phase_tiles - good_tiles
-                    cands = [sc for sc in found if sc.tile in need and sc.id not in tried]
-                    nxt = select_latest_coverage(cands, aoi)
-                    if not nxt:
-                        break
-                    note(f"{len(need)} tiles had no clear sea in their newest image; trying {len(nxt)} older passes")
-                    tried |= {sc.id for sc in nxt}
-                    report.found += len(nxt)
-                    _run_batch(settings, store, nxt, opts, report, note, statuses, lock)
+        # A tile whose newest image was all cloud: fall back to its next older pass.
+        if opts.mode == "latest" and not opts.limit:
+            tried = {sc.id for sc in scenes}
+            tiles = {sc.tile for sc in scenes}
+            for _ in range(opts.fallback_rounds):
+                good_tiles = {sc.tile for sc in found if statuses.get(sc.id) == "done"}
+                need = tiles - good_tiles
+                cands = [sc for sc in found if sc.tile in need and sc.id not in tried]
+                nxt = select_latest_coverage(cands, aoi)
+                if not nxt:
+                    break
+                note(f"{len(need)} tiles had no clear sea in their newest image; trying {len(nxt)} older passes")
+                tried |= {sc.id for sc in nxt}
+                report.found += len(nxt)
+                _run_batch(settings, store, nxt, opts, report, note, statuses, lock)
 
-            note(f"=== Phase {k}/{len(phases)} done: {name}")
-
-        note(f"Finished: {report.processed} analysed, {report.skipped} cloud/land only, "
-             f"{report.failed} failed, {report.already_done} already done, {report.ships} ships")
+        note(f"Finished {name}: {report.processed} analysed, {report.skipped} cloud/land only, "
+             f"{report.failed} failed, {report.already_done} already done, {report.ships} new ships")
+        if area:
+            store.set_meta(f"area:{area.id}", {
+                "status": "done", "finished": time.time(), "start": opts.start, "end": opts.end,
+                "tiles": report.processed + report.already_done, "failed": report.failed,
+                "imaged": cov["fraction"]})
         report.current = ""
+    except Exception as exc:
+        if opts.area:
+            store.set_meta(f"area:{opts.area}", {"status": "failed", "finished": time.time(),
+                                                 "start": opts.start, "end": opts.end, "error": str(exc)[:200]})
+        raise
     finally:
         if own_store:
             store.close()

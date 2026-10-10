@@ -1,7 +1,7 @@
 """End-to-end: STAC search -> tile download -> detection -> database -> web API.
 
 A local HTTP server plays the part of the STAC API and the imagery bucket, serving
-synthetic Sentinel-2 tiles that sit inside the default search area.
+synthetic Sentinel-2 tiles that sit inside the Gulf of Oman area.
 """
 import json
 import math
@@ -24,7 +24,8 @@ from shiptracker.server import create_app
 from tests.synth import make_scene
 
 EPSG = 32641            # UTM 41N
-LON, LAT = 61.0, 23.0   # Gulf of Oman, inside config/aoi.geojson
+LON, LAT = 61.0, 23.0   # inside the gulf-of-oman area of config/areas.geojson
+AREA = "gulf-of-oman"
 SHIPS = [(150, 150, 121.5, 20, 8), (300, 300, 250, 40, 45), (450, 450, 400, 60, 170),
          (520, 320, 180, 30, 135)]
 
@@ -117,7 +118,7 @@ def world(tmp_path):
 
 def test_scan_end_to_end(world):
     settings, truth, tr = world
-    opts = ScanOptions(start="2026-09-29", end="2026-10-01", mode="all")
+    opts = ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", mode="all")
     rep = scan(settings, opts)
     assert (rep.found, rep.processed, rep.failed) == (2, 2, 0)
     assert rep.ships == len(SHIPS), "overlapping tile from the same pass must not double count"
@@ -142,12 +143,17 @@ def test_scan_end_to_end(world):
     assert client.get("/api/stats").get_json()["scenes_done"] == 2
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
-    assert client.get("/api/aoi").get_json()["geometry"]["type"] == "Polygon"
+    areas = {f["properties"]["id"]: f["properties"] for f in client.get("/api/areas").get_json()["features"]}
+    assert len(areas) == 7
+    assert areas[AREA]["status"] == "done" and areas[AREA]["ships"] == len(SHIPS)
+    assert areas["baltic"]["ships"] == 0 and "status" not in areas["baltic"]
 
     n_chips = len(list(settings.chips_dir.rglob("*.png")))
     assert n_chips == len(SHIPS), "chips of de-duplicated detections should be removed"
 
     cov = client.get("/api/coverage").get_json()
+    assert list(cov) == [AREA]
+    cov = cov[AREA]
     assert 0 < cov["fraction"] < 0.01  # one small synthetic tile in a huge area
     assert cov["missing"]["type"] in ("Polygon", "MultiPolygon")
 
@@ -167,7 +173,7 @@ def test_scan_end_to_end(world):
 
 def test_latest_mode_processes_each_tile_and_latest_view(world):
     settings, _, _ = world
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
     assert (rep.found, rep.processed) == (2, 2)  # two overlapping tiles, one image each
     assert rep.area_imaged is not None
     client = create_app(settings).test_client()
@@ -192,7 +198,7 @@ def test_tile_falls_back_to_older_pass_when_newest_is_cloud(world):
     Handler.pages = [[_item("S2A_41QKL_20261005_0_L2A", "2026-10-05T06:40:11Z", settings.stac_url, "c",
                             (w, s, e, n)), older]]
 
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-06"))
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-06"))
     assert (rep.skipped, rep.processed) == (1, 1)
     assert rep.ships == len(SHIPS)
     client = create_app(settings).test_client()
@@ -201,19 +207,54 @@ def test_tile_falls_back_to_older_pass_when_newest_is_cloud(world):
     assert {f["properties"]["scene_id"] for f in feats} == {"S2A_41QKL_20260930_0_L2A"}
 
 
-def test_priority_only_skips_tiles_outside_priority_regions(world, tmp_path):
-    import json
-
+def test_scan_only_covers_the_chosen_area(world):
+    """A tile in the Gulf of Oman is not analysed when another area is scanned."""
     settings, _, _ = world
-    far_away = tmp_path / "priority.geojson"
-    far_away.write_text(json.dumps({"type": "FeatureCollection", "features": [{
-        "type": "Feature", "properties": {"name": "Hormuz only"},
-        "geometry": {"type": "Polygon", "coordinates": [[[56, 26], [57, 26], [57, 27], [56, 27], [56, 26]]]}}]}))
-    settings.priority_path = far_away
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01", priority_only=True))
+    rep = scan(settings, ScanOptions(area="baltic", start="2026-09-29", end="2026-10-01"))
     assert rep.found == 0 and rep.processed == 0
-    rep = scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
-    assert rep.processed == 2  # without priority_only the rest of the area still follows
+    client = create_app(settings).test_client()
+    areas = {f["properties"]["id"]: f["properties"] for f in client.get("/api/areas").get_json()["features"]}
+    assert areas["baltic"]["status"] == "done" and areas["baltic"]["imaged"] == 0
+    assert "status" not in areas[AREA]
+
+
+def test_tile_shared_by_two_areas_is_analysed_whole(world, tmp_path):
+    """A tile on the border between two areas: scanning one area finds the ships in both
+    halves, so the later scan of the other area (which skips the tile) misses nothing."""
+    settings, _, _ = world
+    w, s, e, n = Handler.pages[0][0]["bbox"]
+    mid = (w + e) / 2
+    halves = tmp_path / "areas.geojson"
+    halves.write_text(json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"id": i, "name": i, "group": "test"}, "geometry": {
+            "type": "Polygon", "coordinates": [[[a, s - 1], [b, s - 1], [b, n + 1], [a, n + 1], [a, s - 1]]]}}
+        for i, a, b in (("west", w - 1, mid), ("east", mid, e + 1))]}))
+    settings.areas_path = halves
+    rep = scan(settings, ScanOptions(area="west", start="2026-09-29", end="2026-10-01"))
+    assert rep.processed == 2 and rep.ships == len(SHIPS)
+    rep = scan(settings, ScanOptions(area="east", start="2026-09-29", end="2026-10-01"))
+    assert rep.already_done == 2 and rep.processed == 0
+    client = create_app(settings).test_client()
+    areas = {f["properties"]["id"]: f["properties"] for f in client.get("/api/areas").get_json()["features"]}
+    assert areas["west"]["ships"] + areas["east"]["ships"] == len(SHIPS)
+    assert areas["west"]["ships"] and areas["east"]["ships"]
+
+
+def test_scan_api_requires_an_area(world):
+    settings, _, _ = world
+    client = create_app(settings).test_client()
+    r = client.post("/api/scan", json={"days": 7})
+    assert r.status_code == 400 and AREA in r.get_json()["areas"]
+    assert client.post("/api/scan", json={"area": "atlantis"}).status_code == 400
+    r = client.post("/api/scan", json={"area": AREA, "days": 5})
+    assert r.status_code == 202 and r.get_json()["options"]["area"] == AREA
+    import time
+    for _ in range(600):
+        if not client.get("/api/scan").get_json()["running"]:
+            break
+        time.sleep(0.1)
+    status = client.get("/api/scan").get_json()
+    assert status["error"] is None and status["report"]["ships"] == len(SHIPS)
 
 
 def test_downloads_carry_coordinates(world, tmp_path):
@@ -223,7 +264,7 @@ def test_downloads_carry_coordinates(world, tmp_path):
     from PIL import Image
 
     settings, _, _ = world
-    scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
     client = create_app(settings).test_client()
     ship = client.get("/api/detections").get_json()["features"][0]
     lon, lat = ship["geometry"]["coordinates"]
@@ -272,7 +313,7 @@ def test_adjust_measurement_by_hand_and_reset(world):
     from pyproj import Geod
 
     settings, _, _ = world
-    scan(settings, ScanOptions(start="2026-09-29", end="2026-10-01"))
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
     client = create_app(settings).test_client()
     ship = max(client.get("/api/detections").get_json()["features"], key=lambda f: f["properties"]["length_m"])
     p = ship["properties"]
