@@ -5,6 +5,7 @@ synthetic Sentinel-2 tiles that sit inside the Gulf of Oman area.
 """
 import json
 import math
+import os
 import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -70,11 +71,51 @@ def _item(item_id, dt, base_url, sub, bounds, tile="41QKL"):
 
 
 class Handler(SimpleHTTPRequestHandler):
-    """Fake STAC API + imagery bucket."""
+    """Fake STAC API + imagery bucket (with HTTP range requests, like S3)."""
     pages: list = []
+    served: dict = {}  # file name -> bytes sent
 
     def log_message(self, *a):
         pass
+
+    def send_head(self):
+        rng = self.headers.get("Range", "")
+        if not rng.startswith("bytes=") or "," in rng:
+            self._left = None
+            return super().send_head()
+        try:
+            f = open(self.translate_path(self.path), "rb")
+        except OSError:
+            self.send_error(404)
+            return None
+        size = os.fstat(f.fileno()).st_size
+        a, _, b = rng[6:].partition("-")
+        start = int(a) if a else max(size - int(b), 0)
+        end = min(int(b), size - 1) if a and b else size - 1
+        if start >= size:
+            f.close()
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.end_headers()
+            return None
+        self.send_response(206)
+        self.send_header("Content-Type", "image/tiff")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        f.seek(start)
+        self._left = end - start + 1
+        return f
+
+    def copyfile(self, source, outputfile):
+        name = Path(self.path).name
+        if self._left is None:
+            data = source.read()
+        else:
+            data = source.read(self._left)
+        Handler.served[name] = Handler.served.get(name, 0) + len(data)
+        outputfile.write(data)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -118,7 +159,7 @@ def world(tmp_path):
 
 def test_scan_end_to_end(world):
     settings, truth, tr = world
-    opts = ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", mode="all")
+    opts = ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", mode="all", keep_tiles=True)
     rep = scan(settings, opts)
     assert (rep.found, rep.processed, rep.failed) == (2, 2, 0)
     assert rep.ships == len(SHIPS), "overlapping tile from the same pass must not double count"
@@ -183,6 +224,40 @@ def test_latest_mode_processes_each_tile_and_latest_view(world):
     assert len(client.get("/api/scenes").get_json()) == 2
 
 
+def test_streaming_reads_parts_without_downloading_files(world):
+    """By default the big bands are streamed with range requests: no B08/TCI files are
+    written, and the results are the same as from downloaded files."""
+    from shiptracker.db import Store
+    from shiptracker.pipeline import reset_data
+
+    settings, _, _ = world
+    Handler.served = {}
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", workers=2))
+    assert (rep.processed, rep.ships) == (2, len(SHIPS))
+    assert not list(settings.tiles_dir.rglob("B08.tif*")) and not list(settings.tiles_dir.rglob("TCI.tif*"))
+    assert Handler.served.get("B08.tif") and Handler.served.get("TCI.tif")
+
+    def sizes():
+        feats = create_app(settings).test_client().get("/api/detections").get_json()["features"]
+        return sorted((f["properties"]["length_m"], f["properties"]["width_m"]) for f in feats)
+
+    streamed = sizes()
+    st = Store(settings.db_path)
+    reset_data(settings, st)
+    st.close()
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", keep_tiles=True))
+    assert rep.ships == len(SHIPS) and sizes() == streamed
+
+
+def test_falls_back_to_download_when_streaming_fails(world, monkeypatch):
+    from shiptracker import pipeline
+
+    settings, _, _ = world
+    monkeypatch.setattr(pipeline, "remote_href", lambda href, cfg: "http://127.0.0.1:9/unreachable.tif")
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", processes=False))
+    assert (rep.processed, rep.failed, rep.ships) == (2, 0, len(SHIPS))
+
+
 def test_tile_falls_back_to_older_pass_when_newest_is_cloud(world):
     """Newest image of tile 41QKL is clouded over: use its previous pass instead, and
     show that pass on the map."""
@@ -242,7 +317,7 @@ def test_tile_shared_by_two_areas_is_analysed_whole(world, tmp_path):
 
 def test_reset_starts_fresh(world):
     settings, _, _ = world
-    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", keep_tiles=True))
     client = create_app(settings).test_client()
     assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)
     assert list(settings.chips_dir.rglob("*.png")) and list(settings.tiles_dir.iterdir())

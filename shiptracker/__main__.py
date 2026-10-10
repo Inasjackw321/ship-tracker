@@ -58,20 +58,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("area", help="area id (see: shiptracker areas)")
     _add_scan_args(p)
     p.add_argument("--no-rgb", action="store_true", help="skip the true-colour download; chips use NIR")
-    p.add_argument("--delete-tiles", action="store_true", help="delete each tile after it is processed")
+    p.add_argument("--keep-tiles", action="store_true",
+                   help="download whole image files into data/tiles and keep them (default: stream only what is needed)")
+    p.add_argument("--delete-tiles", action="store_true", help=argparse.SUPPRESS)  # the default now
     p.add_argument("--reprocess", action="store_true", help="re-run scenes that were already processed")
     p.add_argument("--all-passes", action="store_true",
                    help="scan every pass in the date range, not just the newest image of each tile")
-    p.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
+    p.add_argument("--workers", type=int, default=0, help="tiles processed in parallel (default: automatic)")
 
     p = sub.add_parser("watch", help="scan one area for new imagery repeatedly")
     p.add_argument("area", help="area id (see: shiptracker areas)")
     p.add_argument("--every-hours", type=float, default=6.0)
-    p.add_argument("--workers", type=int, default=3)
+    p.add_argument("--workers", type=int, default=0)
     p.add_argument("--days", type=int, default=30, help="look-back window on each run")
     p.add_argument("--max-cloud", type=float, default=30.0)
     p.add_argument("--no-rgb", action="store_true")
-    p.add_argument("--delete-tiles", action="store_true")
+    p.add_argument("--keep-tiles", action="store_true")
+    p.add_argument("--delete-tiles", action="store_true", help=argparse.SUPPRESS)
 
     p = sub.add_parser("detect", help="run detection on local B08 + SCL GeoTIFFs")
     p.add_argument("nir", help="B08 (10 m NIR) GeoTIFF")
@@ -133,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{len(scenes)} scenes")
             return 0
         opts.rgb_chips = not args.no_rgb
-        opts.keep_tiles = not args.delete_tiles
+        opts.keep_tiles = args.keep_tiles
         opts.reprocess = args.reprocess
         opts.mode = "all" if args.all_passes else "latest"
         opts.workers = args.workers
@@ -146,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.now(timezone.utc)
             opts = ScanOptions(start=(now - timedelta(days=args.days)).date().isoformat(),
                                end=now.date().isoformat(), max_cloud=args.max_cloud,
-                               rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles,
+                               rgb_chips=not args.no_rgb, keep_tiles=args.keep_tiles,
                                workers=args.workers, area=args.area)
             try:
                 scan(settings, opts)

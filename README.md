@@ -34,7 +34,7 @@ Each area shows when it was last scanned, the image dates, how much of it Sentin
 
 **To start fresh**, press **Reset ships & start fresh** under the area list (or run `py run.py --reset`). It deletes every tracked ship, their images and the scan history, so the next scan of an area analyses all of its tiles again. You'll be asked to confirm first, and hand-adjusted measurements are deleted too.
 
-Three tiles are processed in parallel, and each tile is deleted once it is processed (the ship chips are kept). `py run.py --scan gulf-of-oman` also starts scanning that area straight away, and `py run.py --areas` lists the ids. Other options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes` and `--keep-tiles`; they also apply to scans started from the map.
+Several tiles are analysed at once, one per spare CPU core (2–4), each in its own process. Images are **streamed** rather than downloaded: only the sea inside the area is read, plus small patches around each ship for the colour checks and image chips (see *What gets downloaded*). `py run.py --scan gulf-of-oman` also starts scanning that area straight away, and `py run.py --areas` lists the ids. Other options are `--days 45`, `--max-cloud 50`, `--workers 4`, `--all-passes` and `--keep-tiles` (download and keep the whole image files); they also apply to scans started from the map.
 
 ## Manual setup
 
@@ -66,7 +66,7 @@ You don't need any accounts or API keys. Imagery comes from the public [Element 
 | `areas` | List the area ids |
 | `reset [--yes]` | Delete all tracked ships, images and scan history (asks first unless `--yes`) |
 | `search AREA [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
-| `scan AREA [same] [--limit N] [--all-passes] [--workers 3] [--no-rgb] [--delete-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the area once. |
+| `scan AREA [same] [--limit N] [--all-passes] [--workers N] [--no-rgb] [--keep-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the area once. |
 | `watch AREA [--every-hours 6] [--days 3]` | Keep scanning an area for new passes |
 | `serve [--host --port]` | Web map and JSON API |
 | `detect B08.tif SCL.tif [--rgb TCI.tif --chips DIR]` | Run detection on GeoTIFFs you already have |
@@ -75,13 +75,13 @@ Global options are `--data DIR` (default `./data`), `--areas-file file.geojson` 
 
 ### What gets downloaded
 
-For each tile (an MGRS square about 110 × 110 km), files go to `data/tiles/<scene-id>/`:
+Sentinel-2 images are cloud-optimised GeoTIFFs, so a scan reads just the parts it needs with HTTP range requests instead of downloading whole files. For each tile (an MGRS square about 110 × 110 km):
 
-1. **`SCL.tif`** (20 m scene classification, a few MB). This is checked first. A tile with no cloud-free sea inside the area is marked *skipped* and nothing else is downloaded.
-2. **`B08.tif`** (10 m near-infrared, roughly 100–200 MB). Detection runs on this band.
-3. **`TCI.tif`** (10 m true colour). This is downloaded only when ships were found, and only for the image chips. Pass `--no-rgb` to skip it; chips then use the NIR band.
+1. **`SCL`** (20 m scene classification, a few MB) is downloaded first. A tile with no cloud-free sea inside your areas is marked *skipped* and nothing else is read.
+2. **`B08`** (10 m near-infrared, 100–200 MB as a file) is where detection runs. It is read in 2 km blocks, and only blocks with clear sea inside your areas are fetched: land, cloud, nodata and anything outside the areas are never downloaded.
+3. **`TCI`** (10 m true colour, about 100 MB as a file) is read only in small patches around the ships found, for the colour checks and the image chips. Pass `--no-rgb` to skip it; chips then use the NIR band.
 
-Downloads resume after an interruption (`.part` files with HTTP Range) and are retried with backoff. A scene that has already been processed is never processed again, so you can re-run `scan` safely. `--delete-tiles` removes each tile once it is processed, so disk use stays small.
+Nothing large is written to disk. If streaming fails (an unusual proxy or firewall, for example), that tile falls back to downloading whole files, which resume after an interruption and are retried with backoff. `--keep-tiles` always downloads the whole files into `data/tiles/<scene-id>/` and keeps them. A scene that has already been processed is never processed again, so you can re-run `scan` safely.
 
 ## How detection and measurement work (`shiptracker/detect.py`, `shiptracker/verify.py`)
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+import rasterio.errors
 from rasterio.windows import Window
 
 from .scene import GeoDetection, apply_affine
@@ -83,8 +84,13 @@ def verify_detections(dets: list[GeoDetection], nir_path: Path, tci_path: Path |
         return dets
     inland = _inland(dets, p.inland_km)
     keep: list[GeoDetection] = []
-    nir_src = rasterio.open(nir_path)
-    tci_src = rasterio.open(tci_path) if tci_path else None
+    nir_src = rasterio.open(nir_path)  # header only, for its pixel grid
+    tci_src = None
+    if tci_path:
+        try:
+            tci_src = rasterio.open(tci_path)
+        except rasterio.errors.RasterioIOError as exc:
+            log.warning("True-colour image unreadable (%s); colour checks skipped", exc)
     try:
         for g, is_inland in zip(dets, inland):
             if is_inland:
@@ -92,7 +98,9 @@ def verify_detections(dets: list[GeoDetection], nir_path: Path, tci_path: Path |
                 continue
             if tci_src is not None:
                 rows, cols = hull_pixels(g)
-                (nir_dn,) = _sample(nir_src, g, rows, cols, nir_src.transform, (1,))
+                nir_dn = g.det.hull_nir_dn  # recorded by the detector: no second NIR read
+                if nir_dn is None:
+                    (nir_dn,) = _sample(nir_src, g, rows, cols, nir_src.transform, (1,))
                 rgb = _sample(tci_src, g, rows, cols, nir_src.transform, (1, 2, 3))
                 if np.isfinite(nir_dn) and np.isfinite(rgb).all():
                     nir = nir_dn * nir_scale + nir_offset

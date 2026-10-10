@@ -229,7 +229,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
                 rgb_chips=bool(body.get("rgb_chips", True)),
                 keep_tiles=bool(body.get("keep_tiles")),
                 mode="all" if body.get("all_passes") else "latest",
-                workers=int(body.get("workers", 3)),
+                workers=int(body.get("workers") or 0),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400

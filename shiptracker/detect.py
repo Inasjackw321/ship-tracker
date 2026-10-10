@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import math
-import warnings
 from collections import Counter
 from dataclasses import asdict, dataclass
 
@@ -120,6 +119,7 @@ class Detection:
     width_err_m: float = 0.0
     method: str = "profile"    # "fit" (hull model) or "profile" (fallback)
     wake_m: float = 0.0        # visible wake behind the stern (ship under way); 0 = none found
+    hull_nir_dn: float | None = None  # mean NIR DN over the hull (for the colour checks)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -170,16 +170,35 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
 
 
 def _local_stats(img: np.ndarray, mask: np.ndarray, win: int):
+    """Mean, std and fill fraction of ``img`` over ``mask`` in a win x win moving window."""
     m = mask.astype(np.float32)
     x = img * m
     n = ndimage.uniform_filter(m, win)
     s1 = ndimage.uniform_filter(x, win)
-    s2 = ndimage.uniform_filter(x * img, win)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = s1 / n
-        var = s2 / n - mean * mean
-    std = np.sqrt(np.clip(var, 0, None))
-    return np.nan_to_num(mean), np.nan_to_num(std), n
+    x *= img
+    s2 = ndimage.uniform_filter(x, win)
+    ok = n > 0
+    mean = np.divide(s1, n, out=np.zeros_like(s1), where=ok)
+    var = np.divide(s2, n, out=np.zeros_like(s2), where=ok)
+    var -= mean * mean
+    np.clip(var, 0, None, out=var)
+    return mean, np.sqrt(var, out=var), n
+
+
+def _update_stats(stats, img: np.ndarray, mask: np.ndarray, removed: np.ndarray, win: int) -> None:
+    """Recompute ``stats`` (from ``_local_stats``) in place after the pixels ``removed``
+    left ``mask``. Only windows that contain a removed pixel change, so only those are
+    recomputed, each from a crop with a full window of margin (exact, much faster)."""
+    h = win // 2
+    H, W = img.shape
+    zone = ndimage.maximum_filter(removed, size=win)
+    labels, _ = ndimage.label(zone)
+    for sl in ndimage.find_objects(labels):
+        r0, r1, c0, c1 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+        er0, er1, ec0, ec1 = max(r0 - h, 0), min(r1 + h, H), max(c0 - h, 0), min(c1 + h, W)
+        local = _local_stats(img[er0:er1, ec0:ec1], mask[er0:er1, ec0:ec1], win)
+        for full, part in zip(stats, local):
+            full[r0:r1, c0:c1] = part[r0 - er0:r1 - er0, c0 - ec0:c1 - ec0]
 
 
 def _coarse_background(refl: np.ndarray, mask: np.ndarray, block: int = 32) -> np.ndarray:
@@ -192,18 +211,32 @@ def _coarse_background(refl: np.ndarray, mask: np.ndarray, block: int = 32) -> n
     hb, wb = -(-H // block), -(-W // block)
     pad = np.full((hb * block, wb * block), np.nan, np.float32)
     pad[:H, :W] = np.where(mask, refl, np.nan)
-    blocks = pad.reshape(hb, block, wb, block).transpose(0, 2, 1, 3).reshape(hb, wb, -1)
-    with warnings.catch_warnings():  # all-NaN blocks (land, cloud) are expected
-        warnings.simplefilter("ignore", RuntimeWarning)
-        med = np.nanmedian(blocks, axis=2)
+    blocks = pad.reshape(hb, block, wb, block).transpose(0, 2, 1, 3).reshape(hb * wb, -1)
+    nvalid = np.isfinite(blocks).sum(axis=1)
+    med = np.full(hb * wb, np.nan, np.float32)
+    full = nvalid == blocks.shape[1]
+    if full.any():  # open sea: plain median, much faster than nanmedian
+        med[full] = np.median(blocks[full], axis=1)
+    part = (nvalid > 0) & ~full
+    if part.any():  # coast and cloud edges
+        med[part] = np.nanmedian(blocks[part], axis=1)
+    med = med.reshape(hb, wb)
     fill = np.nanmedian(med) if np.isfinite(med).any() else 0.0
     med = np.where(np.isfinite(med), med, fill)
     med = ndimage.median_filter(med, size=3, mode="nearest")
     return np.repeat(np.repeat(med, block, 0), block, 1)[:H, :W]
 
 
-def _candidates(refl, search, bgmask, p: DetectParams):
-    mean, std, n = _local_stats(refl, bgmask, p.bg_window)
+def _label_max(values: np.ndarray, labels: np.ndarray, n: int) -> np.ndarray:
+    """Maximum of ``values`` per label 1..n (same as ndimage.maximum, far faster here)."""
+    on = labels > 0
+    peaks = np.full(n, -np.inf, values.dtype)
+    np.maximum.at(peaks, labels[on] - 1, values[on])
+    return peaks
+
+
+def _candidates(refl, search, stats, p: DetectParams):
+    mean, std, n = stats
     excess = refl - mean
     snr = excess / np.maximum(std, p.std_floor)
     cand = search & (n > 0.25) & (snr > p.k_sigma) & (excess > p.min_contrast)
@@ -465,14 +498,17 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         return []
 
     water_ok = search & (refl < _coarse_background(refl, search) + p.min_contrast)
-    cand, _, _ = _candidates(refl, search, water_ok, p)
-    bgmask = water_ok & ~ndimage.maximum_filter(cand, size=7) if cand.any() else water_ok
-    cand, excess, snr = _candidates(refl, search, bgmask, p)
+    stats = _local_stats(refl, water_ok, p.bg_window)
+    cand, _, _ = _candidates(refl, search, stats, p)
+    if cand.any():  # second pass: background statistics without the candidates themselves
+        removed = water_ok & ndimage.maximum_filter(cand, size=7)
+        _update_stats(stats, refl, water_ok & ~removed, removed, p.bg_window)
+    cand, excess, snr = _candidates(refl, search, stats, p)
     if not cand.any():
         return []
 
     labels, n = ndimage.label(cand, structure=np.ones((3, 3)))
-    peaks = ndimage.maximum(excess, labels, index=np.arange(1, n + 1))
+    peaks = _label_max(excess, labels, n)
     claimed = np.zeros(refl.shape, bool)
     out: list[Detection] = []
     # Window around each seed: the seed may be only the brightest part of the hull

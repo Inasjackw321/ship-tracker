@@ -1,7 +1,9 @@
-"""Download Sentinel-2 band files (COGs) to the local tile cache.
+"""Get at Sentinel-2 band files (cloud-optimised GeoTIFFs).
 
-Downloads are streamed to ``<file>.part`` and resumed with HTTP Range requests,
-so an interrupted scan picks up where it left off.
+Normally the big 10 m bands are *streamed*: GDAL reads just the parts of the file a
+scan needs (sea inside the area, small patches around ships) with HTTP range requests.
+The whole file is downloaded only with ``--keep-tiles`` or if streaming fails; such
+downloads go to ``<file>.part`` and resume after an interruption.
 """
 from __future__ import annotations
 
@@ -10,6 +12,9 @@ import shutil
 import time
 from pathlib import Path
 
+import os
+
+import rasterio
 import requests
 
 from .stac import sign_href
@@ -66,6 +71,43 @@ def download_file(href: str, dest: Path, source_cfg: dict, retries: int = 5) -> 
     shutil.move(part, dest)
     log.info("  downloaded %s (%.1f MB)", dest.name, dest.stat().st_size / 1e6)
     return dest
+
+
+def remote_href(href: str, source_cfg: dict) -> str:
+    """URL GDAL can read the file from directly (signed where the source needs it)."""
+    return sign_href(_https(href), source_cfg)
+
+
+def gdal_options() -> dict:
+    """GDAL settings for reading COGs over HTTP quickly and robustly."""
+    opts = {
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",   # don't list the bucket "directory"
+        "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.TIF,.tiff",
+        "GDAL_HTTP_MULTIRANGE": "YES",                 # fetch a window's blocks in parallel
+        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+        "GDAL_HTTP_MULTIPLEX": "YES",
+        "GDAL_HTTP_VERSION": "2",
+        "GDAL_HTTP_MAX_RETRY": "6",
+        "GDAL_HTTP_RETRY_DELAY": "2",
+        "GDAL_HTTP_TIMEOUT": "120",
+        "GDAL_HTTP_USERAGENT": "ship-tracker/2.0",
+        "VSI_CACHE": "TRUE",
+        "VSI_CACHE_SIZE": str(64 << 20),
+        # Decoded blocks kept in memory, enough for a whole tile (~250 MB), so the overlap
+        # between neighbouring processing blocks is never fetched twice.
+        "GDAL_CACHEMAX": 1 << 30,
+    }
+    if not any(os.environ.get(k) for k in ("CURL_CA_BUNDLE", "SSL_CERT_FILE")):
+        try:  # same certificates requests uses; GDAL's own may be missing on Windows
+            import certifi
+            opts["CURL_CA_BUNDLE"] = certifi.where()
+        except ImportError:
+            pass
+    return opts
+
+
+def gdal_env() -> rasterio.Env:
+    return rasterio.Env(**gdal_options())
 
 
 def scene_dir(tiles_dir: Path, scene_id: str) -> Path:

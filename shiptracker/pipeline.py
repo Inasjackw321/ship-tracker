@@ -6,12 +6,15 @@ uses its most recent usable image, falling back to older passes when that is clo
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import os
 import shutil
 import threading
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Callable
 
@@ -26,7 +29,9 @@ from .chips import render_chips
 from .config import Settings
 from .db import Store
 from .detect import DETECTOR_VERSION, DetectParams
-from .download import download_file, remove_scene, scene_dir
+from rasterio.errors import RasterioIOError
+
+from .download import download_file, gdal_env, remote_href, remove_scene, scene_dir
 from .scene import clear_sea_fraction, detect_scene
 from .stac import Scene, search_scenes
 from .verify import verify_detections
@@ -43,10 +48,13 @@ class ScanOptions:
     # "latest": the most recent usable image of every tile, covering the area once.
     # "all": every pass in the date range (several looks at the same place).
     mode: str = "latest"
-    workers: int = 3             # tiles downloaded/processed in parallel
+    workers: int = 0             # tiles processed in parallel (0 = automatic, from the CPU count)
     min_sea_fraction: float = 0.01
-    rgb_chips: bool = True       # download the true-colour image for chips and colour checks
-    keep_tiles: bool = True
+    rgb_chips: bool = True       # read the true-colour image for chips and colour checks
+    # False: stream just the needed parts of each image (fast). True: download whole
+    # files into data/tiles and keep them.
+    keep_tiles: bool = False
+    processes: bool = True       # run detection in worker processes (uses every CPU core)
     reprocess: bool = False
     fallback_rounds: int = 3     # older passes tried when a tile's newest image is clouded out
     area: str | None = None      # id of the area to scan (config/areas.geojson); None = all areas
@@ -151,44 +159,95 @@ def imagery_coverage(scenes: list[Scene], aoi: BaseGeometry) -> dict:
     }
 
 
+def auto_workers() -> int:
+    """Tiles in parallel: one per spare CPU core, 2 to 4 (each needs a few hundred MB)."""
+    return min(4, max(2, (os.cpu_count() or 2) - 1))
+
+
+_pool_lock = threading.Lock()
+_pool: ProcessPoolExecutor | None = None
+
+
+def _detect_job(nir, scl_path, aoi, scale, offset, params):
+    """Runs in a worker process: detection over one tile, returning (ships, rejected)."""
+    rejected: Counter = Counter()
+    with gdal_env():
+        dets = detect_scene(nir, scl_path, aoi, scale, offset, params, rejected)
+    return dets, rejected
+
+
+def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions):
+    global _pool
+    args = (nir, str(scl_path), aoi, scene.nir_scale, scene.nir_offset, opts.params)
+    with _pool_lock:
+        pool = _pool
+    if pool is not None:
+        try:
+            return pool.submit(_detect_job, *args).result()
+        except BrokenProcessPool:
+            log.warning("Detection worker processes stopped; continuing in this process")
+            with _pool_lock:
+                _pool = None
+    return _detect_job(*args)
+
+
 def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions) -> tuple[str, int]:
-    """Download and analyse one scene. Returns (status, ships_added)."""
+    """Analyse one scene. Returns (status, ships_added).
+
+    The small scene-classification band is downloaded; the big NIR and true-colour
+    bands are streamed (only sea in the area and patches around ships are read)
+    unless ``opts.keep_tiles`` asks for whole files.
+    """
     src_cfg = settings.source_config()
     # Every area the tile touches, not just the one being scanned: a tile is analysed
     # once, so a scan of the neighbouring area must not find it half done.
     aoi = settings.search_area()
     sdir = scene_dir(settings.tiles_dir, scene.id)
 
-    scl_path = download_file(scene.scl_href, sdir / "SCL.tif", src_cfg)
-    sea = clear_sea_fraction(scl_path, aoi)
-    if sea < opts.min_sea_fraction:
-        store.save_scene(scene, "skipped", f"clear sea {sea:.1%}", sea_fraction=sea,
-                         detector_version=DETECTOR_VERSION)
-        if not opts.keep_tiles:
-            remove_scene(settings.tiles_dir, scene.id)
-        return "skipped", 0
+    with gdal_env():
+        scl_path = download_file(scene.scl_href, sdir / "SCL.tif", src_cfg)
+        sea = clear_sea_fraction(scl_path, aoi)
+        if sea < opts.min_sea_fraction:
+            store.save_scene(scene, "skipped", f"clear sea {sea:.1%}", sea_fraction=sea,
+                             detector_version=DETECTOR_VERSION)
+            if not opts.keep_tiles:
+                remove_scene(settings.tiles_dir, scene.id)
+            return "skipped", 0
 
-    nir_path = download_file(scene.nir_href, sdir / "B08.tif", src_cfg)
-    log.info("  detecting ships (clear sea %.0f%%)", sea * 100)
-    rejected: Counter = Counter()
-    dets = detect_scene(nir_path, scl_path, aoi, scene.nir_scale, scene.nir_offset, opts.params, rejected)
+        stream = not opts.keep_tiles
+        log.info("  detecting ships (clear sea %.0f%%)", sea * 100)
+        if stream:
+            nir = remote_href(scene.nir_href, src_cfg)
+            try:
+                dets, rejected = _detect(nir, scl_path, aoi, scene, opts)
+            except RasterioIOError as exc:
+                log.warning("  streaming %s failed (%s); downloading the whole file instead", scene.id, exc)
+                stream = False
+        if not stream:
+            nir = str(download_file(scene.nir_href, sdir / "B08.tif", src_cfg))
+            dets, rejected = _detect(nir, scl_path, aoi, scene, opts)
 
-    tci = None
-    if dets and opts.rgb_chips and scene.rgb_href:
-        try:
-            tci = download_file(scene.rgb_href, sdir / "TCI.tif", src_cfg)
-        except Exception as exc:
-            log.warning("  true-colour download failed (%s); colour checks skipped, chips use NIR", exc)
-    dets = verify_detections(dets, nir_path, tci, scene.nir_scale, scene.nir_offset, rejected)
-    if rejected:
-        log.info("  %s: %d ships kept; rejected %s", scene.id, len(dets),
-                 ", ".join(f"{n} {why}" for why, n in rejected.most_common()))
+        tci = None
+        if dets and opts.rgb_chips and scene.rgb_href:
+            try:
+                tci = (remote_href(scene.rgb_href, src_cfg) if stream
+                       else str(download_file(scene.rgb_href, sdir / "TCI.tif", src_cfg)))
+            except Exception as exc:
+                log.warning("  true-colour image unavailable (%s); colour checks skipped, chips use NIR", exc)
+        dets = verify_detections(dets, nir, tci, scene.nir_scale, scene.nir_offset, rejected)
+        if rejected:
+            log.info("  %s: %d ships kept; rejected %s", scene.id, len(dets),
+                     ", ".join(f"{n} {why}" for why, n in rejected.most_common()))
 
-    chips: list = [None] * len(dets)
-    if dets:
-        image = tci or nir_path
-        paths = render_chips(image, dets, settings.chips_dir / scene.id, scene.datetime[:10])
-        chips = [p.relative_to(settings.chips_dir).as_posix() if p else None for p in paths]
+        chips: list = [None] * len(dets)
+        if dets:
+            out_dir, label = settings.chips_dir / scene.id, scene.datetime[:10]
+            try:
+                paths = render_chips(tci or nir, dets, out_dir, label)
+            except RasterioIOError as exc:
+                log.warning("  true-colour image unreadable (%s); chips use NIR", exc)
+                paths = render_chips(nir, dets, out_dir, label)
+            chips = [p.relative_to(settings.chips_dir).as_posix() if p else None for p in paths]
 
     store.delete_scene_detections(scene.id)  # replaces results of an earlier run
     added = store.add_detections(scene, dets, chips)
@@ -218,6 +277,7 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
     store = store or Store(settings.db_path)
     report = ScanReport()
     lock = threading.Lock()
+    opts = replace(opts, workers=opts.workers or auto_workers())
 
     def note(msg: str) -> None:
         log.info(msg)
@@ -227,6 +287,10 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         if on_progress:
             on_progress(report)
 
+    global _pool
+    if opts.processes:
+        with _pool_lock:
+            _pool = ProcessPoolExecutor(opts.workers, mp_context=multiprocessing.get_context("spawn"))
     try:
         area = settings.area(opts.area) if opts.area else None
         aoi = area.geom if area else settings.search_area()
@@ -250,6 +314,8 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         note(f"Found {len(found)} images of {n_tiles} tiles; {len(scenes)} selected "
              f"({'most recent per tile' if opts.mode == 'latest' else 'every pass'}"
              f"{f', limited to {opts.limit}' if opts.limit else ''})")
+        note(f"Analysing {opts.workers} tiles at a time"
+             + ("" if opts.keep_tiles else "; reading only the sea in each image, no full downloads"))
         note(f"Sentinel-2 imaged {cov['fraction']:.0%} of {name} in this window "
              f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2)")
 
@@ -286,6 +352,10 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
                                                  "start": opts.start, "end": opts.end, "error": str(exc)[:200]})
         raise
     finally:
+        with _pool_lock:
+            pool, _pool = _pool, None
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
         if own_store:
             store.close()
     return report

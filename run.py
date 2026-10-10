@@ -72,9 +72,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="max tiles to download this run (default 0 = whole area)")
     ap.add_argument("--all-passes", action="store_true",
                     help="scan every pass in the window instead of the newest image of each tile")
-    ap.add_argument("--workers", type=int, default=3, help="tiles processed in parallel (default 3)")
+    ap.add_argument("--workers", type=int, default=0, help="tiles processed in parallel (default: automatic)")
     ap.add_argument("--keep-tiles", action="store_true",
-                    help="keep downloaded tiles (default: delete each after processing; chips are kept)")
+                    help="download whole image files and keep them (default: stream only what is needed)")
     ap.add_argument("--max-cloud", type=float, default=30.0, help="max cloud cover %% (default 30)")
     ap.add_argument("--no-scan", action="store_true", help=argparse.SUPPRESS)  # the default now
     ap.add_argument("--port", type=int, default=8000)

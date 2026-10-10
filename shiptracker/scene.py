@@ -1,9 +1,10 @@
-"""Run ship detection over a downloaded Sentinel-2 tile, block by block."""
+"""Run ship detection over a Sentinel-2 tile (local file or streamed COG), block by block."""
 from __future__ import annotations
 
 import logging
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import rasterio
@@ -91,6 +92,14 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                 wb = box(*window_bounds(win, src.transform))
                 if not wb.intersects(aoi_proj):
                     continue
+                # Decide from the small SCL band whether this block has any sea in the area
+                # before reading the big NIR band (which may be streamed over the network).
+                shape_ = (int(win.height), int(win.width))
+                scl = _read_scl(scl_src, win, src.transform, shape_)
+                wt = window_transform(win, src.transform)
+                aoi_mask = geometry_mask([mapping(aoi_proj)], out_shape=shape_, transform=wt, invert=True)
+                if not ((scl == SCL_WATER) & aoi_mask).any():
+                    continue
                 dn = src.read(1, window=win)
                 valid = dn != nodata
                 # Treat the outer rim of the tile like nodata: edge artifacts live there,
@@ -104,14 +113,9 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                     valid[H - e - rr1:] = False
                 if cc1 > W - e:
                     valid[:, W - e - cc1:] = False
-                if not valid.any():
-                    continue
-                scl = _read_scl(scl_src, win, src.transform, dn.shape)
                 if not ((scl == SCL_WATER) & valid).any():
                     continue
                 refl = dn.astype(np.float32) * nir_scale + nir_offset
-                wt = window_transform(win, src.transform)
-                aoi_mask = geometry_mask([mapping(aoi_proj)], out_shape=dn.shape, transform=wt, invert=True)
                 dets = detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected)
                 for d in dets:
                     fr, fc = d.row + rr0, d.col + cc0
@@ -119,10 +123,26 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                     if not (r0 <= fr < r0 + B and c0 <= fc < c0 + B):
                         continue
                     d.row, d.col = fr, fc
+                    d.hull_nir_dn = _hull_mean(dn, d, rr0, cc0)
                     results.append(_georef(d, src.transform, to_wgs))
                 if done % 10 == 0:
                     log.info("  block %d/%d, %d ships so far", done, n_blocks, len(results))
     return results
+
+
+def _hull_mean(dn: np.ndarray, d: Detection, r_off: int, c_off: int) -> float | None:
+    """Mean DN over the hull samples the colour checks use (see verify.hull_pixels), taken
+    from the block already in memory so the NIR band is not fetched a second time."""
+    from .verify import hull_pixels
+
+    rows, cols = hull_pixels(SimpleNamespace(det=d))
+    ri = np.floor(rows + 0.5).astype(int) - r_off  # sample point -> pixel holding it
+    ci = np.floor(cols + 0.5).astype(int) - c_off
+    inside = (ri >= 0) & (ri < dn.shape[0]) & (ci >= 0) & (ci < dn.shape[1])
+    vals = np.zeros(ri.shape, np.float32)
+    vals[inside] = dn[ri[inside], ci[inside]]
+    ok = vals > 0
+    return float(vals[ok].mean()) if ok.any() else None
 
 
 def _georef(d: Detection, transform, to_wgs: Transformer) -> GeoDetection:
