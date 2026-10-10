@@ -43,7 +43,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 5
+DETECTOR_VERSION = 6
 
 
 @dataclass
@@ -89,6 +89,11 @@ class DetectParams:
     model_fit: bool = True
     wake_model: bool = True        # separate a moving ship's wake from its hull
     wake_min_gain: float = 0.40    # the wake model must fit >= 40 % better to be used
+    # Bright, large hulls: fit the image blur too instead of assuming it, so a softer
+    # (or sharper) image than the nominal PSF does not widen (or shrink) the hull.
+    fit_blur: bool = True
+    blur_fit_min_snr: float = 15.0  # deck brightness / background noise
+    blur_fit_min_len_px: float = 15.0  # ~150 m: shorter hulls are too few pixels across
     wake_soft_end_px: float = 1.5  # ...and is only tried when one end fades out this gradually
     max_plausible_aspect: float = 9.5  # length/beam above this (150 m+) flags the length as doubtful
     wake_min_length: float = 0.2   # wake fades over >= 0.2 x hull length (shorter = superstructure)
@@ -309,12 +314,22 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
     corr = 2 * z * sigma_eff
 
     along = grid.sum(axis=1)
-    ends = _crossings(along, s, p.profile_frac * _plateau(along))
+    level = p.profile_frac * _plateau(along)
+    ends = _crossings(along, s, level)
     if ends is None:
         return None
+    # A superstructure much brighter than the deck sets the "typical" level so high that
+    # the deck drops below it and only the superstructure is measured. If the measured
+    # span is far shorter than the detected hull, take the level from the whole hull.
+    proj = (rr - cr) * u[0] + (cc - cc0) * u[1]
+    extent = float(proj.max() - proj.min() + 1)
+    if ends[1] - ends[0] < 0.6 * extent:
+        on_hull = (s >= proj.min()) & (s <= proj.max())
+        level = p.profile_frac * float(np.median(along[on_hull]))
+        ends = _crossings(along, s, level) or ends
     s_lo, s_hi = ends
     length = max(s_hi - s_lo - corr, 1.0)
-    core = _crossings(along, s, 0.7 * _plateau(along))
+    core = _crossings(along, s, 0.7 / p.profile_frac * level)
     if core:
         # Judge the sharper end: a moving ship's wake softens one end, but its bow stays
         # sharp; a cloud is soft all round.
@@ -406,11 +421,11 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
             return None
 
     x0 = np.array([init["row"], init["col"], th0, L0 * 1.03, max(W0 * 0.7, 0.6), A0])
-    best = None
+    best, best_sign = None, 1
     for sign in (1, -1):  # bow at either end
         res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, x0, lb6, ub6)
         if res is not None and res.success and (best is None or res.cost < best.cost):
-            best = res
+            best, best_sign = res, sign
     if best is None:
         return None
 
@@ -447,6 +462,14 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
                 best = res
             else:
                 wake = None
+
+    if (wake is None and p.fit_blur and L0 >= p.blur_fit_min_len_px
+            and A0 >= p.blur_fit_min_snr * max(noise, 1e-6)):
+        lb7, ub7 = np.append(lb6, 0.35), np.append(ub6, 1.3)
+        res = solve(lambda q: _hull_model(q[:6], rr, cc, p.bow_taper, best_sign, q[6]) - y,
+                    np.append(best.x, sigma), lb7, ub7)
+        if res is not None and res.success and lb7[6] + 0.01 < res.x[6] < ub7[6] - 0.01:
+            best = res
 
     r0, c0, th, L, W, A = best.x[:6]
     ub = ubw if wake is not None else ub6

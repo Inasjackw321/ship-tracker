@@ -61,6 +61,15 @@ def draw_ruler(img: Image.Image, cx_px: float, cy_px: float, ax: float, ay: floa
     x0, y0 = cx - ax * hl + px * off, cy - ay * hl + py * off
     x1, y1 = cx + ax * hl + px * off, cy + ay * hl + py * off
     shadow, white = (0, 0, 0), (255, 255, 255)
+    # The measured hull itself (length x beam) drawn on the ship, so you can see exactly
+    # where the bow, stern and sides were put, joined to the ruler by extension lines.
+    hw = width_px / 2 * scale
+    corners = [(cx + sa * ax * hl + sb * px * hw, cy + sa * ay * hl + sb * py * hw)
+               for sa, sb in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    draw.polygon(corners, outline=color, width=1)
+    for sa, (ex, ey) in ((-1, (x0, y0)), (1, (x1, y1))):
+        hx, hy = cx + sa * ax * hl + px * hw, cy + sa * ay * hl + py * hw
+        draw.line([(hx, hy), (ex + px * 4, ey + py * 4)], fill=color, width=1)
     draw.line([(x0, y0), (x1, y1)], fill=shadow, width=5)
     draw.line([(x0, y0), (x1, y1)], fill=color, width=2)
     for i in range(1, 10):  # ruler ticks
