@@ -43,7 +43,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 6
+DETECTOR_VERSION = 7
 
 
 @dataclass
@@ -102,6 +102,9 @@ class DetectParams:
     length_err_floor_m: float = 4.0
     length_err_rel: float = 0.015
     width_err_floor_m: float = 3.0
+    # Dark hull sides next to a bright deck, and how sharp the image is, change the beam
+    # seen in the near-infrared by a share of the beam itself.
+    width_err_rel: float = 0.15
 
 
 @dataclass
@@ -232,6 +235,29 @@ def _coarse_background(refl: np.ndarray, mask: np.ndarray, block: int = 32) -> n
     return np.repeat(np.repeat(med, block, 0), block, 1)[:H, :W]
 
 
+def _alongside(lab_win: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """Pixels of other detected objects lying beside this seed (a ship moored alongside or
+    passing close by), which its outline must not grow into. Objects in line with the
+    seed are left alone: wake foam trails straight behind the stern."""
+    out = np.zeros(seed.shape, bool)
+    others = np.unique(lab_win[(lab_win > 0) & ~seed])
+    rr, cc = np.nonzero(seed)
+    if not others.size or rr.size < 4:
+        return out
+    r0, c0 = rr.mean(), cc.mean()
+    cov = np.cov(np.vstack([rr - r0, cc - c0]))
+    evals, evecs = np.linalg.eigh(cov)
+    u = evecs[:, 1]
+    half_w = math.sqrt(12 * max(evals[0], 0.1)) / 2
+    for o in others:
+        orr, occ = np.nonzero(lab_win == o)
+        d = np.array([orr.mean() - r0, occ.mean() - c0])
+        along, perp = abs(d @ u), abs(d[0] * -u[1] + d[1] * u[0])
+        if perp > half_w + 1.5 and perp > 0.5 * along:
+            out |= lab_win == o
+    return out
+
+
 def _label_max(values: np.ndarray, labels: np.ndarray, n: int) -> np.ndarray:
     """Maximum of ``values`` per label 1..n (same as ndimage.maximum, far faster here)."""
     on = labels > 0
@@ -329,15 +355,26 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
         ends = _crossings(along, s, level) or ends
     s_lo, s_hi = ends
     length = max(s_hi - s_lo - corr, 1.0)
-    core = _crossings(along, s, 0.7 / p.profile_frac * level)
-    if core:
-        # Judge the sharper end: a moving ship's wake softens one end, but its bow stays
-        # sharp; a cloud is soft all round.
-        span = max(core[1] - core[0], 0.5)
-        edges = (max(core[0] - s_lo, 0.0), max(s_hi - core[1], 0.0))
-        softness = (span + 2 * min(edges)) / span
-    else:
-        softness, edges = 9.0, (0.0, 0.0)
+    def end_edges(level70: float):
+        core = _crossings(along, s, level70)
+        if not core:
+            return None, (0.0, 0.0)
+        return max(core[1] - core[0], 0.5), (max(core[0] - s_lo, 0.0), max(s_hi - core[1], 0.0))
+
+    # How gradually each end fades (30 -> 70 % of the brightest part): a wake makes one
+    # end fade out slowly. Used to decide whether to try the hull-plus-wake model.
+    span, edges = end_edges(0.7 / p.profile_frac * level)
+    # Cloud test: how sharp is the sharper end? A moving ship's wake softens one end, but
+    # its bow stays sharp; a cloud is soft all round. When a superstructure is far
+    # brighter than the deck, judge against the deck's level over the whole hull, or the
+    # deck itself looks like the soft fade of a cloud. (Clouds are evenly bright, so for
+    # them the stricter test against the bright part applies.)
+    on_span = (s >= s_lo) & (s <= s_hi)
+    typical = float(np.median(along[on_span])) if on_span.any() else 0.0
+    soft_edges = edges
+    if typical > 0 and float(along.max()) >= 1.8 * typical:
+        span, soft_edges = end_edges(0.7 * typical)
+    softness = (span + 2 * min(soft_edges)) / span if span else 9.0
 
     inside = (S >= s_lo) & (S <= s_hi)
     across = np.where(inside, grid, 0).sum(axis=0)
@@ -553,6 +590,7 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         ex = excess[r0:r1, c0:c1]
         peak = float(peaks[idx])
         grow = (ex > max(p.grow_frac * peak, p.min_contrast / 2)) & sea[r0:r1, c0:c1]
+        grow &= ~_alongside(labels[r0:r1, c0:c1], seed)
         glab, _ = ndimage.label(grow | seed, structure=np.ones((3, 3)))
         hull = np.isin(glab, np.unique(glab[seed]))
         hull &= ~claimed[r0:r1, c0:c1]
@@ -569,13 +607,17 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         length_m, width_m = m["length_px"] * pixel_m, m["width_px"] * pixel_m
         if method == "fit":
             length_err = math.hypot(m["sigma_length_px"] * pixel_m, p.length_err_floor_m, p.length_err_rel * length_m)
-            width_err = math.hypot(m["sigma_width_px"] * pixel_m, p.width_err_floor_m)
+            width_err_stat = math.hypot(m["sigma_width_px"] * pixel_m, p.width_err_floor_m)
+            # Dark hull sides only ever make the beam look narrower: this part of the
+            # uncertainty is reported but not used to let over-wide objects through.
+            width_err = math.hypot(width_err_stat, p.width_err_rel * width_m)
         else:  # the profile method's own bias (bows short, beams wide) is folded in
             length_err = math.hypot(1.5 * p.length_err_floor_m, 0.05 * length_m)
             width_err = math.hypot(2 * p.width_err_floor_m, 0.3 * width_m)
+            width_err_stat = width_err
         # Size limits respect the uncertainty: drop only what is confidently outside them.
         if (length_m + length_err < p.min_length_m or length_m - length_err > p.max_length_m
-                or width_m - width_err > p.max_width_m):
+                or width_m - width_err_stat > p.max_width_m):
             rejected["size"] += 1
             continue
         aspect = length_m / max(width_m, 1e-6)

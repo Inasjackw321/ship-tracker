@@ -49,6 +49,30 @@ def file_stem(rec: dict) -> str:
     return f"ship_{abs(lat):.5f}{ns}_{abs(lon):.5f}{ew}_{rec['datetime'][:10]}_{rec['length_m']:.0f}m"
 
 
+def quality(rec: dict) -> tuple[str, str]:
+    """How far to trust a measurement: ("good" | "fair" | "rough", why)."""
+    if rec.get("method") == "manual":
+        return "good", "adjusted by hand"
+    L, W = rec["length_m"], max(rec["width_m"], 1e-6)
+    rel = (rec.get("length_err_m") or 0.05 * L) / max(L, 1e-6)
+    why = []
+    if rec.get("method") != "fit":
+        why.append("rough profile estimate (the hull model did not fit)")
+    if L < 60:
+        why.append(f"only about {max(L / 10, 1):.0f} pixels long")
+    if L >= 150 and L / W > 9.5:
+        why.append("unusually slender: may include wake or a streak")
+    if rec.get("wake_m"):
+        why.append("moving: wake separated from the hull")
+    if rel <= 0.06 and rec.get("method") == "fit" and not (L >= 150 and L / W > 9.5):
+        grade = "good"
+    elif rel <= 0.15:
+        grade = "fair"
+    else:
+        grade = "rough"
+    return grade, "; ".join(why) or "clear hull, model fits well"
+
+
 def size_text(rec: dict) -> str:
     le, we = rec.get("length_err_m"), rec.get("width_err_m")
     return (f"{rec['length_m']:.0f}{f' ± {le:.0f}' if le else ''} m x "
@@ -59,8 +83,10 @@ def _lines(rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int
     when = rec["datetime"].replace("T", " ")[:16] + " UTC"
     axis = rec.get("heading_deg") or 0.0
     how = {"fit": "hull-model fit", "profile": "profile estimate", "manual": "adjusted by hand"}.get(rec.get("method"), "")
+    grade, why = quality(rec)
     header = [
         (f"Ship  {size_text(rec)}   hull axis {axis:.0f}° / {(axis + 180) % 360:.0f}°", 20, FG),
+        (f"Measurement reliability: {grade} ({why})", 13, MUTED),
         (f"{when}   Sentinel-2 (10 m)   {how}   {rec['scene_id']}", 13, MUTED),
     ]
     if rec.get("wake_m"):
@@ -79,10 +105,14 @@ def _lines(rec: dict) -> tuple[list[tuple[str, int, tuple]], list[tuple[str, int
     return header, footer
 
 
-def chip_image(rec: dict, chips_dir: Path) -> Image.Image:
+def chip_image(rec: dict, chips_dir: Path, clean: bool = False) -> Image.Image:
     """The ship's chip with its current ruler: re-drawn from the GeoTIFF when the
-    measurement was adjusted by hand, otherwise the chip saved at detection time."""
+    measurement was adjusted by hand, otherwise the chip saved at detection time.
+    ``clean``: without the measurement drawn on it (needs the GeoTIFF)."""
     tif = geotiff_path(rec, chips_dir)
+    if clean and tif is not None:
+        from .chips import render_clean
+        return render_clean(tif)
     if rec.get("method") == "manual" and tif is not None:
         from .chips import render_from_geotiff
         return render_from_geotiff(tif, rec)
@@ -92,9 +122,9 @@ def chip_image(rec: dict, chips_dir: Path) -> Image.Image:
     return Image.new("RGB", (360, 360), (0, 0, 0))
 
 
-def annotated_png(rec: dict, chips_dir: Path) -> bytes:
+def annotated_png(rec: dict, chips_dir: Path, clean: bool = False) -> bytes:
     """The ship's image chip framed with its coordinates, as PNG bytes."""
-    chip = chip_image(rec, chips_dir)
+    chip = chip_image(rec, chips_dir, clean)
     chip = chip.resize((WIDTH, round(chip.height * WIDTH / chip.width)), Image.LANCZOS)
 
     header, footer = _lines(rec)
@@ -130,14 +160,14 @@ def geotiff_path(rec: dict, chips_dir: Path) -> Path | None:
     return p if p.exists() else None
 
 
-def bundle_zip(recs: list[dict], chips_dir: Path) -> bytes:
+def bundle_zip(recs: list[dict], chips_dir: Path, clean: bool = False) -> bytes:
     """Zip of annotated PNGs (+ GeoTIFFs where saved), coordinates.csv and ships.kml."""
     buf = io.BytesIO()
     rows = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for rec in recs:
             stem = file_stem(rec)
-            z.writestr(f"{stem}.png", annotated_png(rec, chips_dir))
+            z.writestr(f"{stem}.png", annotated_png(rec, chips_dir, clean))
             tif = geotiff_path(rec, chips_dir)
             if tif:
                 z.write(tif, f"{stem}.tif")

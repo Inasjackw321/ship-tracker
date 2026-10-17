@@ -13,7 +13,7 @@ from flask import Flask, Response, abort, jsonify, request, send_file, send_from
 from shapely import contains_xy
 from shapely.geometry import mapping, shape
 
-from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path
+from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path, quality
 from .config import Settings
 from .db import Store
 from .aoi import CUSTOM_GROUP, Area, new_area_id, save_areas
@@ -32,6 +32,7 @@ def _feature(d: dict) -> dict:
     if d.get("method") == "manual":  # re-drawn with the hand-placed ruler
         props["chip_url"] = f"/api/detections/{d['id']}/chip.png?v={int(d.get('updated_at') or 0)}"
     props["adjusted"] = d.get("method") == "manual"
+    props["quality"], props["quality_why"] = quality(d)
     props.pop("auto_json", None)
     if d.get("auto_json"):
         props["auto"] = json.loads(d["auto_json"])
@@ -98,7 +99,8 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
             abort(404)
         name = file_stem(rec) + ".png"
         disposition = "attachment" if request.args.get("dl") else "inline"
-        return Response(annotated_png(rec, settings.chips_dir), mimetype="image/png",
+        clean = bool(request.args.get("clean"))
+        return Response(annotated_png(rec, settings.chips_dir, clean), mimetype="image/png",
                         headers={"Content-Disposition": f'{disposition}; filename="{name}"'})
 
     @app.get("/api/detections/<int:det_id>/image.png")
@@ -111,7 +113,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
         if rec is None:
             abort(404)
         buf = io.BytesIO()
-        chip_image(rec, settings.chips_dir).save(buf, "PNG")
+        chip_image(rec, settings.chips_dir, clean=bool(request.args.get("clean"))).save(buf, "PNG")
         return Response(buf.getvalue(), mimetype="image/png")
 
     def _feature_response(rec):
@@ -157,7 +159,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
             abort(400, "ids must be integers")
         if not ships:
             abort(400, "nothing selected")
-        return Response(bundle_zip(ships, settings.chips_dir), mimetype="application/zip",
+        return Response(bundle_zip(ships, settings.chips_dir, bool(body.get("clean"))), mimetype="application/zip",
                         headers={"Content-Disposition": f'attachment; filename="ships_{len(ships)}.zip"'})
 
     @app.get("/api/coverage")

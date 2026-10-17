@@ -9,8 +9,12 @@ from scipy import ndimage
 SS = 10  # 1 m sub-pixels
 
 
-def render_ship(L, W, heading, dx, dy, size, rng, wake=None, wake_rng=None):
-    """Excess-reflectance image (10 m pixels) of one ship with deck structure."""
+def render_ship(L, W, heading, dx, dy, size, rng, wake=None, wake_rng=None, psf=0.53, dark_sides=0.0,
+                super_gain=1.0):
+    """Excess-reflectance image (10 m pixels) of one ship with deck structure.
+
+    ``dark_sides``: share of the beam on each side that is dark hull paint (only the deck
+    between is bright); ``super_gain`` scales the superstructure's brightness."""
     n = size * SS
     yy, xx = np.mgrid[0:n, 0:n] + 0.5
     cy, cx = n / 2 + dy * SS, n / 2 + dx * SS  # true centre, sub-pixel offset
@@ -27,6 +31,8 @@ def render_ship(L, W, heading, dx, dy, size, rng, wake=None, wake_rng=None):
     hull = (np.abs(s) <= hl) & (np.abs(t) <= taper)
     deck = rng.uniform(0.05, 0.16)
     img = hull * deck
+    if dark_sides:
+        img = np.where(np.abs(t) > taper * (1 - 2 * dark_sides), img * 0.15, img)
     # hatch covers: alternating brightness along the deck
     if rng.random() < 0.6:
         period = rng.uniform(12, 25)
@@ -37,7 +43,7 @@ def render_ship(L, W, heading, dx, dy, size, rng, wake=None, wake_rng=None):
         pos = -hl + rng.uniform(0.03, 0.12) * L if rng.random() < 0.85 else hl - 0.25 * L
         ln = rng.uniform(0.06, 0.12) * L
         sup = (s > pos) & (s < pos + ln) & (np.abs(t) <= hw * 0.9)
-        img = np.where(sup, rng.uniform(0.2, 0.45), img)
+        img = np.where(sup, rng.uniform(0.2, 0.45) * super_gain, img)
     if wake:
         # turbulent wake behind the stern: bright foam that fades and spreads with distance
         d = np.clip(-hl - s, 0, None)                 # metres behind the stern
@@ -48,7 +54,7 @@ def render_ship(L, W, heading, dx, dy, size, rng, wake=None, wake_rng=None):
         foam = (s < -hl) & (d < wl) & (np.abs(t) < spread)
         img = img + np.where(foam, deck * wake["brightness"] * fade * texture, 0)
     small = img.reshape(size, SS, size, SS).mean(axis=(1, 3))
-    return ndimage.gaussian_filter(small, 0.53)
+    return ndimage.gaussian_filter(small, psf)
 
 
 def make_benchmark(n=200, seed=42, wake_fraction=0.0, wake_seed=7):
@@ -73,6 +79,43 @@ def make_benchmark(n=200, seed=42, wake_fraction=0.0, wake_seed=7):
         refl = (water + excess + noise_rng.normal(0, noise, excess.shape)).astype(np.float32)
         truth_rc = (size / 2 - 0.5 + dy, size / 2 - 0.5 + dx)
         cases.append(dict(refl=refl, L=L, W=W, heading=heading, rc=truth_rc, wake=wake))
+    return cases
+
+
+def make_hard_benchmark(n=200, seed=11):
+    """Harder, more realistic conditions: image sharpness varies (Sentinel-2's blur is not
+    exactly the nominal value), dark hull sides with a bright deck, superstructures up to
+    3x brighter, sun-glint gradients, noisier water and another ship close by."""
+    rng = np.random.default_rng(seed)
+    cases = []
+    for _ in range(n):
+        L = float(np.exp(rng.uniform(np.log(25), np.log(400))))
+        W = float(np.clip(L / rng.uniform(4.5, 8.0), 6, 62))
+        heading = float(rng.uniform(0, 180))
+        dx, dy = rng.uniform(-0.5, 0.5, 2)
+        psf = float(rng.uniform(0.38, 0.68))
+        dark = float(rng.choice([0.0, 0.0, 0.1, 0.2]))
+        gain = float(rng.uniform(1.0, 3.0))
+        size = int(L / 10 * 1.5) + 60
+        size += size % 2
+        excess = render_ship(L, W, heading, dx, dy, size, rng, psf=psf, dark_sides=dark, super_gain=gain)
+        neighbour = rng.random() < 0.25
+        if neighbour:  # another ship 1.5-4 beams to the side (moored alongside / nearby)
+            L2 = L * rng.uniform(0.3, 1.0)
+            off = (W / 2 + L2 / 6 * 0.5 + rng.uniform(15, 60)) / 10
+            th = np.radians(heading)
+            ox, oy = np.cos(th) * off, np.sin(th) * off  # perpendicular to the hull
+            excess = excess + render_ship(L2, max(L2 / 6, 6), heading + rng.uniform(-20, 20), dx + ox, dy + oy,
+                                          size, rng, psf=psf)
+        water = 0.012 + rng.uniform(0, 0.02)
+        yy, xx = np.mgrid[0:size, 0:size]
+        glint = rng.uniform(0, 0.006) * (xx * np.cos(rng.uniform(0, 6.3)) + yy * np.sin(rng.uniform(0, 6.3))) / size
+        noise = rng.uniform(0.0015, 0.006)
+        noise_rng = np.random.default_rng(int(rng.integers(1 << 31)))
+        refl = (water + glint + excess + noise_rng.normal(0, noise, excess.shape)).astype(np.float32)
+        truth_rc = (size / 2 - 0.5 + dy, size / 2 - 0.5 + dx)
+        cases.append(dict(refl=refl, L=L, W=W, heading=heading, rc=truth_rc, wake=None, psf=psf,
+                          dark=dark, neighbour=neighbour))
     return cases
 
 

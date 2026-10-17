@@ -458,6 +458,37 @@ def test_downloads_carry_coordinates(world, tmp_path):
 
 
 
+def test_images_without_measurement_and_reliability(world):
+    import io
+    import zipfile
+
+    from PIL import Image
+
+    settings, _, _ = world
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    client = create_app(settings).test_client()
+    feats = client.get("/api/detections").get_json()["features"]
+    assert all(f["properties"]["quality"] in ("good", "fair", "rough") and f["properties"]["quality_why"] for f in feats)
+    big = max(feats, key=lambda f: f["properties"]["length_m"])["properties"]
+    assert big["quality"] == "good"  # a clear 400 m hull, fitted
+
+    def img(url):
+        r = client.get(url)
+        assert r.status_code == 200
+        return np.asarray(Image.open(io.BytesIO(r.data)).convert("RGB")).astype(int)
+
+    sid = big["id"]
+    ruled, clean = img(f"/api/detections/{sid}/chip.png"), img(f"/api/detections/{sid}/chip.png?clean=1")
+    assert ruled.shape == clean.shape
+    # the ruler, label and outline are drawn in pure white; the clean image has far less of it
+    white = lambda a: int(((a == 255).all(axis=2)).sum())
+    assert white(clean) < white(ruled) / 3
+    png = Image.open(io.BytesIO(client.get(f"/api/detections/{sid}/image.png?clean=1").data))
+    assert png.text["Coordinates"] and "reliability" in png.text["Description"]
+    z = zipfile.ZipFile(io.BytesIO(client.post("/api/download.zip", json={"ids": [sid], "clean": True}).data))
+    assert sum(n.endswith(".png") for n in z.namelist()) == 1
+
+
 def test_adjust_measurement_by_hand_and_reset(world):
     import io
 

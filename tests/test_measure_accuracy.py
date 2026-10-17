@@ -5,7 +5,7 @@ Guards against regressions; numbers are for synthetic ships, real imagery is noi
 import numpy as np
 import pytest
 
-from tests.bench_ships import make_benchmark, run
+from tests.bench_ships import make_benchmark, make_hard_benchmark, run
 
 
 @pytest.fixture(scope="module")
@@ -76,3 +76,28 @@ def test_no_fake_supertankers(moving):
     assert len(fake) <= 0.1 * max(len(reported), 1)
     real = [c for c, d in rows if c["L"] >= 320]
     assert all(d.length_m >= 280 for c, d in rows if c["L"] >= 320) and real  # real VLCCs/ULCVs are kept
+
+
+@pytest.fixture(scope="module")
+def hard():
+    """Varying image sharpness, dark hull sides, very bright superstructures, glint,
+    noisy water and ships moored alongside."""
+    cases = make_hard_benchmark(200)
+    return [(c, d) for c, d in zip(cases, run(cases)) if d is not None], len(cases)
+
+
+def test_hard_conditions_found_and_not_grossly_wrong(hard):
+    rows, n = hard
+    assert len(rows) >= 0.93 * n  # was 177/200: bright superstructures read as "soft cloud edges"
+    gross = [1 for c, d in rows if abs(d.length_m - c["L"]) > max(20, 0.15 * c["L"])]
+    assert len(gross) <= 0.02 * n  # was 6: ships alongside cut hulls short
+    big = [d.length_m - c["L"] for c, d in rows if c["L"] >= 150]
+    assert _rmse(big) < 8  # was 20 m
+
+
+def test_hard_conditions_error_bars_are_honest(hard):
+    """The +- shown is a 1-sigma uncertainty: at least ~68 % of true sizes lie inside it."""
+    rows, _ = hard
+    in_len = np.mean([abs(d.length_m - c["L"]) <= d.length_err_m for c, d in rows])
+    in_beam = np.mean([abs(d.width_m - c["W"]) <= d.width_err_m for c, d in rows])
+    assert in_len >= 0.75 and in_beam >= 0.7

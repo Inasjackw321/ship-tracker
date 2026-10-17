@@ -95,6 +95,21 @@ def draw_ruler(img: Image.Image, cx_px: float, cy_px: float, ax: float, ay: floa
     return img
 
 
+def render_clean(tif: Path) -> Image.Image:
+    """The ship's image without any measurement drawn on it (only a 100 m scale bar)."""
+    with rasterio.open(tif) as src:
+        rgb = src.read((1, 2, 3))
+        pixel_m = abs(src.res[0])
+    img = Image.fromarray(np.moveaxis(rgb, 0, -1), "RGB")
+    scale = OUT_PX / img.width
+    img = img.resize((OUT_PX, round(img.height * scale)), Image.LANCZOS)
+    draw = ImageDraw.Draw(img)
+    bar = 100 / pixel_m * scale
+    draw.line([(OUT_PX - 10 - bar, 12), (OUT_PX - 10, 12)], fill=(255, 255, 255), width=3)
+    draw.text((OUT_PX - 10 - bar / 2, 24), "100 m", fill=(255, 255, 255), font=_font(13), anchor="mm")
+    return img
+
+
 def render_from_geotiff(tif: Path, rec: dict) -> Image.Image:
     """Re-draw a ship's chip from its clean GeoTIFF with the ruler at the stored hull
     ends (used after a measurement was adjusted by hand)."""

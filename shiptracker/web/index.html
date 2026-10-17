@@ -66,6 +66,7 @@
   input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
     padding: 6px 8px; font: inherit; width: 100%; }
   input[type=checkbox] { width: auto; }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%; }
   button { background: var(--accent); color: #04130a; border: 0; border-radius: 6px; padding: 8px 12px;
     font: 600 13px system-ui, sans-serif; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
@@ -157,6 +158,9 @@
         <label>Min confidence <input type="number" id="f-conf" value="0" min="0" max="1" step="0.1"></label>
         <label class="inline"><input type="checkbox" id="f-stat" checked> show stationary</label>
         <label class="inline" title="Only results from each tile's most recent analysed image"><input type="checkbox" id="f-latest" checked> latest image per tile</label>
+        <label title="How far each measurement can be trusted (see the ship's popup for why)">Measurement quality
+          <select id="f-quality"><option value="any">any</option><option value="fair">fair or good</option><option value="good">good only</option></select></label>
+        <label class="inline" title="Draw the ruler and hull outline on the satellite images and the map"><input type="checkbox" id="f-rulers" checked> show measurements on images</label>
       </div>
       <div class="row"><button class="ghost" id="f-apply">Apply</button></div>
     </section>

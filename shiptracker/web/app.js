@@ -98,7 +98,7 @@ function coordsHtml(p, lat, lon) {
     <div class="dms"><span>${esc(coordDms(lat, lon))}</span>
       <button class="mini ghost" data-copy="${esc(coordDms(lat, lon))}">Copy</button></div>
     <div class="dl">
-      <a class="mini" href="${base}/image.png?dl=1" download title="Image with the coordinates printed on it">Download image</a>
+      <a class="mini" href="${base}/image.png?dl=1${imgQuery(p)}" data-dl="${p.id}" download title="Image with the coordinates printed on it">Download image</a>
       ${p.has_tif ? `<a class="mini" href="${base}/image.tif" download title="Georeferenced: opens in place in Google Earth / QGIS">GeoTIFF</a>` : ''}
       <a class="mini ghost" href="${base}/image.png" target="_blank" rel="noopener">Open large</a>
     </div>`;
@@ -106,10 +106,11 @@ function coordsHtml(p, lat, lon) {
 
 function popupHtml(p, lat, lon) {
   return `<div class="popup">
-    ${p.chip_url ? `<img src="${esc(p.chip_url)}" alt="ship chip">` : ''}
+    ${p.chip_url ? `<img src="${esc(chipSrc(p))}" data-chip="${p.id}" alt="ship chip">` : ''}
     <table>
       <tr><td>Length</td><td><b>${lenText(p)}</b></td></tr>
       <tr><td>Beam</td><td>${beamText(p)}</td></tr>
+      <tr><td>Reliability</td><td>${qualityHtml(p)}</td></tr>
       <tr><td>Measured</td><td>${esc(METHOD[p.method] || '')}${p.adjusted && p.auto
         ? ` <span style="color:#666">(automatic: ${lenText(p.auto)} × ${beamText(p.auto)})</span>` : ''}</td></tr>
       ${p.wake_m ? `<tr><td>Under way</td><td>wake ≈ ${Math.round(p.wake_m)} m behind the stern (not counted in the length)</td></tr>` : ''}
@@ -122,9 +123,41 @@ function popupHtml(p, lat, lon) {
     </table>${coordsHtml(p, lat, lon)}
     <div class="dl">
       <button class="mini" data-adjust="${p.id}" title="Drag the ruler ends onto the bow and stern">Adjust measurement</button>
+      ${p.chip_url && cleanOk(p) ? `<button class="mini ghost" data-toggle-ruler="${p.id}" title="Show the satellite image with or without the measurement drawn on it">${!showRulers || hidden.has(p.id) ? 'Show measurement' : 'Hide measurement'}</button>` : ''}
       ${p.adjusted ? `<button class="mini ghost" data-reset="${p.id}">Reset to automatic</button>` : ''}
     </div></div>`;
 }
+
+// ---- show / hide the measurement drawn on the satellite images ----
+let showRulers = true;
+try { showRulers = localStorage.getItem('showRulers') !== '0'; } catch (e) { /* private window */ }
+const hidden = new Set();  // images where the measurement was hidden one by one
+const cleanOk = (p) => p.has_tif !== false;  // ships found before GeoTIFFs were kept have no clean copy
+function chipSrc(p) {
+  const off = !showRulers || hidden.has(p.id);
+  return off && cleanOk(p) ? `/api/detections/${p.id}/chip.png?clean=1` : (p.chip_url || '');
+}
+const imgQuery = (p) => (!showRulers || hidden.has(p.id) ? '&clean=1' : '');
+function refreshChips() {
+  document.querySelectorAll('img[data-chip]').forEach((img) => {
+    const f = featuresById.get(Number(img.dataset.chip));
+    if (f) img.src = chipSrc(f.properties);
+  });
+  document.querySelectorAll('[data-toggle-ruler]').forEach((b) => {
+    const id = Number(b.dataset.toggleRuler);
+    b.textContent = !showRulers || hidden.has(id) ? 'Show measurement' : 'Hide measurement';
+  });
+  document.querySelectorAll('a[data-dl]').forEach((a) => {
+    const f = featuresById.get(Number(a.dataset.dl));
+    if (f) a.href = `${apiBase(f.properties)}/image.png?dl=1${imgQuery(f.properties)}`;
+  });
+  drawRulers();
+}
+const QUALITY = { good: ['Good', '#2ea043'], fair: ['Fair', '#d29922'], rough: ['Rough', '#f85149'] };
+const qualityHtml = (p) => {
+  const [label, color] = QUALITY[p.quality] || ['–', '#888'];
+  return `<span style="color:${color};font-weight:700">● ${label}</span> <span style="color:#666">${esc(p.quality_why || '')}</span>`;
+};
 
 const METHOD = { fit: 'hull-model fit', profile: 'profile estimate (less precise)', manual: 'adjusted by hand' };
 const pm = (e) => (e ? ` ± ${Math.round(e)}` : '');
@@ -167,7 +200,7 @@ let editingId = null;
 
 function drawRulers() {
   rulerLayer.clearLayers();
-  if (map.getZoom() < 13) return;
+  if (map.getZoom() < 13 || !showRulers) return;
   const bounds = map.getBounds().pad(0.2);
   for (const f of features) {
     const p = f.properties;
@@ -208,11 +241,12 @@ function render() {
   for (const f of sorted.slice(0, 500)) {
     const p = f.properties;
     const li = document.createElement('li');
-    li.innerHTML = `${p.chip_url ? `<img loading="lazy" src="${esc(p.chip_url)}" alt="">` : '<img alt="">'}
+    li.innerHTML = `${p.chip_url ? `<img loading="lazy" src="${esc(chipSrc(p))}" data-chip="${p.id}" alt="">` : '<img alt="">'}
       <div><div class="len">${lenText(p)} × ${beamText(p)}${p.adjusted ? '<span class="tag">adjusted</span>' : ''}
       ${p.stationary ? '<span class="tag">stationary</span>' : ''}</div>
       <div class="meta">${esc(fmtDate(p.datetime))}</div>
-      <div class="meta">${f.geometry.coordinates[1].toFixed(4)}, ${f.geometry.coordinates[0].toFixed(4)} · conf ${(p.confidence * 100).toFixed(0)}%</div></div>`;
+      <div class="meta">${f.geometry.coordinates[1].toFixed(4)}, ${f.geometry.coordinates[0].toFixed(4)} · conf ${(p.confidence * 100).toFixed(0)}%
+        · <span style="color:${(QUALITY[p.quality] || ['', '#888'])[1]}">${(QUALITY[p.quality] || ['?'])[0].toLowerCase()} measurement</span></div></div>`;
     li.onclick = () => {
       const [lon, lat] = f.geometry.coordinates;
       map.setView([lat, lon], 15);
@@ -272,13 +306,13 @@ function renderTray() {
     card.className = 'card';
     card.innerHTML = `
       <button class="x" title="Remove from tray" data-remove="${key}">×</button>
-      <img src="${esc(p.chip_url || '')}" alt="" title="Show on map">
+      <img src="${esc(chipSrc(p))}" data-chip="${p.id}" alt="" title="Show on map">
       <div class="t">${esc(title)}</div>
       <div class="meta">${esc(fmtDate(p.datetime))}</div>
       <div class="coords"><input readonly value="${c}" title="${c}" onclick="this.select()"></div>
       <div class="dl">
         <button class="mini" data-copy="${c}">Copy</button>
-        <a class="mini" href="${base}/image.png?dl=1" download>Image</a>
+        <a class="mini" href="${base}/image.png?dl=1${imgQuery(p)}" data-dl="${p.id}" download>Image</a>
         ${p.has_tif ? `<a class="mini" href="${base}/image.tif" download>GeoTIFF</a>` : ''}
       </div>`;
     card.querySelector('img').onclick = () => { map.setView([lat, lon], Math.max(map.getZoom(), 14)); openShip(f); };
@@ -316,6 +350,18 @@ document.addEventListener('click', (e) => {
   if (rs) { saveMeasurement(Number(rs.dataset.reset), null); return; }
   const sc = e.target.closest('[data-scan-area]');
   if (sc) { e.preventDefault(); e.stopPropagation(); startScan(sc.dataset.scanArea); return; }
+  const tg = e.target.closest('[data-toggle-ruler]');
+  if (tg) {
+    const id = Number(tg.dataset.toggleRuler);
+    if (!showRulers) {  // everything hidden: show this one only by switching back on, others hidden
+      showRulers = true;
+      $('f-rulers').checked = true;
+      features.forEach((f) => { if (f.properties.id !== id) hidden.add(f.properties.id); });
+      hidden.delete(id);
+    } else if (hidden.has(id)) hidden.delete(id); else hidden.add(id);
+    refreshChips();
+    return;
+  }
   const del = e.target.closest('[data-delete-area]');
   if (del) { e.preventDefault(); e.stopPropagation(); deleteArea(del.dataset.deleteArea); return; }
   const zm = e.target.closest('[data-zoom-area]');
@@ -332,7 +378,7 @@ function trayLines() {
 }
 
 async function downloadTrayZip(btn) {
-  const body = { ids: [...tray.values()].map((f) => f.properties.id) };
+  const body = { ids: [...tray.values()].map((f) => f.properties.id), clean: !showRulers };
   const old = btn.textContent;
   btn.textContent = 'Preparing…';
   btn.disabled = true;
@@ -615,7 +661,9 @@ async function loadDetections() {
   q.set('stationary', $('f-stat').checked ? '1' : '0');
   q.set('view', $('f-latest').checked ? 'latest' : 'all');
   const fc = await getJSON('/api/detections?' + q);
-  features = fc.features;
+  const want = $('f-quality').value;  // any | fair | good
+  const ok = { any: ['good', 'fair', 'rough'], fair: ['good', 'fair'], good: ['good'] }[want] || ['good', 'fair', 'rough'];
+  features = fc.features.filter((f) => ok.includes(f.properties.quality));
   render();
 }
 
@@ -786,6 +834,14 @@ $('reset-btn').onclick = resetAll;
 
 $('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes()]).catch((e) => alert(e.message));
 $('f-latest').onchange = $('f-apply').onclick;
+$('f-quality').onchange = $('f-apply').onclick;
+$('f-rulers').checked = showRulers;
+$('f-rulers').onchange = () => {
+  showRulers = $('f-rulers').checked;
+  hidden.clear();
+  try { localStorage.setItem('showRulers', showRulers ? '1' : '0'); } catch (e) { /* private window */ }
+  refreshChips();
+};
 
 (function init() {
   loadAreas().then(() => {

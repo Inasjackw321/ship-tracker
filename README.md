@@ -162,12 +162,38 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/coverage` | `{area: {...}}` imaged and not-imaged parts of each scanned area |
 | `POST /api/scan` `{area, days \| start+end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan of one area (required) or check its progress |
 | `GET /chips/<scene>/<n>.png` | Ship image chip with ruler |
-| `GET /api/detections/<id>/image.png[?dl=1]` | Ship image with coordinates printed on it (and in its metadata) |
+| `GET /api/detections/<id>/image.png[?dl=1][&clean=1]` | Ship image with coordinates printed on it (and in its metadata); `clean=1` without the ruler |
 | `GET /api/detections/<id>/image.tif` | Georeferenced GeoTIFF of the ship chip |
-| `GET /api/detections/<id>/chip.png` | The ship's chip with its current ruler |
+| `GET /api/detections/<id>/chip.png[?clean=1]` | The ship's chip with its current ruler (or without any measurement) |
 | `POST /api/detections/<id>/measurement` `{stern: [lat, lon], bow: [lat, lon], width_m}` | Save a hand measurement |
 | `POST /api/detections/<id>/measurement/reset` | Back to the automatic measurement |
 | `POST /api/download.zip` `{ids: [...]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
+
+## How reliable are the measurements?
+
+Every ship has a **reliability** rating in its popup, list entry and downloaded image, with the reason:
+
+- **Good**: a clear hull that the hull model fits, length known to within about 6 %.
+- **Fair**: usable, but less certain (e.g. a boat only 4–6 pixels long, or a wake separated from the hull).
+- **Rough**: treat as an estimate. Typical reasons are a hull only 2–3 pixels long, the hull model not fitting, or a shape so slender it may include a wake.
+
+**Measurement quality** under *Filter* hides the rough (or the fair) ones. The **±** after each size is a 1-sigma uncertainty, tested to be honest: on the hard benchmark 87 % of true lengths and 79 % of true beams fall inside it (a 1-sigma range should hold at least 68 %). The beam is the less certain of the two. Dark hull paint next to a bright deck looks like water in the near-infrared, so a beam can read narrower than it really is, never wider.
+
+These numbers come from synthetic ships, not real ones with known sizes. Besides the standard benchmark, `tests/test_measure_accuracy.py` runs a **hard benchmark** of 200 ships:
+
+- image sharpness varying around Sentinel-2's nominal value;
+- dark hull sides;
+- superstructures up to 3× brighter than the deck;
+- sun-glint gradients and noisier water;
+- a quarter of the ships with another ship close alongside.
+
+It finds 189/200, with 1 gross length error (more than 15 % off) and a big-ship length RMSE of 4.4 m. Before the fixes it found 177, with 6 gross errors and a 20 m RMSE. Three things were fixed:
+
+- A bright superstructure made the deck look like the soft edge of a cloud, so the ship was thrown away.
+- A ship moored alongside could swallow part of its neighbour's hull.
+- The beam ± ignored dark hull sides.
+
+**Hide the measurement on the images.** Untick **show measurements on images** under *Filter* to see every ship image, the opened-images tray and the map without rulers or outlines. Downloads (single images and the zip) then have no ruler either, though the coordinates and sizes are still printed around the image. **Hide measurement** / **Show measurement** in a popup does the same for one ship. Ships found before GeoTIFF chips were kept have no clean copy and always show their ruler.
 
 ## Measuring on the map
 
