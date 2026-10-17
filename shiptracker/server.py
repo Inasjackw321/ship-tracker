@@ -11,15 +11,17 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
 from shapely import contains_xy
-from shapely.geometry import mapping
+from shapely.geometry import mapping, shape
 
 from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path
 from .config import Settings
 from .db import Store
-from .pipeline import ScanOptions, ScanReport, current_scene_ids, reset_data, scan
+from .aoi import CUSTOM_GROUP, Area, new_area_id, save_areas
+from .pipeline import ScanOptions, ScanReport, area_km2, current_scene_ids, reset_data, scan
 
 log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
+MAX_AREA_KM2 = 3_000_000  # larger than the biggest built-in area; more is a mistake
 
 
 def _feature(d: dict) -> dict:
@@ -172,15 +174,60 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
         lons = [r["lon"] for r in ships]
         lats = [r["lat"] for r in ships]
         running = job["thread"] is not None and job["thread"].is_alive()
+        custom = {a.id for a in settings.custom_areas()}
         feats = []
         for a in settings.areas():
-            status = store.get_meta(f"area:{a.id}") or {}
-            if status.get("status") == "scanning" and not (running and job["options"].get("area") == a.id):
-                status["status"] = "interrupted"  # the app was closed during that scan
-            n = int(contains_xy(a.geom, lons, lats).sum()) if ships else 0
-            feats.append({"type": "Feature", "geometry": mapping(a.geom), "properties": {
-                "id": a.id, "name": a.name, "group": a.group, "ships": n, **status}})
+            feats.append(_area_feature(a, a.id in custom, lons, lats, running))
         return jsonify({"type": "FeatureCollection", "features": feats})
+
+    def _area_feature(a: Area, custom: bool, lons, lats, running: bool) -> dict:
+        status = store.get_meta(f"area:{a.id}") or {}
+        if status.get("status") == "scanning" and not (running and job["options"].get("area") == a.id):
+            status["status"] = "interrupted"  # the app was closed during that scan
+        n = int(contains_xy(a.geom, lons, lats).sum()) if lons else 0
+        return {"type": "Feature", "geometry": mapping(a.geom), "properties": {
+            "id": a.id, "name": a.name, "group": a.group, "ships": n, "custom": custom,
+            "km2": round(area_km2(a.geom)), **status}}
+
+    @app.post("/api/areas")
+    def add_area():
+        """Save an area drawn on the map: {name, geometry (GeoJSON Polygon)}."""
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("name") or "").strip()[:80] or f"My area {len(settings.custom_areas()) + 1}"
+        try:
+            geom = shape(body["geometry"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return jsonify({"error": "draw an area on the map first"}), 400
+        if geom.geom_type not in ("Polygon", "MultiPolygon"):
+            return jsonify({"error": "an area must be a polygon"}), 400
+        minx, miny, maxx, maxy = geom.bounds
+        if not (-180 <= minx <= maxx <= 180 and -85 <= miny <= maxy <= 85):
+            return jsonify({"error": "the area is outside the map"}), 400
+        if not geom.is_valid:
+            geom = geom.buffer(0)  # e.g. a shape whose outline crosses itself
+        km2 = area_km2(geom)
+        if km2 < 1:
+            return jsonify({"error": "the area is too small; click at least three points around it"}), 400
+        if km2 > MAX_AREA_KM2:
+            return jsonify({"error": f"the area is too big ({km2:,.0f} km²); draw at most "
+                                     f"{MAX_AREA_KM2:,} km²"}), 400
+        taken = {a.id for a in settings.areas()}
+        area = Area(new_area_id(name, taken), name, CUSTOM_GROUP, geom)
+        save_areas(settings.custom_areas_path, list(settings.custom_areas()) + [area])
+        return jsonify(_area_feature(area, True, [], [], False)), 201
+
+    @app.delete("/api/areas/<area_id>")
+    def delete_area(area_id: str):
+        """Remove an area you drew. Ships already found stay on the map."""
+        mine = list(settings.custom_areas())
+        if area_id not in {a.id for a in mine}:
+            return jsonify({"error": "only areas you drew can be removed"}), 400
+        if job["thread"] and job["thread"].is_alive() and job["options"].get("area") == area_id:
+            return jsonify({"error": "this area is being scanned"}), 409
+        save_areas(settings.custom_areas_path, [a for a in mine if a.id != area_id])
+        for key in (f"area:{area_id}", f"coverage:{area_id}"):
+            store.delete_meta(key)
+        return jsonify({"deleted": area_id})
 
     @app.get("/api/stats")
     def stats():

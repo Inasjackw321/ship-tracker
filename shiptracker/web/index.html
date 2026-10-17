@@ -89,6 +89,11 @@
   #areas .area .nm span { display: block; font-size: 11px; color: var(--muted); }
   #areas .area.scanning .nm span { color: var(--warn); }
   #areas .area button { padding: 4px 10px; font-size: 12px; }
+  .drawing .leaflet-tooltip-pane { display: none; }
+  #areas .area button.del { padding: 4px 7px; color: var(--muted); }
+  #areas .area button.del:hover { color: var(--err); border-color: #6e2b2b; }
+  .area-pop .ghost-pop { background: transparent; color: #a33; border: 1px solid #d99; border-radius: 6px; padding: 4px 10px;
+    font: 600 12px system-ui, sans-serif; cursor: pointer; margin-left: 6px; }
   .area-pop b { font-size: 14px; }
   .area-pop .st { color: #555; font-size: 12px; margin: 4px 0 8px; }
   .area-pop button { background: #39d353; color: #04130a; border: 0; border-radius: 6px; padding: 6px 12px; font: 600 13px system-ui, sans-serif; cursor: pointer; }
@@ -133,6 +138,7 @@
     <section>
       <h2>Areas · press one to analyse it</h2>
       <ul id="areas"></ul>
+      <div class="row"><button class="ghost" id="draw-start" title="Click points on the map around the sea you want, then double-click">＋ Draw your own area</button></div>
       <div class="grid" style="margin-top:8px">
         <label title="Use the newest image of each tile taken in this many days">Look back (days) <input type="number" id="scan-days" value="30" min="1" max="365"></label>
         <label>Max cloud % <input type="number" id="scan-cloud" value="30" min="0" max="100"></label>
@@ -162,6 +168,13 @@
       <span>Distance <b id="measure-total">0 m</b></span>
       <span class="help" id="measure-help">Click to add points, double-click to finish, Esc to clear.</span>
       <button class="mini ghost" id="measure-close">Close</button>
+    </div>
+    <div id="draw-box" class="floatbox" hidden>
+      <span>New area <b id="draw-size">0 points</b></span>
+      <span class="help">Click points around the sea you want to scan. Double-click, click the first point or press Enter to finish. Esc cancels.</span>
+      <button class="mini" id="draw-finish" disabled>Finish</button>
+      <button class="mini ghost" id="draw-undo">Undo point</button>
+      <button class="mini ghost" id="draw-cancel">Cancel</button>
     </div>
     <div id="adjust-box" class="floatbox" hidden>
       <span>Length <b id="adjust-length">–</b></span>

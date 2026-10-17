@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS scenes (
     n_ships INTEGER DEFAULT 0,
     processed_at REAL,
     detector_version INTEGER DEFAULT 1,
-    geometry TEXT
+    geometry TEXT,
+    covered TEXT                   -- GeoJSON: the part of the tile that was analysed
 );
 CREATE TABLE IF NOT EXISTS detections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +84,8 @@ class Store:
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(scenes)")}
             if "detector_version" not in cols:  # databases from before versioning
                 self.conn.execute("ALTER TABLE scenes ADD COLUMN detector_version INTEGER DEFAULT 1")
+            if "covered" not in cols:  # databases from before areas could be drawn
+                self.conn.execute("ALTER TABLE scenes ADD COLUMN covered TEXT")
             dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(detections)")}
             for name, typ in (("length_err_m", "REAL"), ("width_err_m", "REAL"), ("method", "TEXT"),
                               ("auto_json", "TEXT"), ("updated_at", "REAL"), ("wake_m", "REAL")):
@@ -103,6 +106,10 @@ class Store:
         with self.lock, self.conn:
             self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, json.dumps(value)))
 
+    def delete_meta(self, key: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
     def get_meta(self, key: str, default=None):
         rows = self._query("SELECT value FROM meta WHERE key=?", (key,))
         return json.loads(rows[0]["value"]) if rows else default
@@ -117,17 +124,22 @@ class Store:
         return int(rows[0]["detector_version"] or 1) if rows else 0
 
     def save_scene(self, scene, status: str, note: str = "", sea_fraction: float | None = None,
-                   n_ships: int = 0, detector_version: int = 1) -> None:
+                   n_ships: int = 0, detector_version: int = 1, covered: dict | None = None) -> None:
         with self.lock, self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO scenes
                    (id, datetime, ts, tile, cloud_cover, aoi_overlap, sea_fraction, status, note,
-                    n_ships, processed_at, detector_version, geometry)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    n_ships, processed_at, detector_version, geometry, covered)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scene.id, scene.datetime, _ts(scene.datetime), scene.tile, scene.cloud_cover,
                  scene.aoi_overlap, sea_fraction, status, note, n_ships, time.time(),
-                 detector_version, json.dumps(scene.geometry)),
+                 detector_version, json.dumps(scene.geometry), json.dumps(covered) if covered else None),
             )
+
+    def scene_covered(self, scene_id: str) -> dict | None:
+        """GeoJSON of the part of a tile that was analysed (None for older records)."""
+        rows = self._query("SELECT covered FROM scenes WHERE id=?", (scene_id,))
+        return json.loads(rows[0]["covered"]) if rows and rows[0]["covered"] else None
 
     def scenes(self, limit: int = 500) -> list[dict]:
         rows = self._query(

@@ -30,6 +30,8 @@ The first run creates `.venv` and installs everything. After that it starts the 
 | | Black Sea north: Crimea, Kerch & Azov (`black-sea-north`) |
 | East Asia | Yellow Sea, East China Sea & Taiwan (`east-china-sea`) |
 
+**Your own areas.** To scan somewhere else, or just part of an area, press **＋ Draw your own area** (or the ⬠ button under the zoom buttons). Click points around the sea you want, then double-click, click the first point or press Enter. Give it a name and it appears on the map (light blue) and under **My areas** in the list, ready to scan like the others. Draw it over the sea you care about; land inside it is ignored anyway. ✕ removes an area you drew; ships already found there stay. Your areas are saved in `data/custom_areas.geojson`, so updating the app never touches them. Tiles analysed before you drew an area over them are analysed again for the new part when you scan it.
+
 Each area shows when it was last scanned, the image dates, how much of it Sentinel-2 photographed and how many ships it holds. Pressing **Scan again** later picks up only the new images. One area is scanned at a time. **Look back (days)** and **Max cloud %** in the sidebar apply to the next scan.
 
 **To start fresh**, press **Reset ships & start fresh** under the area list (or run `py run.py --reset`). It deletes every tracked ship, their images and the scan history, so the next scan of an area analyses all of its tiles again. You'll be asked to confirm first, and hand-adjusted measurements are deleted too.
@@ -154,7 +156,8 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/detections?view=latest\|all&start=&end=&min_length=&max_length=&min_confidence=&stationary=0\|1` | GeoJSON of ships: length/width/heading, bow and stern points, chip URL |
 | `GET /api/scenes` | Processed tiles with status and footprint |
 | `GET /api/stats` | Counts |
-| `GET /api/areas` | The areas as GeoJSON, with last-scan status, image window, share imaged and ship count |
+| `GET /api/areas` | The areas as GeoJSON, with last-scan status, image window, share imaged, ship count, size and whether you drew it |
+| `POST /api/areas` `{name, geometry}` / `DELETE /api/areas/<id>` | Save an area you drew (GeoJSON polygon, up to 3,000,000 km²) / remove one |
 | `POST /api/reset` | Delete all tracked ships and start fresh (refused while a scan runs) |
 | `GET /api/coverage` | `{area: {...}}` imaged and not-imaged parts of each scanned area |
 | `POST /api/scan` `{area, days \| start+end, max_cloud, limit, all_passes, workers, keep_tiles}` / `GET /api/scan` | Start a background scan of one area (required) or check its progress |

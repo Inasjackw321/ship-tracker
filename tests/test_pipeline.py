@@ -350,6 +350,48 @@ def test_reset_from_the_command_line(world, monkeypatch, capsys):
     assert create_app(settings).test_client().get("/api/stats").get_json()["detections"] == 0
 
 
+def test_draw_your_own_area_and_scan_it(world, tmp_path):
+    """An area drawn on the map is saved, scanned like a built-in one, and removable.
+    A tile analysed before the area was drawn over it is redone for the new part."""
+    settings, _, _ = world
+    w, s, e, n = Handler.pages[0][0]["bbox"]
+    mid = (w + e) / 2
+    west = tmp_path / "areas.geojson"
+    west.write_text(json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"id": "west", "name": "West", "group": "test"}, "geometry": {
+            "type": "Polygon", "coordinates": [[[w - 1, s - 1], [mid, s - 1], [mid, n + 1], [w - 1, n + 1], [w - 1, s - 1]]]}}]}))
+    settings.areas_path = west
+    rep = scan(settings, ScanOptions(area="west", start="2026-09-29", end="2026-10-01"))
+    found_west = rep.ships
+    assert rep.processed == 2 and 0 < found_west < len(SHIPS)
+
+    client = create_app(settings).test_client()
+    east = [[mid, s - 0.5], [e + 0.5, s - 0.5], [e + 0.5, n + 0.5], [mid, n + 0.5], [mid, s - 0.5]]
+    r = client.post("/api/areas", json={"name": "East side!", "geometry": {"type": "Polygon", "coordinates": [east]}})
+    assert r.status_code == 201
+    new = r.get_json()["properties"]
+    assert new["id"] == "my-east-side" and new["custom"] and new["group"] == "My areas" and new["km2"] > 1
+    assert settings.custom_areas_path.exists()
+    ids = [f["properties"]["id"] for f in client.get("/api/areas").get_json()["features"]]
+    assert ids == ["west", "my-east-side"]
+
+    # the tiles were analysed for the west half only: they are redone for the east half
+    rep = scan(settings, ScanOptions(area="my-east-side", start="2026-09-29", end="2026-10-01"))
+    assert rep.processed == 2 and rep.already_done == 0
+    assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)
+    # ... and now cover both halves, so neither area redoes them
+    for area in ("west", "my-east-side"):
+        assert scan(settings, ScanOptions(area=area, start="2026-09-29", end="2026-10-01")).already_done == 2
+
+    assert client.post("/api/areas", json={"name": "x", "geometry": {"type": "Point", "coordinates": [0, 0]}}).status_code == 400
+    huge = [[-60, -40], [60, -40], [60, 40], [-60, 40], [-60, -40]]
+    assert client.post("/api/areas", json={"geometry": {"type": "Polygon", "coordinates": [huge]}}).status_code == 400
+    assert client.delete("/api/areas/west").status_code == 400  # built-in areas stay
+    assert client.delete("/api/areas/my-east-side").status_code == 200
+    assert [f["properties"]["id"] for f in client.get("/api/areas").get_json()["features"]] == ["west"]
+    assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)  # ships stay
+
+
 def test_scan_api_requires_an_area(world):
     settings, _, _ = world
     client = create_app(settings).test_client()

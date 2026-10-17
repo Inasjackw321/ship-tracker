@@ -21,18 +21,20 @@ const areaById = new Map();
 const AREA_STYLE = {
   idle: { color: '#39ff5a', weight: 2, fillColor: '#39ff5a', fillOpacity: 0.06 },
   scanning: { color: '#ffb000', weight: 3, dashArray: '8 6', fillColor: '#ffb000', fillOpacity: 0.12 },
+  custom: { color: '#4dd0ff', weight: 2, fillColor: '#4dd0ff', fillOpacity: 0.07 },
   hover: { weight: 3.5, fillOpacity: 0.16 },
 };
 const areaLayer = L.geoJSON(null, {
   pane: 'areas',
-  style: (f) => (f.properties.id === scanJob.area && scanJob.running ? AREA_STYLE.scanning : AREA_STYLE.idle),
+  style: (f) => (f.properties.id === scanJob.area && scanJob.running ? AREA_STYLE.scanning
+    : f.properties.custom ? AREA_STYLE.custom : AREA_STYLE.idle),
   onEachFeature: (f, l) => {
     areaById.set(f.properties.id, l);
     l.bindTooltip(() => `<b>${esc(f.properties.name)}</b><br>${esc(areaStatus(currentArea(f.properties.id)))}<br><i>click to scan</i>`, { sticky: true });
     l.on('mouseover', () => l.setStyle(AREA_STYLE.hover));
     l.on('mouseout', () => areaLayer.resetStyle(l));
     l.on('click', (e) => {
-      if (measure.on || editingId != null) return;
+      if (measure.on || draw.on || editingId != null) return;
       L.DomEvent.stopPropagation(e);
       l.closeTooltip();
       openAreaPopup(f.properties.id, e.latlng);
@@ -230,7 +232,7 @@ const tray = new Map();
 const keyOf = (f) => String(f.properties.id);
 
 function openShip(f) {
-  if (measure.on) return; // clicks add ruler points while measuring
+  if (measure.on || draw.on) return; // clicks add ruler / outline points
   const key = keyOf(f);
   const [lon, lat] = f.geometry.coordinates;
   if (openPopups.has(key)) { addToTray(f); return; }
@@ -314,6 +316,8 @@ document.addEventListener('click', (e) => {
   if (rs) { saveMeasurement(Number(rs.dataset.reset), null); return; }
   const sc = e.target.closest('[data-scan-area]');
   if (sc) { e.preventDefault(); e.stopPropagation(); startScan(sc.dataset.scanArea); return; }
+  const del = e.target.closest('[data-delete-area]');
+  if (del) { e.preventDefault(); e.stopPropagation(); deleteArea(del.dataset.deleteArea); return; }
   const zm = e.target.closest('[data-zoom-area]');
   if (zm) { zoomArea(zm.dataset.zoomArea); }
 }, true);
@@ -383,6 +387,7 @@ function measureRedraw() {
 }
 
 function setMeasure(on) {
+  if (on && draw.on) setDraw(false);
   measure.on = on;
   measure.done = false;
   measure.pts = [];
@@ -419,6 +424,115 @@ const MeasureControl = L.Control.extend({
 });
 new MeasureControl().addTo(map);
 $('measure-close').onclick = () => setMeasure(false);
+
+// ---- Draw your own area to scan ----
+const draw = { on: false, pts: [], layer: L.layerGroup().addTo(map) };
+
+function polygonKm2(pts) {  // spherical polygon area
+  if (pts.length < 3) return 0;
+  const R = 6371.0088, rad = Math.PI / 180;
+  let s = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    s += (b.lng - a.lng) * rad * (2 + Math.sin(a.lat * rad) + Math.sin(b.lat * rad));
+  }
+  return Math.abs(s * R * R / 2);
+}
+
+function drawRedraw() {
+  draw.layer.clearLayers();
+  const pts = draw.pts;
+  if (pts.length >= 2) {
+    L.polygon(pts, { pane: 'measure', color: '#4dd0ff', weight: 2, dashArray: '6 5', fillOpacity: 0.12, interactive: false }).addTo(draw.layer);
+  }
+  pts.forEach((pt, i) => L.circleMarker(pt, { pane: 'measure', radius: i ? 4 : 6, color: '#000', weight: 2,
+    fillColor: i ? '#4dd0ff' : '#fff', fillOpacity: 1, interactive: false }).addTo(draw.layer));
+  const km2 = polygonKm2(pts);
+  $('draw-size').textContent = pts.length >= 3 ? `${Math.round(km2).toLocaleString()} km²` : `${pts.length} point${pts.length === 1 ? '' : 's'}`;
+  $('draw-finish').disabled = pts.length < 3;
+}
+
+function setDraw(on) {
+  if (on && measure.on) setMeasure(false);
+  if (on && editingId != null) stopAdjust();
+  draw.on = on;
+  draw.pts = [];
+  map.closePopup();
+  map.getContainer().style.cursor = on ? 'crosshair' : '';
+  map.getContainer().classList.toggle('drawing', on);  // hide area labels while drawing over them
+  if (on) map.doubleClickZoom.disable(); else map.doubleClickZoom.enable();
+  document.querySelector('.draw-btn')?.classList.toggle('active', on);
+  $('draw-box').hidden = !on;
+  drawRedraw();
+}
+
+async function finishDraw() {
+  if (draw.pts.length < 3) return;
+  const pts = draw.pts.slice();
+  const km2 = polygonKm2(pts);
+  const n = areas.filter((f) => f.properties.custom).length + 1;
+  const name = prompt(`Name this area (${Math.round(km2).toLocaleString()} km²):`, `My area ${n}`);
+  if (name === null) return;  // keep drawing
+  const ring = pts.map((p) => [p.lng, p.lat]);
+  ring.push(ring[0]);
+  try {
+    const f = await getJSON('/api/areas', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, geometry: { type: 'Polygon', coordinates: [ring] } }),
+    });
+    setDraw(false);
+    await loadAreas();
+    zoomArea(f.properties.id);
+    openAreaPopup(f.properties.id);
+  } catch (e) { alert('Could not save the area: ' + e.message); }
+}
+
+async function deleteArea(id) {
+  const p = currentArea(id);
+  if (!confirm(`Remove "${p.name || id}"? Ships already found there stay on the map.`)) return;
+  try {
+    await getJSON(`/api/areas/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    map.closePopup();
+    await loadAreas();
+    loadCoverage();
+  } catch (e) { alert('Could not remove the area: ' + e.message); }
+}
+
+map.on('click', (e) => {
+  if (!draw.on) return;
+  const pt = e.latlng, pts = draw.pts;
+  const px = (q) => map.latLngToContainerPoint(q);
+  if (pts.length >= 3 && px(pts[0]).distanceTo(px(pt)) < 10) { finishDraw(); return; }  // closed the shape
+  if (pts.length && px(pts[pts.length - 1]).distanceTo(px(pt)) < 4) return;  // double-click's second click
+  pts.push(pt);
+  drawRedraw();
+});
+map.on('dblclick', () => { if (draw.on) finishDraw(); });
+document.addEventListener('keydown', (e) => {
+  if (!draw.on) return;
+  if (e.key === 'Escape') setDraw(false);
+  if (e.key === 'Backspace' && draw.pts.length && document.activeElement === document.body) { draw.pts.pop(); drawRedraw(); }
+  if (e.key === 'Enter') finishDraw();
+});
+
+const DrawControl = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const box = L.DomUtil.create('div', 'leaflet-bar');
+    const a = L.DomUtil.create('a', 'measure-btn draw-btn', box);
+    a.href = '#';
+    a.title = 'Draw your own area to scan';
+    a.innerHTML = '&#11040;';
+    L.DomEvent.disableClickPropagation(box);
+    L.DomEvent.on(a, 'click', (ev) => { L.DomEvent.preventDefault(ev); setDraw(!draw.on); });
+    return box;
+  },
+});
+new DrawControl().addTo(map);
+$('draw-start').onclick = () => setDraw(!draw.on);
+$('draw-finish').onclick = finishDraw;
+$('draw-undo').onclick = () => { draw.pts.pop(); drawRedraw(); };
+$('draw-cancel').onclick = () => setDraw(false);
 
 // ---- Adjust a ship's measurement by dragging its hull ends ----
 map.createPane('edit').style.zIndex = 680;
@@ -543,7 +657,9 @@ function openAreaPopup(id, latlng) {
   const html = `<div class="area-pop"><b>${esc(p.name)}</b>
     <div class="st">${esc(areaStatus(p))}</div>
     <button data-scan-area="${esc(id)}" ${busy ? 'disabled' : ''}>${busy ? (scanJob.area === id ? 'Scanning…' : 'Another scan is running') : (p.status === 'done' ? 'Scan again' : 'Scan this area')}</button>
-    <div class="st">Newest image of each tile from the last ${Number($('scan-days').value || 30)} days.</div></div>`;
+    <div class="st">Newest image of each tile from the last ${Number($('scan-days').value || 30)} days.
+      ${p.km2 ? `Area ${Number(p.km2).toLocaleString()} km².` : ''}</div>
+    ${p.custom ? `<button class="ghost-pop" data-delete-area="${esc(id)}">Remove this area</button>` : ''}</div>`;
   L.popup({ autoPan: true }).setLatLng(latlng || layer.getBounds().getCenter()).setContent(html).openOn(map);
 }
 
@@ -573,7 +689,8 @@ function renderAreas() {
     li.dataset.zoomArea = p.id;
     li.title = 'Click to zoom to this area';
     li.innerHTML = `<div class="nm"><b>${esc(p.name)}</b><span>${esc(areaStatus(p))}</span></div>
-      <button data-scan-area="${esc(p.id)}" ${scanJob.running ? 'disabled' : ''}>${scanningThis ? '…' : 'Scan'}</button>`;
+      <button data-scan-area="${esc(p.id)}" ${scanJob.running ? 'disabled' : ''}>${scanningThis ? '…' : 'Scan'}</button>
+      ${p.custom ? `<button class="ghost del" data-delete-area="${esc(p.id)}" title="Remove this area (ships found stay on the map)" ${scanningThis ? 'disabled' : ''}>✕</button>` : ''}`;
     ul.appendChild(li);
   }
   $('s-areas').textContent = `${scanned}/${areas.length}`;
@@ -582,7 +699,8 @@ function renderAreas() {
 
 async function loadAreas() {
   const fc = await getJSON('/api/areas');
-  const first = !areas.length;
+  const ids = (list) => list.map((f) => f.properties.id).join('|');
+  const first = ids(areas) !== ids(fc.features);  // first load, or an area was drawn/removed
   areas = fc.features;
   if (first) {
     areaById.clear();

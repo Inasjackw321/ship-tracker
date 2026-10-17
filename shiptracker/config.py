@@ -63,18 +63,36 @@ class Settings:
             cfg["collection"] = self.collection
         return cfg
 
-    def search_area(self):
-        """All areas together (used for the map's "latest image" view)."""
-        from .aoi import all_areas
-        return all_areas(self.areas_path)
+    @property
+    def custom_areas_path(self) -> Path:
+        """Areas drawn on the map (kept with your data, not in the repository)."""
+        return self.data_dir / "custom_areas.geojson"
 
-    def area(self, area_id: str):
-        from .aoi import get_area
-        return get_area(self.areas_path, area_id)
-
-    def areas(self):
+    def builtin_areas(self):
         from .aoi import load_areas
         return load_areas(self.areas_path)
+
+    def custom_areas(self):
+        from .aoi import load_areas
+        return load_areas(self.custom_areas_path)
+
+    def areas(self):
+        return self.builtin_areas() + self.custom_areas()
+
+    def area(self, area_id: str):
+        for a in self.areas():
+            if a.id == area_id:
+                return a
+        raise KeyError(f"unknown area {area_id!r}; choose from {', '.join(a.id for a in self.areas())}")
+
+    def search_area(self):
+        """All areas together: every tile is analysed for all the areas it touches."""
+        from shapely.ops import unary_union
+        return unary_union([a.geom for a in self.areas()])
+
+    def builtin_search_area(self):
+        from shapely.ops import unary_union
+        return unary_union([a.geom for a in self.builtin_areas()])
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.tiles_dir, self.chips_dir):

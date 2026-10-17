@@ -203,13 +203,14 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
     # once, so a scan of the neighbouring area must not find it half done.
     aoi = settings.search_area()
     sdir = scene_dir(settings.tiles_dir, scene.id)
+    covered = _covered(aoi, scene)
 
     with gdal_env():
         scl_path = download_file(scene.scl_href, sdir / "SCL.tif", src_cfg)
         sea = clear_sea_fraction(scl_path, aoi)
         if sea < opts.min_sea_fraction:
             store.save_scene(scene, "skipped", f"clear sea {sea:.1%}", sea_fraction=sea,
-                             detector_version=DETECTOR_VERSION)
+                             detector_version=DETECTOR_VERSION, covered=covered)
             if not opts.keep_tiles:
                 remove_scene(settings.tiles_dir, scene.id)
             return "skipped", 0
@@ -254,10 +255,29 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
     _prune_chips(settings, store, scene.id)
     why = ", ".join(f"{n} {r}" for r, n in rejected.most_common())
     store.save_scene(scene, "done", f"{len(dets)} detected, {added} new" + (f"; rejected {why}" if why else ""),
-                     sea_fraction=sea, n_ships=added, detector_version=DETECTOR_VERSION)
+                     sea_fraction=sea, n_ships=added, detector_version=DETECTOR_VERSION, covered=covered)
     if not opts.keep_tiles:
         remove_scene(settings.tiles_dir, scene.id)
     return "done", added
+
+
+def _covered(aoi: BaseGeometry, scene: Scene) -> dict | None:
+    part = aoi.intersection(shape(scene.geometry)) if scene.geometry else aoi
+    return mapping(part.simplify(0.001)) if not part.is_empty else None
+
+
+def _covers(settings: Settings, store: Store, sc: Scene, aoi: BaseGeometry) -> bool:
+    """Whether an analysed tile already covers its part of ``aoi``. A tile analysed before
+    an area was drawn over it has not looked at that area yet."""
+    if not sc.geometry:
+        return True
+    need = aoi.intersection(shape(sc.geometry))
+    if need.is_empty:
+        return True
+    rec = store.scene_covered(sc.id)
+    done = shape(rec) if rec else settings.builtin_search_area()  # older records: built-in areas
+    missing = need.difference(done.buffer(0.002))
+    return missing.area < max(1e-6, 0.002 * need.area)
 
 
 def _prune_chips(settings: Settings, store: Store, scene_id: str) -> None:
@@ -363,9 +383,11 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
 
 def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> None:
     todo, outdated = [], []
+    aoi = scan_region(settings, opts)
     for sc in scenes:
         status = store.scene_status(sc.id)
-        current = store.scene_version(sc.id) >= DETECTOR_VERSION
+        current = store.scene_version(sc.id) >= DETECTOR_VERSION and (
+            status not in ("done", "skipped") or _covers(settings, store, sc, aoi))
         if not opts.reprocess and status in ("done", "skipped") and current:
             report.already_done += 1
             statuses[sc.id] = status
@@ -377,7 +399,8 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
     for sc in outdated:
         store.delete_scene_detections(sc.id)
     if outdated:
-        note(f"{len(outdated)} tiles were analysed by an older detector and will be redone")
+        note(f"{len(outdated)} tiles were analysed before (older detector, or before this area "
+             "was drawn) and will be redone")
     if not todo:
         return
 

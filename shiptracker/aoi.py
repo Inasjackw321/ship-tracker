@@ -1,14 +1,18 @@
-"""The areas ships are tracked in (config/areas.geojson). Each is scanned on demand."""
+"""The areas ships are tracked in. Each is scanned on demand.
+
+Built-in areas come from config/areas.geojson; areas you draw on the map are kept in
+data/custom_areas.geojson (with your results, so a git pull never touches them).
+"""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
 
 
 @dataclass(frozen=True)
@@ -32,18 +36,33 @@ def _load(path: str, mtime: float) -> tuple[Area, ...]:
     return tuple(out)
 
 
+CUSTOM_GROUP = "My areas"
+
+
 def load_areas(path: Path) -> tuple[Area, ...]:
-    """All areas; re-read automatically when the file is edited."""
+    """All areas in a file; re-read automatically when the file is edited."""
     p = Path(path)
+    if not p.exists():
+        return ()
     return _load(str(p), p.stat().st_mtime)
 
 
-def get_area(path: Path, area_id: str) -> Area:
-    for a in load_areas(path):
-        if a.id == area_id:
-            return a
-    raise KeyError(f"unknown area {area_id!r}; choose from {', '.join(a.id for a in load_areas(path))}")
+def save_areas(path: Path, areas) -> None:
+    from shapely.geometry import mapping
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    feats = [{"type": "Feature", "properties": {"id": a.id, "name": a.name, "group": a.group},
+              "geometry": mapping(a.geom)} for a in areas]
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"type": "FeatureCollection", "features": feats}, indent=1))
+    tmp.replace(p)
 
 
-def all_areas(path: Path) -> BaseGeometry:
-    return unary_union([a.geom for a in load_areas(path)])
+def new_area_id(name: str, taken) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "area"
+    base, n = f"my-{slug}", 2
+    out = base
+    while out in taken:
+        out, n = f"{base}-{n}", n + 1
+    return out
