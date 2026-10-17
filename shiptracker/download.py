@@ -20,6 +20,9 @@ import requests
 from .stac import sign_href
 
 log = logging.getLogger(__name__)
+# The imagery bucket is public, so rasterio's unsigned "DummySession" is exactly right;
+# don't announce it for every file it opens.
+logging.getLogger("rasterio.session").setLevel(logging.WARNING)
 
 CHUNK = 1 << 20
 
