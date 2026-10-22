@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reprocess", action="store_true", help="re-run scenes that were already processed")
     p.add_argument("--all-passes", action="store_true",
                    help="scan every pass in the date range, not just the newest image of each tile")
-    p.add_argument("--workers", type=int, default=0, help="tiles processed in parallel (default: automatic)")
+    p.add_argument("--workers", type=int, default=0, help="CPU cores used to analyse each tile (default: automatic)")
 
     p = sub.add_parser("watch", help="scan one area for new imagery repeatedly")
     p.add_argument("area", help="area id (see: shiptracker areas)")

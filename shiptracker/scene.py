@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import Counter, deque
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -70,14 +72,39 @@ def clear_sea_fraction(scl_path, aoi: BaseGeometry) -> float:
     return float(((scl == SCL_WATER) & valid).sum() / valid.sum())
 
 
+def _block_job(dn: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi_mask: np.ndarray, scale: float,
+               offset: float, p: DetectParams, pixel_m: float, rr0: int, cc0: int, r0: int, c0: int):
+    """Detect ships in one block (runs in a worker process). Returns the detections whose
+    centre lies in the block's core, in tile pixel coordinates, and the rejection counts."""
+    rejected: Counter = Counter()
+    refl = dn.astype(np.float32) * scale + offset
+    out = []
+    for d in detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected):
+        fr, fc = d.row + rr0, d.col + cc0
+        # Keep each ship once: only in the block whose core holds its centre.
+        if not (r0 <= fr < r0 + p.block and c0 <= fc < c0 + p.block):
+            continue
+        d.row, d.col = fr, fc
+        d.hull_nir_dn = _hull_mean(dn, d, rr0, cc0)
+        out.append(d)
+    return out, rejected
+
+
 def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_offset: float,
                  params: DetectParams | None = None, rejected=None, stats: dict | None = None,
-                 progress=None) -> list[GeoDetection]:
-    """``stats`` (optional) receives how many processing blocks the tile has and how many
-    were read (the others are land, cloud, nodata or outside every area); ``progress``
-    (optional) is called as progress(blocks_done, blocks_total) while it runs."""
+                 progress=None, pool=None) -> list[GeoDetection]:
+    """Detect ships in one tile, block by block.
+
+    The blocks are read here, in order, so each part of the image is fetched once; with a
+    ``pool`` (ProcessPoolExecutor) they are analysed in parallel on every CPU core while
+    the next ones are read. ``stats`` (optional) receives how many blocks the tile has and
+    how many were read (the others are land, cloud, nodata or outside every area);
+    ``progress`` (optional) is called as progress(blocks_done, blocks_total)."""
     p = params or DetectParams()
+    rejected = rejected if rejected is not None else Counter()
     results: list[GeoDetection] = []
+    pending: deque = deque()
+    max_pending = 2 * max(getattr(pool, "_max_workers", 1), 1)  # bounds memory
     with rasterio.open(nir_path) as src, rasterio.open(scl_path) as scl_src:
         H, W = src.height, src.width
         pixel_m = abs(src.res[0])
@@ -86,17 +113,40 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
         nodata = src.nodata if src.nodata is not None else 0
         B, halo = p.block, p.halo
         n_blocks = math.ceil(H / B) * math.ceil(W / B)
-        done = read = 0
+        state = {"done": 0, "read": 0}
+
+        def finished(job) -> None:
+            dets, rej = job
+            rejected.update(rej)
+            results.extend(_georef(d, src.transform, to_wgs) for d in dets)
+            tick()
+
+        def tick() -> None:
+            state["done"] += 1
+            if progress is not None:
+                progress(state["done"], n_blocks)
+
+        def collect_one() -> None:
+            nonlocal pool
+            fut, args = pending.popleft()
+            try:
+                job = fut.result()
+            except BrokenProcessPool:
+                log.warning("Worker processes stopped; analysing in this process")
+                pool = None
+                job = _block_job(*args)
+            finished(job)
+
+        if progress is not None:
+            progress(0, n_blocks)
         for r0 in range(0, H, B):
             for c0 in range(0, W, B):
-                done += 1
-                if progress is not None:
-                    progress(done - 1, n_blocks)
                 rr0, cc0 = max(r0 - halo, 0), max(c0 - halo, 0)
                 rr1, cc1 = min(r0 + B + halo, H), min(c0 + B + halo, W)
                 win = Window(cc0, rr0, cc1 - cc0, rr1 - rr0)
                 wb = box(*window_bounds(win, src.transform))
                 if not wb.intersects(aoi_proj):
+                    tick()
                     continue
                 # Decide from the small SCL band whether this block has any sea in the area
                 # before reading the big NIR band (which may be streamed over the network).
@@ -105,9 +155,10 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                 wt = window_transform(win, src.transform)
                 aoi_mask = geometry_mask([mapping(aoi_proj)], out_shape=shape_, transform=wt, invert=True)
                 if not ((scl == SCL_WATER) & aoi_mask).any():
+                    tick()
                     continue
                 dn = src.read(1, window=win)
-                read += 1
+                state["read"] += 1
                 valid = dn != nodata
                 # Treat the outer rim of the tile like nodata: edge artifacts live there,
                 # and the overlapping neighbour tile sees that strip from its interior.
@@ -121,23 +172,24 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                 if cc1 > W - e:
                     valid[:, W - e - cc1:] = False
                 if not ((scl == SCL_WATER) & valid).any():
+                    tick()
                     continue
-                refl = dn.astype(np.float32) * nir_scale + nir_offset
-                dets = detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected)
-                for d in dets:
-                    fr, fc = d.row + rr0, d.col + cc0
-                    # Keep each ship once: only in the block whose core holds its centre.
-                    if not (r0 <= fr < r0 + B and c0 <= fc < c0 + B):
-                        continue
-                    d.row, d.col = fr, fc
-                    d.hull_nir_dn = _hull_mean(dn, d, rr0, cc0)
-                    results.append(_georef(d, src.transform, to_wgs))
-                if done % 10 == 0:
-                    log.info("  block %d/%d, %d ships so far", done, n_blocks, len(results))
-    if progress is not None:
-        progress(n_blocks, n_blocks)
+                args = (dn, scl, valid, aoi_mask, nir_scale, nir_offset, p, pixel_m, rr0, cc0, r0, c0)
+                if pool is None:
+                    finished(_block_job(*args))
+                    continue
+                try:
+                    pending.append((pool.submit(_block_job, *args), args))
+                except (BrokenProcessPool, RuntimeError):
+                    pool = None
+                    finished(_block_job(*args))
+                    continue
+                while len(pending) >= max_pending:
+                    collect_one()
+        while pending:
+            collect_one()
     if stats is not None:
-        stats.update(blocks=n_blocks, read=read)
+        stats.update(blocks=n_blocks, read=state["read"])
     return results
 
 

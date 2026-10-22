@@ -162,12 +162,20 @@ def render_chip(src, g: GeoDetection, out_path: Path, label: str = "") -> Path:
 
 
 def render_chips(image_path: Path, detections: list[GeoDetection], out_dir: Path, label: str = "") -> list[Path | None]:
-    paths: list[Path | None] = []
-    with rasterio.open(image_path) as src:
-        for i, g in enumerate(detections):
-            try:
-                paths.append(render_chip(src, g, out_dir / f"{i:04d}.png", label))
-            except Exception as exc:  # a broken chip must not lose the detection
-                log.warning("Chip %d failed: %s", i, exc)
-                paths.append(None)
-    return paths
+    """One chip per detection, read in parallel (the image may be streamed)."""
+    from .download import in_parallel
+
+    rasterio.open(image_path).close()  # fail early (and once) if the image cannot be opened
+
+    def render(chunk):
+        out = []
+        with rasterio.open(image_path) as src:
+            for i, g in chunk:
+                try:
+                    out.append((i, render_chip(src, g, out_dir / f"{i:04d}.png", label)))
+                except Exception as exc:  # a broken chip must not lose the detection
+                    log.warning("Chip %d failed: %s", i, exc)
+                    out.append((i, None))
+        return out
+
+    return in_parallel(list(detections), render) if detections else []

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,40 +84,50 @@ def verify_detections(dets: list[GeoDetection], nir_path: Path, tci_path: Path |
     if not dets:
         return dets
     inland = _inland(dets, p.inland_km)
-    keep: list[GeoDetection] = []
-    nir_src = rasterio.open(nir_path)  # header only, for its pixel grid
-    tci_src = None
-    if tci_path:
-        try:
-            tci_src = rasterio.open(tci_path)
-        except rasterio.errors.RasterioIOError as exc:
-            log.warning("True-colour image unreadable (%s); colour checks skipped", exc)
     try:
-        for g, is_inland in zip(dets, inland):
-            if is_inland:
-                rejected["inland"] += 1
-                continue
-            if tci_src is not None:
-                rows, cols = hull_pixels(g)
-                nir_dn = g.det.hull_nir_dn  # recorded by the detector: no second NIR read
-                if nir_dn is None:
-                    (nir_dn,) = _sample(nir_src, g, rows, cols, nir_src.transform, (1,))
-                rgb = _sample(tci_src, g, rows, cols, nir_src.transform, (1, 2, 3))
-                if np.isfinite(nir_dn) and np.isfinite(rgb).all():
-                    nir = nir_dn * nir_scale + nir_offset
-                    red, green, blue = rgb / 255.0 * TCI_FULL_SCALE
-                    ndvi = (nir - red) / max(nir + red, 1e-6)
-                    bands = np.array([red, green, blue, min(nir, TCI_FULL_SCALE)])
-                    flat = bands.min() / max(bands.max(), 1e-6)
-                    if ndvi > p.max_ndvi:
-                        rejected["vegetation"] += 1
-                        continue
-                    if blue >= p.cloud_min_blue and flat >= p.cloud_flatness:
-                        rejected["white like cloud"] += 1
-                        continue
+        tci_ok = bool(tci_path) and rasterio.open(tci_path).close() is None
+    except rasterio.errors.RasterioIOError as exc:
+        log.warning("True-colour image unreadable (%s); colour checks skipped", exc)
+        tci_ok = False
+
+    def check(chunk):
+        out = []
+        with rasterio.open(nir_path) as nir_src, (rasterio.open(tci_path) if tci_ok else nullcontext()) as tci_src:
+            for i, g in chunk:
+                out.append((i, _verdict(g, nir_src, tci_src, nir_scale, nir_offset, p)))
+        return out
+
+    from .download import in_parallel
+    to_check = [g for g, bad in zip(dets, inland) if not bad]
+    verdicts = iter(in_parallel(to_check, check) if to_check else [])
+    keep: list[GeoDetection] = []
+    for g, is_inland in zip(dets, inland):
+        why = "inland" if is_inland else next(verdicts)
+        if why:
+            rejected[why] += 1
+        else:
             keep.append(g)
-    finally:
-        nir_src.close()
-        if tci_src is not None:
-            tci_src.close()
     return keep
+
+
+def _verdict(g: GeoDetection, nir_src, tci_src, nir_scale: float, nir_offset: float, p: VerifyParams) -> str | None:
+    """Why this detection is not a ship (vegetation, cloud), or None."""
+    if tci_src is None:
+        return None
+    rows, cols = hull_pixels(g)
+    nir_dn = g.det.hull_nir_dn  # recorded by the detector: no second NIR read
+    if nir_dn is None:
+        (nir_dn,) = _sample(nir_src, g, rows, cols, nir_src.transform, (1,))
+    rgb = _sample(tci_src, g, rows, cols, nir_src.transform, (1, 2, 3))
+    if not (np.isfinite(nir_dn) and np.isfinite(rgb).all()):
+        return None
+    nir = nir_dn * nir_scale + nir_offset
+    red, green, blue = rgb / 255.0 * TCI_FULL_SCALE
+    ndvi = (nir - red) / max(nir + red, 1e-6)
+    bands = np.array([red, green, blue, min(nir, TCI_FULL_SCALE)])
+    flat = bands.min() / max(bands.max(), 1e-6)
+    if ndvi > p.max_ndvi:
+        return "vegetation"
+    if blue >= p.cloud_min_blue and flat >= p.cloud_flatness:
+        return "white like cloud"
+    return None

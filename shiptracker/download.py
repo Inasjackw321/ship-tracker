@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 # The imagery bucket is public, so rasterio's unsigned "DummySession" is exactly right;
 # don't announce it for every file it opens.
 logging.getLogger("rasterio.session").setLevel(logging.WARNING)
+# Byte ranges fetched over HTTP are kept in one cache shared by every open copy of a file,
+# so the colour checks and the ship images (read from several threads) fetch each part
+# of the true-colour image once. Must be set before GDAL first reads over HTTP.
+os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", str(256 << 20))
 
 CHUNK = 1 << 20
 
@@ -115,6 +119,32 @@ def gdal_options() -> dict:
 
 def gdal_env() -> rasterio.Env:
     return rasterio.Env(**gdal_options())
+
+
+def in_parallel(items: list, work, threads: int = 6) -> list:
+    """Run ``work(chunk)`` over ``items`` split into chunks on several threads (each with
+    the GDAL settings, which are per thread) and return the results in the original order.
+    ``work`` gets a list of (index, item) and returns a list of (index, result)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    indexed = list(enumerate(items))
+    n = max(1, min(threads, len(indexed)))
+    chunks = [indexed[i::n] for i in range(n)]
+
+    def run(chunk):
+        with gdal_env():
+            return work(chunk)
+
+    out = [None] * len(items)
+    if n == 1:
+        pairs = [run(chunks[0])]
+    else:
+        with ThreadPoolExecutor(n) as ex:
+            pairs = list(ex.map(run, chunks))
+    for part in pairs:
+        for i, r in part:
+            out[i] = r
+    return out
 
 
 def scene_dir(tiles_dir: Path, scene_id: str) -> Path:

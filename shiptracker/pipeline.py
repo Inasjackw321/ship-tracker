@@ -13,7 +13,6 @@ import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Callable
@@ -48,7 +47,7 @@ class ScanOptions:
     # "latest": the most recent usable image of every tile, covering the area once.
     # "all": every pass in the date range (several looks at the same place).
     mode: str = "latest"
-    workers: int = 0             # tiles processed in parallel (0 = automatic, from the CPU count)
+    workers: int = 0             # CPU cores (worker processes) per tile (0 = automatic)
     min_sea_fraction: float = 0.01
     rgb_chips: bool = True       # read the true-colour image for chips and colour checks
     # False: stream just the needed parts of each image (fast). True: download whole
@@ -161,57 +160,30 @@ def imagery_coverage(scenes: list[Scene], aoi: BaseGeometry) -> dict:
 
 
 def auto_workers() -> int:
-    """Tiles in parallel: one per spare CPU core, 2 to 4 (each needs a few hundred MB)."""
-    return min(4, max(2, (os.cpu_count() or 2) - 1))
+    """Worker processes: one per CPU core but one, 2 to 6 (each needs a few hundred MB)."""
+    return min(6, max(2, (os.cpu_count() or 2) - 1))
 
 
 _pool_lock = threading.Lock()
 _pool: ProcessPoolExecutor | None = None
-# Progress of tiles being analysed: worker processes put (tile, done, total) on a queue
-# (set by _init_worker); in this process it goes straight to _progress.
-_progress_q = None
+# Called as _progress(tile, blocks_done, blocks_total) while a tile is analysed.
 _progress: Callable[[str, int, int], None] | None = None
 
 
-def _init_worker(q) -> None:
-    global _progress_q
-    _progress_q = q
-
-
-def _detect_job(nir, scl_path, aoi, scale, offset, params, scene_id=""):
-    """Runs in a worker process: detection over one tile, returning (ships, rejected, stats)."""
-    rejected: Counter = Counter()
-    stats: dict = {}
-    last = [-1]
-
-    def progress(done: int, total: int) -> None:
-        pct = int(100 * done / max(total, 1))
-        if pct - last[0] < 3 and done < total:
-            return
-        last[0] = pct
-        if _progress_q is not None:
-            _progress_q.put((scene_id, done, total))
-        elif _progress is not None:
-            _progress(scene_id, done, total)
-
-    with gdal_env():
-        dets = detect_scene(nir, scl_path, aoi, scale, offset, params, rejected, stats, progress)
-    return dets, rejected, stats
-
-
 def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions):
+    """Detect ships in one tile; its blocks are analysed on every CPU core."""
     global _pool
-    args = (nir, str(scl_path), aoi, scene.nir_scale, scene.nir_offset, opts.params, scene.id)
     with _pool_lock:
         pool = _pool
-    if pool is not None:
-        try:
-            return pool.submit(_detect_job, *args).result()
-        except BrokenProcessPool:
-            log.warning("Detection worker processes stopped; continuing in this process")
-            with _pool_lock:
-                _pool = None
-    return _detect_job(*args)
+    rejected: Counter = Counter()
+    stats: dict = {}
+    progress = (lambda done, total: _progress(scene.id, done, total)) if _progress else None
+    dets = detect_scene(nir, str(scl_path), aoi, scene.nir_scale, scene.nir_offset, opts.params,
+                        rejected, stats, progress, pool)
+    if pool is not None and getattr(pool, "_broken", False):
+        with _pool_lock:
+            _pool = None  # the rest of the scan runs in this process
+    return dets, rejected, stats
 
 
 def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions) -> tuple[str, int]:
@@ -346,19 +318,9 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
 
     global _pool, _progress
     _progress = tile_progress
-    queue = reader = None
     if opts.processes:
-        ctx = multiprocessing.get_context("spawn")
-        queue = ctx.Queue()
-
-        def read_progress() -> None:
-            while (item := queue.get()) is not None:
-                tile_progress(*item)
-
-        reader = threading.Thread(target=read_progress, daemon=True)
-        reader.start()
         with _pool_lock:
-            _pool = ProcessPoolExecutor(opts.workers, mp_context=ctx, initializer=_init_worker, initargs=(queue,))
+            _pool = ProcessPoolExecutor(opts.workers, mp_context=multiprocessing.get_context("spawn"))
     try:
         area = settings.area(opts.area) if opts.area else None
         aoi = area.geom if area else settings.search_area()
@@ -382,7 +344,7 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         note(f"Found {len(found)} images of {n_tiles} tiles; {len(scenes)} selected "
              f"({'most recent per tile' if opts.mode == 'latest' else 'every pass'}"
              f"{f', limited to {opts.limit}' if opts.limit else ''})")
-        note(f"Analysing {opts.workers} tiles at a time"
+        note(f"One tile at a time, analysed on {opts.workers} CPU cores"
              + ("" if opts.keep_tiles else "; reading only the sea in each image, no full downloads"))
         note(f"Sentinel-2 imaged {cov['fraction']:.0%} of {name} in this window "
              f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2)")
@@ -424,9 +386,6 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
             pool, _pool = _pool, None
         if pool is not None:
             pool.shutdown(cancel_futures=True)
-        if queue is not None:
-            queue.put(None)  # stop the progress reader
-            reader.join(timeout=5)
         _progress = None
         report.active.clear()
         if own_store:
@@ -469,7 +428,8 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
                 report.active.pop(sc.id, None)
 
     done_n = 0
-    with ThreadPoolExecutor(max_workers=max(1, opts.workers)) as pool:
+    # One tile at a time: it gets the whole connection, and its blocks every CPU core.
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futures = {pool.submit(work, sc): sc for sc in todo}
         for fut in as_completed(futures):
             sc = futures[fut]
