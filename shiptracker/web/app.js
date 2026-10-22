@@ -781,7 +781,10 @@ async function pollScan() {
   const name = currentArea(area).name || area || '';
   scanJob = {
     running, area,
-    text: running && r ? `scanning… ${r.processed + r.skipped + r.failed + r.already_done}/${r.found || '?'} tiles, ${r.ships} ships` : 'scanning…',
+    text: running && r ? `scanning… ${r.processed + r.skipped + r.failed + r.already_done}/${r.found || '?'} tiles done, ${r.ships} ships`
+      + (r.active && Object.keys(r.active).length
+        ? ` · now analysing ${Object.keys(r.active).length}: ${Object.values(r.active).map((v) => `${Math.round(v * 100)}%`).join(', ')}` : '')
+      : 'scanning…',
   };
   $('scan-state').textContent = running
     ? `${name}: ${scanJob.text}`

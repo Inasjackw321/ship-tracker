@@ -71,9 +71,11 @@ def clear_sea_fraction(scl_path, aoi: BaseGeometry) -> float:
 
 
 def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_offset: float,
-                 params: DetectParams | None = None, rejected=None, stats: dict | None = None) -> list[GeoDetection]:
+                 params: DetectParams | None = None, rejected=None, stats: dict | None = None,
+                 progress=None) -> list[GeoDetection]:
     """``stats`` (optional) receives how many processing blocks the tile has and how many
-    were read (the others are land, cloud, nodata or outside every area)."""
+    were read (the others are land, cloud, nodata or outside every area); ``progress``
+    (optional) is called as progress(blocks_done, blocks_total) while it runs."""
     p = params or DetectParams()
     results: list[GeoDetection] = []
     with rasterio.open(nir_path) as src, rasterio.open(scl_path) as scl_src:
@@ -88,6 +90,8 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
         for r0 in range(0, H, B):
             for c0 in range(0, W, B):
                 done += 1
+                if progress is not None:
+                    progress(done - 1, n_blocks)
                 rr0, cc0 = max(r0 - halo, 0), max(c0 - halo, 0)
                 rr1, cc1 = min(r0 + B + halo, H), min(c0 + B + halo, W)
                 win = Window(cc0, rr0, cc1 - cc0, rr1 - rr0)
@@ -130,6 +134,8 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                     results.append(_georef(d, src.transform, to_wgs))
                 if done % 10 == 0:
                     log.info("  block %d/%d, %d ships so far", done, n_blocks, len(results))
+    if progress is not None:
+        progress(n_blocks, n_blocks)
     if stats is not None:
         stats.update(blocks=n_blocks, read=read)
     return results

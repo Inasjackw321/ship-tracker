@@ -93,6 +93,10 @@ def gdal_options() -> dict:
         "GDAL_HTTP_MAX_RETRY": "6",
         "GDAL_HTTP_RETRY_DELAY": "2",
         "GDAL_HTTP_TIMEOUT": "120",
+        # A transfer that stalls (under 1 kB/s for a minute) is dropped and retried
+        # rather than left hanging.
+        "GDAL_HTTP_LOW_SPEED_TIME": "60",
+        "GDAL_HTTP_LOW_SPEED_LIMIT": "1000",
         "GDAL_HTTP_USERAGENT": "ship-tracker/2.0",
         "VSI_CACHE": "TRUE",
         "VSI_CACHE_SIZE": str(64 << 20),

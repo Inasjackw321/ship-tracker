@@ -72,6 +72,7 @@ class ScanReport:
     current: str = ""
     area: str = ""
     area_imaged: float | None = None  # share of the area with any Sentinel-2 imagery
+    active: dict = field(default_factory=dict)  # tile -> share of it analysed so far (0-1)
     log: list[str] = field(default_factory=list)
 
 
@@ -166,20 +167,41 @@ def auto_workers() -> int:
 
 _pool_lock = threading.Lock()
 _pool: ProcessPoolExecutor | None = None
+# Progress of tiles being analysed: worker processes put (tile, done, total) on a queue
+# (set by _init_worker); in this process it goes straight to _progress.
+_progress_q = None
+_progress: Callable[[str, int, int], None] | None = None
 
 
-def _detect_job(nir, scl_path, aoi, scale, offset, params):
-    """Runs in a worker process: detection over one tile, returning (ships, rejected)."""
+def _init_worker(q) -> None:
+    global _progress_q
+    _progress_q = q
+
+
+def _detect_job(nir, scl_path, aoi, scale, offset, params, scene_id=""):
+    """Runs in a worker process: detection over one tile, returning (ships, rejected, stats)."""
     rejected: Counter = Counter()
     stats: dict = {}
+    last = [-1]
+
+    def progress(done: int, total: int) -> None:
+        pct = int(100 * done / max(total, 1))
+        if pct - last[0] < 3 and done < total:
+            return
+        last[0] = pct
+        if _progress_q is not None:
+            _progress_q.put((scene_id, done, total))
+        elif _progress is not None:
+            _progress(scene_id, done, total)
+
     with gdal_env():
-        dets = detect_scene(nir, scl_path, aoi, scale, offset, params, rejected, stats)
+        dets = detect_scene(nir, scl_path, aoi, scale, offset, params, rejected, stats, progress)
     return dets, rejected, stats
 
 
 def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions):
     global _pool
-    args = (nir, str(scl_path), aoi, scene.nir_scale, scene.nir_offset, opts.params)
+    args = (nir, str(scl_path), aoi, scene.nir_scale, scene.nir_offset, opts.params, scene.id)
     with _pool_lock:
         pool = _pool
     if pool is not None:
@@ -310,10 +332,33 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
         if on_progress:
             on_progress(report)
 
-    global _pool
+    def tile_progress(scene_id: str, done: int, total: int) -> None:
+        share = done / max(total, 1)
+        with lock:
+            if scene_id not in report.active:
+                return
+            before = report.active[scene_id]
+            report.active[scene_id] = round(share, 3)
+        if int(share * 4) > int(before * 4) and share < 1:
+            log.info("  %s: %d%% analysed", scene_id, int(share * 4) * 25)
+        if on_progress:
+            on_progress(report)
+
+    global _pool, _progress
+    _progress = tile_progress
+    queue = reader = None
     if opts.processes:
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue()
+
+        def read_progress() -> None:
+            while (item := queue.get()) is not None:
+                tile_progress(*item)
+
+        reader = threading.Thread(target=read_progress, daemon=True)
+        reader.start()
         with _pool_lock:
-            _pool = ProcessPoolExecutor(opts.workers, mp_context=multiprocessing.get_context("spawn"))
+            _pool = ProcessPoolExecutor(opts.workers, mp_context=ctx, initializer=_init_worker, initargs=(queue,))
     try:
         area = settings.area(opts.area) if opts.area else None
         aoi = area.geom if area else settings.search_area()
@@ -379,6 +424,11 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
             pool, _pool = _pool, None
         if pool is not None:
             pool.shutdown(cancel_futures=True)
+        if queue is not None:
+            queue.put(None)  # stop the progress reader
+            reader.join(timeout=5)
+        _progress = None
+        report.active.clear()
         if own_store:
             store.close()
     return report
@@ -410,8 +460,13 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
     def work(sc: Scene):
         with lock:
             report.current = sc.id
+            report.active[sc.id] = 0.0
         note(f"start {sc.id} ({sc.datetime[:16]}, cloud {sc.cloud_cover}%)")
-        return process_scene(settings, store, sc, opts)
+        try:
+            return process_scene(settings, store, sc, opts)
+        finally:
+            with lock:
+                report.active.pop(sc.id, None)
 
     done_n = 0
     with ThreadPoolExecutor(max_workers=max(1, opts.workers)) as pool:
