@@ -71,7 +71,9 @@ def clear_sea_fraction(scl_path, aoi: BaseGeometry) -> float:
 
 
 def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_offset: float,
-                 params: DetectParams | None = None, rejected=None) -> list[GeoDetection]:
+                 params: DetectParams | None = None, rejected=None, stats: dict | None = None) -> list[GeoDetection]:
+    """``stats`` (optional) receives how many processing blocks the tile has and how many
+    were read (the others are land, cloud, nodata or outside every area)."""
     p = params or DetectParams()
     results: list[GeoDetection] = []
     with rasterio.open(nir_path) as src, rasterio.open(scl_path) as scl_src:
@@ -82,7 +84,7 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
         nodata = src.nodata if src.nodata is not None else 0
         B, halo = p.block, p.halo
         n_blocks = math.ceil(H / B) * math.ceil(W / B)
-        done = 0
+        done = read = 0
         for r0 in range(0, H, B):
             for c0 in range(0, W, B):
                 done += 1
@@ -101,6 +103,7 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                 if not ((scl == SCL_WATER) & aoi_mask).any():
                     continue
                 dn = src.read(1, window=win)
+                read += 1
                 valid = dn != nodata
                 # Treat the outer rim of the tile like nodata: edge artifacts live there,
                 # and the overlapping neighbour tile sees that strip from its interior.
@@ -127,6 +130,8 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                     results.append(_georef(d, src.transform, to_wgs))
                 if done % 10 == 0:
                     log.info("  block %d/%d, %d ships so far", done, n_blocks, len(results))
+    if stats is not None:
+        stats.update(blocks=n_blocks, read=read)
     return results
 
 

@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("areas", help="list the areas you can scan")
+    sub.add_parser("check", help="test step by step that imagery can be found and downloaded")
     p = sub.add_parser("reset", help="delete all tracked ships and start fresh")
     p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
 
@@ -97,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         for a in settings.areas():
             print(f"  {a.id:18s} {a.name}  ({a.group})")
         return 0
+
+    if args.cmd == "check":
+        from .check import run_check
+        return run_check(settings, say=lambda *a, **k: print(*a, **k, flush=True))
 
     if args.cmd == "reset":
         from .db import Store

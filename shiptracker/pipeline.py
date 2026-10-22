@@ -171,9 +171,10 @@ _pool: ProcessPoolExecutor | None = None
 def _detect_job(nir, scl_path, aoi, scale, offset, params):
     """Runs in a worker process: detection over one tile, returning (ships, rejected)."""
     rejected: Counter = Counter()
+    stats: dict = {}
     with gdal_env():
-        dets = detect_scene(nir, scl_path, aoi, scale, offset, params, rejected)
-    return dets, rejected
+        dets = detect_scene(nir, scl_path, aoi, scale, offset, params, rejected, stats)
+    return dets, rejected, stats
 
 
 def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions):
@@ -220,13 +221,13 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
         if stream:
             nir = remote_href(scene.nir_href, src_cfg)
             try:
-                dets, rejected = _detect(nir, scl_path, aoi, scene, opts)
+                dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
             except RasterioIOError as exc:
                 log.warning("  streaming %s failed (%s); downloading the whole file instead", scene.id, exc)
                 stream = False
         if not stream:
             nir = str(download_file(scene.nir_href, sdir / "B08.tif", src_cfg))
-            dets, rejected = _detect(nir, scl_path, aoi, scene, opts)
+            dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
 
         tci = None
         if dets and opts.rgb_chips and scene.rgb_href:
@@ -258,7 +259,9 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
                      sea_fraction=sea, n_ships=added, detector_version=DETECTOR_VERSION, covered=covered)
     if not opts.keep_tiles:
         remove_scene(settings.tiles_dir, scene.id)
-    return "done", added
+    read = stats.get("read", 0) / max(stats.get("blocks", 1), 1)
+    return "done", added, (f"{'streamed' if stream else 'downloaded'} {read:.0%} of the image "
+                           "(the sea in your areas)")
 
 
 def _covered(aoi: BaseGeometry, scene: Scene) -> dict | None:
@@ -418,7 +421,7 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
             done_n += 1
             prefix = f"[{done_n}/{len(todo)}] {sc.id}"
             try:
-                status, added = fut.result()
+                status, added, *info = fut.result()
             except Exception as exc:
                 log.exception("Scene %s failed", sc.id)
                 store.save_scene(sc, "failed", str(exc)[:500])
@@ -434,5 +437,6 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
                 else:
                     report.processed += 1
                     report.ships += added
-            note(f"{prefix}: " + ("no clear sea (cloud/land)" if status == "skipped" else f"{added} ships"))
+            note(f"{prefix}: " + ("no clear sea (cloud/land), nothing more downloaded" if status == "skipped"
+                                  else f"{added} ships" + (f"; {info[0]}" if info else "")))
 

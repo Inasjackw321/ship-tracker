@@ -66,6 +66,7 @@ You don't need any accounts or API keys. Imagery comes from the public [Element 
 | Command | What it does |
 |---|---|
 | `areas` | List the area ids |
+| `check` | Test step by step that imagery can be found, downloaded and streamed |
 | `reset [--yes]` | Delete all tracked ships, images and scan history (asks first unless `--yes`) |
 | `search AREA [--start D --end D \| --days N] [--max-cloud P]` | List scenes intersecting the area |
 | `scan AREA [same] [--limit N] [--all-passes] [--workers N] [--no-rgb] [--keep-tiles] [--reprocess]` | Download, detect and store. By default this is the newest image of every tile, covering the area once. |
@@ -83,7 +84,7 @@ Sentinel-2 images are cloud-optimised GeoTIFFs, so a scan reads just the parts i
 2. **`B08`** (10 m near-infrared, 100–200 MB as a file) is where detection runs. It is read in 2 km blocks, and only blocks with clear sea inside your areas are fetched: land, cloud, nodata and anything outside the areas are never downloaded.
 3. **`TCI`** (10 m true colour, about 100 MB as a file) is read only in small patches around the ships found, for the colour checks and the image chips. Pass `--no-rgb` to skip it; chips then use the NIR band.
 
-Nothing large is written to disk. If streaming fails (an unusual proxy or firewall, for example), that tile falls back to downloading whole files, which resume after an interruption and are retried with backoff. `--keep-tiles` always downloads the whole files into `data/tiles/<scene-id>/` and keeps them. A scene that has already been processed is never processed again, so you can re-run `scan` safely.
+Nothing large is written to disk, so **`data\tiles` stays empty during a scan; that is normal**. The scan log says how much of each image was read, e.g. `streamed 64% of the image (the sea in your areas)`. If scans seem to download nothing, run `py run.py --check`: it tests the catalogue search, a download, streaming and a worker process one by one, and says exactly which step fails. If streaming fails (an unusual proxy or firewall, for example), that tile falls back to downloading whole files, which resume after an interruption and are retried with backoff. `--keep-tiles` always downloads the whole files into `data/tiles/<scene-id>/` and keeps them. A scene that has already been processed is never processed again, so you can re-run `scan` safely.
 
 ## How detection and measurement work (`shiptracker/detect.py`, `shiptracker/verify.py`)
 

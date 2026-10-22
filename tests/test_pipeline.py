@@ -392,6 +392,28 @@ def test_draw_your_own_area_and_scan_it(world, tmp_path):
     assert len(client.get("/api/detections").get_json()["features"]) == len(SHIPS)  # ships stay
 
 
+def test_connection_check(world, tmp_path):
+    """`py run.py --check` walks through catalogue search, SCL download and streaming."""
+    from shiptracker.check import run_check
+
+    settings, _, _ = world
+    first = tmp_path / "areas.geojson"
+    oman = settings.area(AREA)
+    from shapely.geometry import mapping
+    first.write_text(json.dumps({"type": "FeatureCollection", "features": [{"type": "Feature",
+        "properties": {"id": AREA, "name": oman.name, "group": oman.group}, "geometry": mapping(oman.geom)}]}))
+    settings.areas_path = first
+    out = []
+    assert run_check(settings, say=lambda *a, **k: out.append(" ".join(map(str, a)))) == 0
+    text = "\n".join(out)
+    assert "FAILED" not in text and "All good" in text and "512 x 512" in text
+
+    settings.stac_url = "http://127.0.0.1:9"  # nothing listening: the first step fails clearly
+    out.clear()
+    assert run_check(settings, say=lambda *a, **k: out.append(" ".join(map(str, a)))) == 1
+    assert any("FAILED" in line for line in out)
+
+
 def test_scan_api_requires_an_area(world):
     settings, _, _ = world
     client = create_app(settings).test_client()
