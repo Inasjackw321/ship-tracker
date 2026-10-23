@@ -35,3 +35,14 @@ def test_coverage_reports_unimaged_part():
     assert 0.45 < cov["fraction"] < 0.55
     assert cov["missing"] is not None
     assert imagery_coverage([], AOI)["fraction"] == 0.0
+
+
+def test_clear_image_preferred_over_newer_cloudy_one():
+    from dataclasses import replace
+    cloudy = replace(_scene("today-cloudy", "2026-10-08T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=45.0)
+    clear = replace(_scene("monday-clear", "2026-10-05T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=3.0)
+    older = replace(_scene("last-week-clear", "2026-10-01T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=0.5)
+    assert [s.id for s in select_latest_coverage([cloudy, clear, older], AOI)] == ["monday-clear"]
+    # no clear image at all: the newest one, as before
+    hazy = replace(older, id="old-hazy", cloud_cover=25.0)
+    assert [s.id for s in select_latest_coverage([cloudy, hazy], AOI)] == ["today-cloudy"]

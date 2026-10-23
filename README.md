@@ -170,6 +170,20 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `POST /api/detections/<id>/measurement/reset` | Back to the automatic measurement |
 | `POST /api/download.zip` `{ids: [...]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
 
+## Clouds
+
+Fair-weather cumulus over the sea is the main source of false ships. Clouds are told apart from ships by what physically differs:
+
+- **Shape.** Ships are long and narrow: real ones 60 m or longer are at least 3.8 × as long as they are wide, while cumulus puffs are about 2 ×. Objects of 60 m+ must be 3 × longer than wide, and 40–60 m objects 2.5 ×.
+- **Edges.** Hull ends are sharp, while clouds fade out.
+- **Brightness for size.** A 150 m+ or 40 m-wide ship has a bright deck and superstructure; long, faint streaks are cloud lines.
+- **Surroundings.** A roundish or soft object in a field of cloud is rejected. A long, narrow, sharp-edged one is kept even between clouds, so ships in partly cloudy weather are still found.
+- **Smoke and haze are not cloud.** Sentinel-2's "thin cirrus" class, where smoke and dust haze also end up, does not reject ships near it. It only hides the sea where it is bright enough to be real cloud.
+
+Each tile also uses the **newest image with at most 10 % cloud** in the look-back window, and only falls back to a cloudier image when there is none.
+
+The cloud checks run *before* the slow hull-model fit. A patch of cumulus used to take minutes to analyse; it now takes about a second. On a synthetic cumulus benchmark (`tests/bench_clouds.py`), false ships fell from 0.96 to 0.38 per 9 × 9 km scene, and ships on clear water between the clouds found rose from 64 % to 80 %. The cost: two ships moored side by side can merge into one fat blob and be rejected as cloud.
+
 ## How reliable are the measurements?
 
 Every ship has a **reliability** rating in its popup, list entry and downloaded image, with the reason:

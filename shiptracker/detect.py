@@ -36,14 +36,15 @@ log = logging.getLogger(__name__)
 # SCL classes: 0 nodata, 1 saturated/defective, 2 dark/topographic shadow,
 # 3 cloud shadow, 4 vegetation, 5 bare, 6 water, 7 unclassified,
 # 8 cloud medium prob, 9 cloud high prob, 10 thin cirrus, 11 snow.
-SCL_CLOUD = (1, 3, 8, 9, 10)
+SCL_CLOUD = (1, 3, 8, 9)       # plus SCL_THIN where it is bright (see build_masks)
+SCL_THIN = 10                  # "thin cirrus": also where Sen2Cor puts smoke and dust haze
 SCL_WATER = 6
 SCL_VEGETATION = 4
 SCL_SHADOW = (2, 3)
-SCL_CLOUDY = (3, 8, 9, 10)  # used for the "is there cloud around it?" test
+SCL_CLOUDY = (3, 8, 9)  # used for the "is there cloud around it?" test (not smoke or haze)
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 7
+DETECTOR_VERSION = 8
 
 
 @dataclass
@@ -69,8 +70,17 @@ class DetectParams:
     min_length_m: float = 25.0
     max_length_m: float = 420.0
     max_width_m: float = 90.0
-    min_aspect: float = 2.0    # applied to objects >= aspect_from_m long
+    min_aspect: float = 2.5    # length / beam, for objects >= aspect_from_m long ...
     aspect_from_m: float = 40.0
+    min_aspect_long: float = 3.0  # ... and for objects >= 60 m (real ships: > 3.8; cumulus ~2)
+    # Long, narrow and sharp-edged: a ship even with cloud around it, so the context tests
+    # (cloud nearby, clutter) are waived. Required length/beam by size, and edge softness.
+    ship_like_aspect: tuple = (3.0, 3.5, 4.0)   # < 40 m, 40-60 m, >= 60 m
+    ship_like_softness: tuple = (1.45, 1.45, 1.3)
+    min_big_contrast: float = 0.06  # objects >= 150 m: peak brightness above the water
+    min_wide_contrast: float = 0.1   # objects >= 40 m wide (only the biggest ships are): same
+    opaque_haze_refl: float = 0.08  # thin-cirrus pixels brighter than this (NIR) count as cloud
+    max_fit_px: int = 8000     # more pixels than any hull plus wake: not worth fitting
     # Context test: a ring around each object (gap px from the hull end, width px).
     # No seeds this close to the edge of the image data (swath edges, tile borders and
     # nodata gaps produce bright artifacts; overlapping neighbour tiles cover the strip).
@@ -153,7 +163,9 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
                 p: DetectParams) -> tuple[np.ndarray, np.ndarray]:
     """Return (search, sea, land): where to look for ship seeds, where hulls may extend,
     and land (including large clouds) that a hull must not touch."""
-    cloud_raw = np.isin(scl, SCL_CLOUD) & valid
+    # Thin cirrus is the class Sen2Cor gives smoke and dust haze too: only where it is
+    # bright enough to hide the sea is it treated as cloud; ships under haze stay visible.
+    cloud_raw = (np.isin(scl, SCL_CLOUD) | ((scl == SCL_THIN) & (refl > p.opaque_haze_refl))) & valid
     labels, sizes = _component_sizes(cloud_raw)
     cloud = (sizes >= p.min_cloud_px)[labels]
     if p.cloud_buffer_px and cloud.any():
@@ -550,7 +562,8 @@ def _ring(shape, r: float, c: float, inner: float, outer: float):
 
 
 def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
-                    p: DetectParams, pixel_m: float = 10.0, rejected: Counter | None = None) -> list[Detection]:
+                    p: DetectParams, pixel_m: float = 10.0, rejected: Counter | None = None,
+                    on_reject=None) -> list[Detection]:
     """Detect and measure ships in one in-memory block.
 
     refl: NIR (B08) reflectance; scl: SCL classes resampled to the same grid;
@@ -582,11 +595,44 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
     slices = ndimage.find_objects(labels)
     H, W = refl.shape
 
+    def size_class(length_m: float) -> int:
+        return 0 if length_m < p.aspect_from_m else 1 if length_m < 60 else 2
+
+    def min_aspect_for(length_m: float) -> float:
+        return 0.0 if length_m < p.aspect_from_m else p.min_aspect if length_m < 60 else p.min_aspect_long
+
+    def ship_like(length_m: float, width_m: float, softness: float) -> bool:
+        k = size_class(length_m)
+        return (length_m / max(width_m, 1e-6) >= p.ship_like_aspect[k]
+                and softness <= p.ship_like_softness[k])
+
+    def context(cr: float, cc_: float, length_px: float) -> str | None:
+        """A ship sits in clean water; clouds come in fields with more cloud, haze and
+        shadows around them. Look at a ring beyond the hull ends."""
+        inner = length_px / 2 + p.ring_gap_px
+        sl2, ring = _ring(refl.shape, cr, cc_, inner, inner + p.ring_width_px)
+        # Only sea and cloud count: bright land near the coast is not "clutter".
+        ring &= valid[sl2] & ~(land[sl2] & ~np.isin(scl[sl2], SCL_CLOUDY))
+        if ring.sum() <= 50:
+            return None
+        if float(np.isin(scl[sl2], SCL_CLOUDY)[ring].mean()) > p.max_ring_cloud:
+            return "cloud nearby"
+        if float(((excess[sl2] > p.min_contrast) & ~claimed[sl2])[ring].mean()) > p.max_ring_clutter:
+            return "cluttered (cloud/glint)"
+        return None
+
     for idx in np.argsort(-np.asarray(peaks)):
         lab = idx + 1
         sl = slices[idx]
         if sl is None:
             continue
+        here = ((sl[0].start + sl[0].stop) / 2, (sl[1].start + sl[1].stop) / 2)
+
+        def reject(why: str, here=here) -> None:
+            rejected[why] += 1
+            if on_reject is not None:
+                on_reject(why, *here)
+
         r0, r1 = max(sl[0].start - pad, 0), min(sl[0].stop + pad, H)
         c0, c1 = max(sl[1].start - pad, 0), min(sl[1].stop + pad, W)
         seed = labels[r0:r1, c0:c1] == lab
@@ -598,11 +644,34 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         grow &= ~_alongside(labels[r0:r1, c0:c1], seed)
         glab, _ = ndimage.label(grow | seed, structure=np.ones((3, 3)))
         hull = np.isin(glab, np.unique(glab[seed]))
+        brightest = float(ex[hull].max())  # including parts already claimed by a brighter seed
         hull &= ~claimed[r0:r1, c0:c1]
         claimed[r0:r1, c0:c1] |= hull
 
         m = measure(ex, hull, p)
         if m is None:
+            continue
+        # Cheap tests first, on the quick profile measurement (with margins, since the hull
+        # fit refines it): clouds and clutter are rejected without the costly model fit.
+        Lq, Wq = m["length_px"] * pixel_m, m["width_px"] * pixel_m
+        if m["length_px"] >= 1.15 * p.edge_test_from_px and m["softness"] > p.max_edge_softness:
+            reject("soft edges (cloud)")
+            continue
+        # Far bigger than any ship, even one trailing a long wake (which the first
+        # measurement still includes): cloud. Smaller objects are left to the fit.
+        if Lq > 3 * p.max_length_m or Wq > 2 * p.max_width_m or hull.sum() > p.max_fit_px:
+            reject("size")
+            continue
+        if Lq >= 1.2 * p.aspect_from_m and Lq / max(Wq, 1e-6) < 0.75 * min_aspect_for(Lq / 1.2):
+            reject("shape")
+            continue
+        # Hulls are surrounded by water: an object running into land/cloud is an edge.
+        if (ndimage.binary_dilation(hull, iterations=2) & land[r0:r1, c0:c1]).any():
+            reject("touches land/cloud")
+            continue
+        why = None if ship_like(Lq, Wq, m["softness"]) else context(m["row"] + r0, m["col"] + c0, m["length_px"])
+        if why:
+            reject(why)
             continue
         method = "profile"
         f = fit_hull(ex, hull, m, p) if p.model_fit and hull.sum() >= p.min_pixels else None
@@ -620,15 +689,20 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             length_err = math.hypot(1.5 * p.length_err_floor_m, 0.05 * length_m)
             width_err = math.hypot(2 * p.width_err_floor_m, 0.3 * width_m)
             width_err_stat = width_err
+        length_err_stat = length_err  # measurement noise only: what the size limits use
         soft_end = max(m.get("end_edges_px", (0.0, 0.0)))
         if m.get("wake_px"):
             length_err = math.hypot(length_err, p.wake_err_rel * m["wake_px"] * pixel_m)
         elif soft_end > p.wake_soft_end_px:
             length_err = math.hypot(length_err, p.soft_end_err_m * (soft_end - p.wake_soft_end_px))
         # Size limits respect the uncertainty: drop only what is confidently outside them.
-        if (length_m + length_err < p.min_length_m or length_m - length_err > p.max_length_m
+        if (length_m + length_err < p.min_length_m or length_m - length_err_stat > p.max_length_m
                 or width_m - width_err_stat > p.max_width_m):
-            rejected["size"] += 1
+            reject("size")
+            continue
+        # A big ship has a bright deck and superstructure; a long faint streak is cloud.
+        if (length_m >= 150 and brightest < p.min_big_contrast) or (width_m >= 40 and brightest < p.min_wide_contrast):
+            reject("faint for its size (cloud)")
             continue
         aspect = length_m / max(width_m, 1e-6)
         # No real ship of 150 m+ is more than ~9x as long as it is wide (supertankers ~5.5,
@@ -637,32 +711,16 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         implausible = length_m >= 150 and aspect > p.max_plausible_aspect
         if implausible:
             length_err = max(length_err, length_m - 7 * width_m)
-        if length_m >= p.aspect_from_m and aspect < p.min_aspect:
-            rejected["shape"] += 1
+        if aspect < min_aspect_for(length_m):
+            reject("shape")
             continue
-        # Hulls are surrounded by water: an object running into land/cloud is an edge.
         if m["length_px"] >= p.edge_test_from_px and m["softness"] > p.max_edge_softness:
-            rejected["soft edges (cloud)"] += 1
+            reject("soft edges (cloud)")
             continue
-        if (ndimage.binary_dilation(hull, iterations=2) & land[r0:r1, c0:c1]).any():
-            rejected["touches land/cloud"] += 1
+        why = None if ship_like(length_m, width_m, m["softness"]) else context(m["row"] + r0, m["col"] + c0, m["length_px"])
+        if why:
+            reject(why)
             continue
-        # A ship sits in clean water; clouds come in fields with more cloud, haze and
-        # shadows around them. Look at a ring beyond the hull ends.
-        cr, cc_ = m["row"] + r0, m["col"] + c0
-        inner = m["length_px"] / 2 + p.ring_gap_px
-        sl2, ring = _ring(refl.shape, cr, cc_, inner, inner + p.ring_width_px)
-        # Only sea and cloud count: bright land near the coast is not "clutter".
-        ring &= valid[sl2] & ~(land[sl2] & ~np.isin(scl[sl2], SCL_CLOUDY))
-        if ring.sum() > 50:
-            cloud_frac = float(np.isin(scl[sl2], SCL_CLOUDY)[ring].mean())
-            clutter = float(((excess[sl2] > p.min_contrast) & ~claimed[sl2])[ring].mean())
-            if cloud_frac > p.max_ring_cloud:
-                rejected["cloud nearby"] += 1
-                continue
-            if clutter > p.max_ring_clutter:
-                rejected["cluttered (cloud/glint)"] += 1
-                continue
         rr, cc = np.nonzero(hull)
         s = float(snr[r0:r1, c0:c1][hull].max())
         heading = math.degrees(math.atan2(m["axis_c"], -m["axis_r"])) % 180.0

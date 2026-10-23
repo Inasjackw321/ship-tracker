@@ -85,19 +85,31 @@ def area_km2(geom: BaseGeometry) -> float:
     return projected.area / 1e6
 
 
-def select_latest_coverage(scenes, aoi: BaseGeometry, min_gain: float = 0.02) -> list:
+CLEAR_CLOUD = 10.0  # % cloud: an image this clear is preferred over a newer, cloudier one
+
+
+def select_latest_coverage(scenes, aoi: BaseGeometry, min_gain: float = 0.02,
+                           clear_cloud: float | None = CLEAR_CLOUD) -> list:
     """For each MGRS tile, take the newest scenes until the tile's part of the area is covered.
 
-    A tile at the edge of an orbit swath is only partly imaged on each pass, so a
-    second (older) pass from the neighbouring orbit is added when it fills a gap.
-    Works on anything with ``id``, ``tile``, ``datetime`` and ``geometry``.
+    Images with at most ``clear_cloud`` % cloud come first (newest first), then the rest:
+    a clear image from a few days ago beats today's cloudy one, which costs time to analyse
+    and yields clouds rather than ships. A tile at the edge of an orbit swath is only
+    partly imaged on each pass, so a second pass from the neighbouring orbit is added
+    when it fills a gap. Works on anything with ``id``, ``tile``, ``datetime``,
+    ``geometry`` (and ``cloud_cover``).
     """
     by_tile: dict[str, list] = defaultdict(list)
     for sc in scenes:
         by_tile[sc.tile or sc.id].append(sc)
     chosen: list = []
+    def cloudy(sc) -> bool:
+        cc = getattr(sc, "cloud_cover", None)
+        return clear_cloud is not None and cc is not None and cc > clear_cloud
+
     for group in by_tile.values():
         group.sort(key=lambda sc: sc.datetime, reverse=True)
+        group.sort(key=cloudy)  # stable: clear images first, each part newest first
         geoms = [shape(sc.geometry).intersection(aoi) for sc in group]
         total = unary_union(geoms).area
         if total <= 0:
