@@ -105,6 +105,11 @@ class DetectParams:
     # Dark hull sides next to a bright deck, and how sharp the image is, change the beam
     # seen in the near-infrared by a share of the beam itself.
     width_err_rel: float = 0.15
+    # Under way, the hull/wake boundary is the least certain part of a measurement: a
+    # share of the wake's length, or of a gradually fading end (a wake not separated),
+    # goes into the length uncertainty.
+    wake_err_rel: float = 0.3
+    soft_end_err_m: float = 40.0  # metres per pixel of fade beyond the sharp-end threshold
 
 
 @dataclass
@@ -615,6 +620,11 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             length_err = math.hypot(1.5 * p.length_err_floor_m, 0.05 * length_m)
             width_err = math.hypot(2 * p.width_err_floor_m, 0.3 * width_m)
             width_err_stat = width_err
+        soft_end = max(m.get("end_edges_px", (0.0, 0.0)))
+        if m.get("wake_px"):
+            length_err = math.hypot(length_err, p.wake_err_rel * m["wake_px"] * pixel_m)
+        elif soft_end > p.wake_soft_end_px:
+            length_err = math.hypot(length_err, p.soft_end_err_m * (soft_end - p.wake_soft_end_px))
         # Size limits respect the uncertainty: drop only what is confidently outside them.
         if (length_m + length_err < p.min_length_m or length_m - length_err > p.max_length_m
                 or width_m - width_err_stat > p.max_width_m):

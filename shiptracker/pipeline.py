@@ -166,6 +166,10 @@ def auto_workers() -> int:
 
 _pool_lock = threading.Lock()
 _pool: ProcessPoolExecutor | None = None
+# Only one tile is analysed at a time (it gets the whole connection and every CPU core);
+# the next tile's small classification band, and the previous tile's colour checks and
+# ship images, are fetched alongside.
+_analyse_gate = threading.Semaphore(1)
 # Called as _progress(tile, blocks_done, blocks_total) while a tile is analysed.
 _progress: Callable[[str, int, int], None] | None = None
 
@@ -200,6 +204,7 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
     sdir = scene_dir(settings.tiles_dir, scene.id)
     covered = _covered(aoi, scene)
 
+    t0 = time.time()
     with gdal_env():
         scl_path = download_file(scene.scl_href, sdir / "SCL.tif", src_cfg)
         sea = clear_sea_fraction(scl_path, aoi)
@@ -211,18 +216,20 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
             return "skipped", 0
 
         stream = not opts.keep_tiles
-        log.info("  detecting ships (clear sea %.0f%%)", sea * 100)
-        if stream:
-            nir = remote_href(scene.nir_href, src_cfg)
-            try:
+        with _analyse_gate:
+            log.info("  detecting ships (clear sea %.0f%%)", sea * 100)
+            if stream:
+                nir = remote_href(scene.nir_href, src_cfg)
+                try:
+                    dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
+                except RasterioIOError as exc:
+                    log.warning("  streaming %s failed (%s); downloading the whole file instead", scene.id, exc)
+                    stream = False
+            if not stream:
+                nir = str(download_file(scene.nir_href, sdir / "B08.tif", src_cfg))
                 dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
-            except RasterioIOError as exc:
-                log.warning("  streaming %s failed (%s); downloading the whole file instead", scene.id, exc)
-                stream = False
-        if not stream:
-            nir = str(download_file(scene.nir_href, sdir / "B08.tif", src_cfg))
-            dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
 
+        t_detect = time.time()
         tci = None
         if dets and opts.rgb_chips and scene.rgb_href:
             try:
@@ -244,6 +251,8 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
                 log.warning("  true-colour image unreadable (%s); chips use NIR", exc)
                 paths = render_chips(nir, dets, out_dir, label)
             chips = [p.relative_to(settings.chips_dir).as_posix() if p else None for p in paths]
+        log.info("  %s: %.0f s (classification + ships %.0f s, colour checks and images %.0f s)",
+                 scene.id, time.time() - t0, t_detect - t0, time.time() - t_detect)
 
     store.delete_scene_detections(scene.id)  # replaces results of an earlier run
     added = store.add_detections(scene, dets, chips)
@@ -428,8 +437,9 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
                 report.active.pop(sc.id, None)
 
     done_n = 0
-    # One tile at a time: it gets the whole connection, and its blocks every CPU core.
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    # One tile is analysed at a time (see _analyse_gate); a second worker lets the next
+    # tile's preparation and the last tile's ship images overlap with it.
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {pool.submit(work, sc): sc for sc in todo}
         for fut in as_completed(futures):
             sc = futures[fut]

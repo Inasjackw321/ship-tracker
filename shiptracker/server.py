@@ -13,7 +13,7 @@ from flask import Flask, Response, abort, jsonify, request, send_file, send_from
 from shapely import contains_xy
 from shapely.geometry import mapping, shape
 
-from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path, quality
+from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path, quality, tif_index
 from .config import Settings
 from .db import Store
 from .aoi import CUSTOM_GROUP, Area, new_area_id, save_areas
@@ -21,7 +21,9 @@ from .pipeline import ScanOptions, ScanReport, area_km2, current_scene_ids, rese
 
 log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
-MAX_AREA_KM2 = 3_000_000  # larger than the biggest built-in area; more is a mistake
+MAX_AREA_KM2 = 3_000_000
+# Stored per ship but not needed by the map (kept in downloads and the database).
+_UNUSED = ("peak_reflectance", "contrast", "npix", "ts", "updated_at")  # larger than the biggest built-in area; more is a mistake
 
 
 def _feature(d: dict) -> dict:
@@ -48,6 +50,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
     settings.ensure_dirs()
     store = Store(settings.db_path)
     app = Flask(__name__, static_folder=None)
+    app.json.sort_keys = False  # sorting the keys of thousands of ships is wasted time
     job: dict = {"thread": None, "report": None, "error": None, "options": None}
 
     @app.get("/")
@@ -62,13 +65,24 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
     def chips(name):
         return send_from_directory(settings.chips_dir, name)
 
+    ids_cache: dict = {}
+
+    def latest_ids() -> set[str]:
+        """Scenes making up the "latest image per tile" view. Recomputed only when a tile
+        has been analysed (or an area drawn or removed) since the last time."""
+        row = store._query("SELECT COUNT(*), MAX(processed_at) FROM scenes")[0]
+        key = (row[0], row[1], tuple(a.id for a in settings.areas()))
+        if ids_cache.get("key") != key:
+            ids_cache.update(key=key, ids=current_scene_ids(store, settings.search_area()))
+        return ids_cache["ids"]
+
     def latest_view() -> bool:
         return request.args.get("view", "latest") != "all"
 
     @app.get("/api/detections")
     def detections():
         a = request.args
-        ids = current_scene_ids(store, settings.search_area()) if latest_view() else None
+        ids = latest_ids() if latest_view() else None
         try:
             rows = store.detections(
                 start=a.get("start") or None, end=a.get("end") or None,
@@ -81,16 +95,23 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
             )
         except ValueError as exc:
             abort(400, str(exc))
-        feats = [_feature(r) for r in rows]
-        for f in feats:  # tell the UI which ships have a clean GeoTIFF to download
-            f["properties"]["has_tif"] = geotiff_path(f["properties"], settings.chips_dir) is not None
+        tifs = tif_index(settings.chips_dir)  # which ships have a clean GeoTIFF to download
+        feats = []
+        for r in rows:
+            f = _feature(r)
+            props = f["properties"]
+            chip = props.get("chip")
+            props["has_tif"] = bool(chip) and chip[:-4] + ".tif" in tifs
+            for k in _UNUSED:
+                props.pop(k, None)
+            feats.append(f)
         return jsonify({"type": "FeatureCollection", "features": feats})
 
     @app.get("/api/scenes")
     def scenes():
         rows = store.scenes(int(request.args.get("limit", 5000)))
         if latest_view():
-            ids = current_scene_ids(store, settings.search_area())
+            ids = latest_ids()
             rows = [r for r in rows if r["id"] in ids]
         return jsonify(rows)
 
@@ -171,7 +192,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
     @app.get("/api/areas")
     def areas():
         """The areas, with their scan status and how many ships the map currently shows in each."""
-        ids = current_scene_ids(store, settings.search_area())
+        ids = latest_ids()
         ships = store.detections(scene_ids=ids)
         lons = [r["lon"] for r in ships]
         lats = [r["lat"] for r in ships]

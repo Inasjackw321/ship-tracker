@@ -270,9 +270,11 @@ function openShip(f) {
   const key = keyOf(f);
   const [lon, lat] = f.geometry.coordinates;
   if (openPopups.has(key)) { addToTray(f); return; }
+  closeAllPopups();  // one popup at a time (the tray keeps every ship opened)
+  map.closePopup();
   addToTray(f); // first, so the tray's height is known for panning
   const trayH = $('tray').hidden ? 0 : $('tray').offsetHeight;
-  const pop = L.popup({ autoClose: false, closeOnClick: false, maxWidth: 280, className: 'ship-popup',
+  const pop = L.popup({ autoClose: true, closeOnClick: true, maxWidth: 280, className: 'ship-popup',
     autoPanPaddingTopLeft: [20, 70], autoPanPaddingBottomRight: [20, trayH + 34] })
     .setLatLng([lat, lon])
     .setContent(popupHtml(f.properties, lat, lon));
@@ -767,6 +769,7 @@ async function loadScenes() {
 }
 
 let polling = null;
+let lastScanKey = null;
 let defaultsSet = false;
 async function pollScan() {
   const s = await getJSON('/api/scan');
@@ -783,7 +786,7 @@ async function pollScan() {
     running, area,
     text: running && r ? `scanning… ${r.processed + r.skipped + r.failed + r.already_done}/${r.found || '?'} tiles done, ${r.ships} ships`
       + (r.active && Object.keys(r.active).length
-        ? ` · now analysing ${Object.keys(r.active).length}: ${Object.values(r.active).map((v) => `${Math.round(v * 100)}%`).join(', ')}` : '')
+        ? ` · now analysing ${Object.keys(r.active).length}: ${Object.values(r.active).map((v) => (v >= 1 ? 'saving images' : `${Math.round(v * 100)}%`)).join(', ')}` : '')
       : 'scanning…',
   };
   $('scan-state').textContent = running
@@ -797,7 +800,12 @@ async function pollScan() {
   $('reset-btn').disabled = running;
   if (running) {
     if (!polling) polling = setInterval(() => pollScan().catch(console.error), 3000);
-    loadDetections(); loadStats(); loadScenes(); loadCoverage();
+    // Reload ships and tiles only when the scan has produced something new.
+    const key = r ? `${r.processed}/${r.skipped}/${r.failed}/${r.ships}/${r.found}` : '';
+    if (key !== lastScanKey) {
+      lastScanKey = key;
+      loadDetections(); loadStats(); loadScenes(); loadCoverage();
+    }
   } else if (polling) {
     clearInterval(polling); polling = null;
     loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadAreas();

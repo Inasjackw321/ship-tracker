@@ -101,3 +101,10 @@ def test_hard_conditions_error_bars_are_honest(hard):
     in_len = np.mean([abs(d.length_m - c["L"]) <= d.length_err_m for c, d in rows])
     in_beam = np.mean([abs(d.width_m - c["W"]) <= d.width_err_m for c, d in rows])
     assert in_len >= 0.75 and in_beam >= 0.7
+
+
+def test_moving_ships_error_bars_are_honest(moving):
+    """Where a wake meets the hull is the least certain part of a measurement; the +-
+    says so (it held only 45 % of true lengths before)."""
+    rows, _ = moving
+    assert np.mean([abs(d.length_m - c["L"]) <= d.length_err_m for c, d in rows]) >= 0.68

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import json
 import zipfile
 from pathlib import Path
@@ -158,6 +159,20 @@ def geotiff_path(rec: dict, chips_dir: Path) -> Path | None:
         return None
     p = (chips_dir / rec["chip"].replace("\\", "/")).with_suffix(".tif")
     return p if p.exists() else None
+
+
+def tif_index(chips_dir: Path) -> set[str]:
+    """Relative paths (scene/0001.tif) of every GeoTIFF chip, from one directory listing:
+    much faster than checking each ship's file separately."""
+    out: set[str] = set()
+    try:
+        scenes = list(os.scandir(chips_dir))
+    except OSError:
+        return out
+    for d in scenes:
+        if d.is_dir():
+            out.update(f"{d.name}/{f.name}" for f in os.scandir(d.path) if f.name.endswith(".tif"))
+    return out
 
 
 def bundle_zip(recs: list[dict], chips_dir: Path, clean: bool = False) -> bytes:

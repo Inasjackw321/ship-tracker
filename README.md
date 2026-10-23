@@ -36,7 +36,7 @@ Each area shows when it was last scanned, the image dates, how much of it Sentin
 
 **To start fresh**, press **Reset ships & start fresh** under the area list (or run `py run.py --reset`). It deletes every tracked ship, their images and the scan history, so the next scan of an area analyses all of its tiles again. You'll be asked to confirm first, and hand-adjusted measurements are deleted too.
 
-Tiles are scanned **one at a time**, so each gets your whole connection and its ships appear as soon as it is done. Within a tile, the image is read block by block and the blocks are analysed in parallel on your CPU cores (one worker process per core but one, 2–6). The sidebar shows how far the current tile has got. Images are **streamed** rather than downloaded: only the sea inside the area is read, plus small patches around each ship for the colour checks and image chips (see *What gets downloaded*). `py run.py --scan gulf-of-oman` also starts scanning that area straight away, and `py run.py --areas` lists the ids. Other options are `--days 45`, `--max-cloud 50`, `--workers 4` (CPU cores to use), `--all-passes` and `--keep-tiles` (download and keep the whole image files); they also apply to scans started from the map.
+Tiles are scanned **one at a time**, so each gets your whole connection and its ships appear as soon as it is done. Within a tile, the image is read block by block and the blocks are analysed in parallel on your CPU cores (one worker process per core but one, 2–6). While one tile is analysed, the next tile's small classification band and the previous tile's colour checks and ship images are fetched alongside, so the connection never sits idle. The sidebar shows how far the current tile has got. Images are **streamed** rather than downloaded: only the sea inside the area is read, plus small patches around each ship for the colour checks and image chips (see *What gets downloaded*). `py run.py --scan gulf-of-oman` also starts scanning that area straight away, and `py run.py --areas` lists the ids. Other options are `--days 45`, `--max-cloud 50`, `--workers 4` (CPU cores to use), `--all-passes` and `--keep-tiles` (download and keep the whole image files); they also apply to scans started from the map.
 
 ## Manual setup
 
@@ -178,7 +178,7 @@ Every ship has a **reliability** rating in its popup, list entry and downloaded 
 - **Fair**: usable, but less certain (e.g. a boat only 4–6 pixels long, or a wake separated from the hull).
 - **Rough**: treat as an estimate. Typical reasons are a hull only 2–3 pixels long, the hull model not fitting, or a shape so slender it may include a wake.
 
-**Measurement quality** under *Filter* hides the rough (or the fair) ones. The **±** after each size is a 1-sigma uncertainty, tested to be honest: on the hard benchmark 87 % of true lengths and 79 % of true beams fall inside it (a 1-sigma range should hold at least 68 %). The beam is the less certain of the two. Dark hull paint next to a bright deck looks like water in the near-infrared, so a beam can read narrower than it really is, never wider.
+**Measurement quality** under *Filter* hides the rough (or the fair) ones. The **±** after each size is a 1-sigma uncertainty, tested to be honest: on the hard benchmark 87 % of true lengths and 79 % of true beams fall inside it (a 1-sigma range should hold at least 68 %). The beam is the less certain of the two. For a ship under way, the point where the wake meets the stern is the least certain part, and the ± widens accordingly (72 % of true lengths within it on the moving-ship benchmark, up from 45 %). Dark hull paint next to a bright deck looks like water in the near-infrared, so a beam can read narrower than it really is, never wider.
 
 These numbers come from synthetic ships, not real ones with known sizes. Besides the standard benchmark, `tests/test_measure_accuracy.py` runs a **hard benchmark** of 200 ships:
 
@@ -207,7 +207,7 @@ It finds 189/200, with 1 gross length error (more than 15 % off) and a big-ship 
 
 ## Opening several ships, copying coordinates, downloading images
 
-- **Open as many ships as you like.** Click ships on the map, or in the list. Each opens its own popup, and opening one doesn't close the others. Popups also stay open while a scan refreshes the map.
+- **One popup at a time.** Clicking a ship on the map or in the list opens its popup and closes the previous one; clicking the map closes it. Every ship you open also stays in the tray below (see next point), so you can still compare several.
 - **Opened images tray.** Every ship you open also goes into a tray at the bottom of the map, so you can compare them side by side. Click a card's picture to fly back to that ship. The tray has these buttons:
   - **Copy all coordinates:** one line per ship, as `lat, lon<TAB>size<TAB>date`.
   - **Download all (.zip):** every image, the GeoTIFFs, `coordinates.csv` and `ships.kml` (opens in Google Earth).
