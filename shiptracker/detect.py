@@ -10,30 +10,41 @@ Method (per 10 m NIR band B08, where open water is dark and hulls are bright):
    the second excluding first-pass detections), giving a CFAR-style contrast test.
 3. Connected bright components are seeds; each seed is grown to all connected
    pixels brighter than a fraction of its peak excess, which captures the whole hull.
-4. Size: the hull orientation comes from PCA of the grown pixels. The excess image is
-   resampled onto a grid aligned with the hull; the along-axis and across-axis
-   intensity profiles give length and beam at a fixed fraction of the peak, with a
-   correction for the sensor's blur. This is the satellite equivalent of laying a
-   ruler bow-to-stern on the image.
+4. Size, first estimate: the hull orientation comes from PCA of the grown pixels; the
+   along- and across-hull intensity profiles give length and beam at a fixed fraction
+   of the deck level, corrected for the sensor's blur.
+5. Size, refined: a model of a hull (rectangle with a pointed bow, blurred exactly as
+   the 10 m sensor blurs) is fitted to the pixels by robust least squares, solving
+   for centre, axis, length, beam and brightness together. This removes the bias of
+   the profile method (pointed bows read short; narrow beams read wide) and gives
+   an uncertainty for each size from the fit, plus a calibrated model-error floor.
 """
 from __future__ import annotations
 
 import logging
 import math
+from collections import Counter
 from dataclasses import asdict, dataclass
 
 import numpy as np
 from scipy import ndimage
-from scipy.special import ndtri
+from scipy.optimize import least_squares
+from scipy.special import ndtr, ndtri
 
 log = logging.getLogger(__name__)
 
 # SCL classes: 0 nodata, 1 saturated/defective, 2 dark/topographic shadow,
 # 3 cloud shadow, 4 vegetation, 5 bare, 6 water, 7 unclassified,
 # 8 cloud medium prob, 9 cloud high prob, 10 thin cirrus, 11 snow.
-SCL_CLOUD = (1, 3, 8, 9, 10)
+SCL_CLOUD = (1, 3, 8, 9)       # plus SCL_THIN where it is bright (see build_masks)
+SCL_THIN = 10                  # "thin cirrus": also where Sen2Cor puts smoke and dust haze
 SCL_WATER = 6
+SCL_VEGETATION = 4
 SCL_SHADOW = (2, 3)
+SCL_CLOUDY = (3, 8, 9)  # used for the "is there cloud around it?" test (not smoke or haze)
+
+# Bump when detection changes enough that old results should be recomputed.
+DETECTOR_VERSION = 8
 
 
 @dataclass
@@ -47,17 +58,68 @@ class DetectParams:
     grow_frac: float = 0.25    # grow seeds to this fraction of the peak excess
     profile_frac: float = 0.3  # profile level used for the ends of the hull
     psf_sigma_px: float = 0.53  # Sentinel-2 10 m PSF (Gaussian sigma, px)
-    coast_buffer_px: int = 3
+    coast_buffer_px: int = 5
     cloud_buffer_px: int = 10
     min_cloud_px: int = 400    # SCL cloud blobs smaller than this may be ships
-    max_hole_px: int = 3000    # enclosed non-water blobs smaller than this are sea
+    # Enclosed non-water blobs up to this size are treated as sea (they are usually the
+    # ships themselves). Kept close to the largest hull (~400 x 60 m plus blur) so that
+    # islets, sandbars and mangrove patches stay land.
+    max_hole_px: int = 600
     water_nir_max: float = 0.04
     min_pixels: int = 3
     min_length_m: float = 25.0
-    max_length_m: float = 500.0
+    max_length_m: float = 420.0
     max_width_m: float = 90.0
-    min_aspect: float = 2.0    # applied to objects >= aspect_from_m long
-    aspect_from_m: float = 50.0
+    min_aspect: float = 2.5    # length / beam, for objects >= aspect_from_m long ...
+    aspect_from_m: float = 40.0
+    min_aspect_long: float = 3.0  # ... and for objects >= 60 m (real ships: > 3.8; cumulus ~2)
+    # Long, narrow and sharp-edged: a ship even with cloud around it, so the context tests
+    # (cloud nearby, clutter) are waived. Required length/beam by size, and edge softness.
+    ship_like_aspect: tuple = (3.0, 3.5, 4.0)   # < 40 m, 40-60 m, >= 60 m
+    ship_like_softness: tuple = (1.45, 1.45, 1.3)
+    min_big_contrast: float = 0.06  # objects >= 150 m: peak brightness above the water
+    min_wide_contrast: float = 0.1   # objects >= 40 m wide (only the biggest ships are): same
+    opaque_haze_refl: float = 0.08  # thin-cirrus pixels brighter than this (NIR) count as cloud
+    max_fit_px: int = 8000     # more pixels than any hull plus wake: not worth fitting
+    # Context test: a ring around each object (gap px from the hull end, width px).
+    # No seeds this close to the edge of the image data (swath edges, tile borders and
+    # nodata gaps produce bright artifacts; overlapping neighbour tiles cover the strip).
+    edge_buffer_px: int = 30
+    ring_gap_px: int = 10
+    ring_width_px: int = 50
+    max_ring_cloud: float = 0.05    # share of SCL cloud/shadow pixels allowed in the ring
+    max_ring_clutter: float = 0.03  # share of other bright pixels allowed in the ring
+    # Hull ends are sharp; cloud puffs fade out. Ratio of the hull length measured at
+    # 30 % and at 70 % of the deck level: ~1.05-1.15 for hulls, ~1.4-1.5 for cloud puffs.
+    max_edge_softness: float = 1.35
+    edge_test_from_px: float = 8.0  # only for objects at least this long (px)
+    fill_vegetation_holes: bool = False  # never relabel vegetated islets/strips as sea
+    # Hull model fit (refines length/beam; see fit_hull) and its error model. The floors
+    # were calibrated on synthetic ships and set conservatively for real imagery.
+    model_fit: bool = True
+    wake_model: bool = True        # separate a moving ship's wake from its hull
+    wake_min_gain: float = 0.40    # the wake model must fit >= 40 % better to be used
+    # Bright, large hulls: fit the image blur too instead of assuming it, so a softer
+    # (or sharper) image than the nominal PSF does not widen (or shrink) the hull.
+    fit_blur: bool = True
+    blur_fit_min_snr: float = 15.0  # deck brightness / background noise
+    blur_fit_min_len_px: float = 15.0  # ~150 m: shorter hulls are too few pixels across
+    wake_soft_end_px: float = 1.5  # ...and is only tried when one end fades out this gradually
+    max_plausible_aspect: float = 9.5  # length/beam above this (150 m+) flags the length as doubtful
+    wake_min_length: float = 0.2   # wake fades over >= 0.2 x hull length (shorter = superstructure)
+    wake_max_brightness: float = 2.0  # wake at most 2 x the deck brightness
+    bow_taper: float = 0.12        # pointed part of the bow, as a fraction of length
+    length_err_floor_m: float = 4.0
+    length_err_rel: float = 0.015
+    width_err_floor_m: float = 3.0
+    # Dark hull sides next to a bright deck, and how sharp the image is, change the beam
+    # seen in the near-infrared by a share of the beam itself.
+    width_err_rel: float = 0.15
+    # Under way, the hull/wake boundary is the least certain part of a measurement: a
+    # share of the wake's length, or of a gradually fading end (a wake not separated),
+    # goes into the length uncertainty.
+    wake_err_rel: float = 0.3
+    soft_end_err_m: float = 40.0  # metres per pixel of fade beyond the sharp-end threshold
 
 
 @dataclass
@@ -76,6 +138,11 @@ class Detection:
     width_m: float = 0.0
     heading_deg: float = 0.0  # hull axis, degrees from grid north, 0-180
     confidence: float = 0.0
+    length_err_m: float = 0.0  # 1-sigma uncertainty
+    width_err_m: float = 0.0
+    method: str = "profile"    # "fit" (hull model) or "profile" (fallback)
+    wake_m: float = 0.0        # visible wake behind the stern (ship under way); 0 = none found
+    hull_nir_dn: float | None = None  # mean NIR DN over the hull (for the colour checks)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -94,8 +161,11 @@ def _component_sizes(mask: np.ndarray, structure=None) -> tuple[np.ndarray, np.n
 
 def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
                 p: DetectParams) -> tuple[np.ndarray, np.ndarray]:
-    """Return (search, sea): where to look for ship seeds, and where hulls may extend."""
-    cloud_raw = np.isin(scl, SCL_CLOUD) & valid
+    """Return (search, sea, land): where to look for ship seeds, where hulls may extend,
+    and land (including large clouds) that a hull must not touch."""
+    # Thin cirrus is the class Sen2Cor gives smoke and dust haze too: only where it is
+    # bright enough to hide the sea is it treated as cloud; ships under haze stay visible.
+    cloud_raw = (np.isin(scl, SCL_CLOUD) | ((scl == SCL_THIN) & (refl > p.opaque_haze_refl))) & valid
     labels, sizes = _component_sizes(cloud_raw)
     cloud = (sizes >= p.min_cloud_px)[labels]
     if p.cloud_buffer_px and cloud.any():
@@ -108,31 +178,113 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
     border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
     hole = sizes < p.max_hole_px
     hole[border] = False
+    if not p.fill_vegetation_holes:
+        veg = np.bincount(labels.ravel(), weights=(scl == SCL_VEGETATION).ravel(), minlength=sizes.size)
+        hole &= veg < 0.5 * np.maximum(sizes, 1)
     hole[0] = False
     sea = water | hole[labels]
 
     land = valid & ~sea
     if p.coast_buffer_px and land.any():
         land = ndimage.maximum_filter(land, size=2 * p.coast_buffer_px + 1)
+    land_raw = (valid & ~sea) | ~valid  # hulls may not touch land, big cloud or nodata
     search = sea & valid & aoi & ~land & ~cloud
-    return search, sea & valid & ~cloud
+    if p.edge_buffer_px and (~valid).any():
+        search &= ~ndimage.maximum_filter(~valid, size=2 * p.edge_buffer_px + 1)
+    return search, sea & valid & ~cloud, land_raw
 
 
 def _local_stats(img: np.ndarray, mask: np.ndarray, win: int):
+    """Mean, std and fill fraction of ``img`` over ``mask`` in a win x win moving window."""
     m = mask.astype(np.float32)
     x = img * m
     n = ndimage.uniform_filter(m, win)
     s1 = ndimage.uniform_filter(x, win)
-    s2 = ndimage.uniform_filter(x * img, win)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = s1 / n
-        var = s2 / n - mean * mean
-    std = np.sqrt(np.clip(var, 0, None))
-    return np.nan_to_num(mean), np.nan_to_num(std), n
+    x *= img
+    s2 = ndimage.uniform_filter(x, win)
+    ok = n > 0
+    mean = np.divide(s1, n, out=np.zeros_like(s1), where=ok)
+    var = np.divide(s2, n, out=np.zeros_like(s2), where=ok)
+    var -= mean * mean
+    np.clip(var, 0, None, out=var)
+    return mean, np.sqrt(var, out=var), n
 
 
-def _candidates(refl, search, bgmask, p: DetectParams):
-    mean, std, n = _local_stats(refl, bgmask, p.bg_window)
+def _update_stats(stats, img: np.ndarray, mask: np.ndarray, removed: np.ndarray, win: int) -> None:
+    """Recompute ``stats`` (from ``_local_stats``) in place after the pixels ``removed``
+    left ``mask``. Only windows that contain a removed pixel change, so only those are
+    recomputed, each from a crop with a full window of margin (exact, much faster)."""
+    h = win // 2
+    H, W = img.shape
+    zone = ndimage.maximum_filter(removed, size=win)
+    labels, _ = ndimage.label(zone)
+    for sl in ndimage.find_objects(labels):
+        r0, r1, c0, c1 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+        er0, er1, ec0, ec1 = max(r0 - h, 0), min(r1 + h, H), max(c0 - h, 0), min(c1 + h, W)
+        local = _local_stats(img[er0:er1, ec0:ec1], mask[er0:er1, ec0:ec1], win)
+        for full, part in zip(stats, local):
+            full[r0:r1, c0:c1] = part[r0 - er0:r1 - er0, c0 - ec0:c1 - ec0]
+
+
+def _coarse_background(refl: np.ndarray, mask: np.ndarray, block: int = 32) -> np.ndarray:
+    """Robust local water level: median per 32 px block, then a 3x3 median over blocks.
+
+    Unlike a moving mean, this is not pulled up by large bright objects (a 400 m ship
+    fills whole blocks, but not most of a 3x3 neighbourhood of them).
+    """
+    H, W = refl.shape
+    hb, wb = -(-H // block), -(-W // block)
+    pad = np.full((hb * block, wb * block), np.nan, np.float32)
+    pad[:H, :W] = np.where(mask, refl, np.nan)
+    blocks = pad.reshape(hb, block, wb, block).transpose(0, 2, 1, 3).reshape(hb * wb, -1)
+    nvalid = np.isfinite(blocks).sum(axis=1)
+    med = np.full(hb * wb, np.nan, np.float32)
+    full = nvalid == blocks.shape[1]
+    if full.any():  # open sea: plain median, much faster than nanmedian
+        med[full] = np.median(blocks[full], axis=1)
+    part = (nvalid > 0) & ~full
+    if part.any():  # coast and cloud edges
+        med[part] = np.nanmedian(blocks[part], axis=1)
+    med = med.reshape(hb, wb)
+    fill = np.nanmedian(med) if np.isfinite(med).any() else 0.0
+    med = np.where(np.isfinite(med), med, fill)
+    med = ndimage.median_filter(med, size=3, mode="nearest")
+    return np.repeat(np.repeat(med, block, 0), block, 1)[:H, :W]
+
+
+def _alongside(lab_win: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """Pixels of other detected objects lying beside this seed (a ship moored alongside or
+    passing close by), which its outline must not grow into. Objects in line with the
+    seed are left alone: wake foam trails straight behind the stern."""
+    out = np.zeros(seed.shape, bool)
+    others = np.unique(lab_win[(lab_win > 0) & ~seed])
+    rr, cc = np.nonzero(seed)
+    if not others.size or rr.size < 4:
+        return out
+    r0, c0 = rr.mean(), cc.mean()
+    cov = np.cov(np.vstack([rr - r0, cc - c0]))
+    evals, evecs = np.linalg.eigh(cov)
+    u = evecs[:, 1]
+    half_w = math.sqrt(12 * max(evals[0], 0.1)) / 2
+    for o in others:
+        orr, occ = np.nonzero(lab_win == o)
+        d = np.array([orr.mean() - r0, occ.mean() - c0])
+        along, perp = abs(d @ u), abs(d[0] * -u[1] + d[1] * u[0])
+        if perp > half_w + 1.5 and perp > 0.5 * along:
+            out |= lab_win == o
+    return out
+
+
+def _label_max(values: np.ndarray, labels: np.ndarray, n: int) -> np.ndarray:
+    """Maximum of ``values`` per label 1..n (same as ndimage.maximum, far faster here)."""
+    on = labels > 0
+    peaks = np.full(n, -np.inf, values.dtype)
+    np.maximum.at(peaks, labels[on] - 1, values[on])
+    return peaks
+
+
+def _candidates(refl, search, stats, p: DetectParams):
+    mean, std, n = stats
     excess = refl - mean
     snr = excess / np.maximum(std, p.std_floor)
     cand = search & (n > 0.25) & (snr > p.k_sigma) & (excess > p.min_contrast)
@@ -205,11 +357,41 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
     corr = 2 * z * sigma_eff
 
     along = grid.sum(axis=1)
-    ends = _crossings(along, s, p.profile_frac * _plateau(along))
+    level = p.profile_frac * _plateau(along)
+    ends = _crossings(along, s, level)
     if ends is None:
         return None
+    # A superstructure much brighter than the deck sets the "typical" level so high that
+    # the deck drops below it and only the superstructure is measured. If the measured
+    # span is far shorter than the detected hull, take the level from the whole hull.
+    proj = (rr - cr) * u[0] + (cc - cc0) * u[1]
+    extent = float(proj.max() - proj.min() + 1)
+    if ends[1] - ends[0] < 0.6 * extent:
+        on_hull = (s >= proj.min()) & (s <= proj.max())
+        level = p.profile_frac * float(np.median(along[on_hull]))
+        ends = _crossings(along, s, level) or ends
     s_lo, s_hi = ends
     length = max(s_hi - s_lo - corr, 1.0)
+    def end_edges(level70: float):
+        core = _crossings(along, s, level70)
+        if not core:
+            return None, (0.0, 0.0)
+        return max(core[1] - core[0], 0.5), (max(core[0] - s_lo, 0.0), max(s_hi - core[1], 0.0))
+
+    # How gradually each end fades (30 -> 70 % of the brightest part): a wake makes one
+    # end fade out slowly. Used to decide whether to try the hull-plus-wake model.
+    span, edges = end_edges(0.7 / p.profile_frac * level)
+    # Cloud test: how sharp is the sharper end? A moving ship's wake softens one end, but
+    # its bow stays sharp; a cloud is soft all round. When a superstructure is far
+    # brighter than the deck, judge against the deck's level over the whole hull, or the
+    # deck itself looks like the soft fade of a cloud. (Clouds are evenly bright, so for
+    # them the stricter test against the bright part applies.)
+    on_span = (s >= s_lo) & (s <= s_hi)
+    typical = float(np.median(along[on_span])) if on_span.any() else 0.0
+    soft_edges = edges
+    if typical > 0 and float(along.max()) >= 1.8 * typical:
+        span, soft_edges = end_edges(0.7 * typical)
+    softness = (span + 2 * min(soft_edges)) / span if span else 9.0
 
     inside = (S >= s_lo) & (S <= s_hi)
     across = np.where(inside, grid, 0).sum(axis=0)
@@ -225,7 +407,143 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
         "width_px": float(width),
         "axis_r": float(u[0]),
         "axis_c": float(u[1]),
+        "softness": float(softness),
+        "end_edges_px": edges,  # 30->70 % rise at each end; a wake makes one end long
     }
+
+
+def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float) -> np.ndarray:
+    """Blurred hull: a rectangle with a pointed bow (at +s if sign=1), convolved with a
+    Gaussian of width ``sigma`` px. Separable in the hull frame, so it is evaluated
+    analytically at pixel centres (no supersampling).
+
+    With 9 parameters a wake is added behind the stern: foam that starts at the stern
+    with brightness ``fa`` x the deck, fades exponentially over ``fl`` x the hull length,
+    and has its own width ``ww``. Expressing the wake relative to the hull keeps it
+    physical: a short, very bright blob is the superstructure, not a wake.
+    """
+    r0, c0, th, L, W, A = params[:6]
+    ur, uc = -math.cos(th), math.sin(th)  # along hull; th = axis angle from north
+    s = (rr - r0) * ur + (cc - c0) * uc
+    t = (rr - r0) * uc - (cc - c0) * ur
+    bow0 = L / 2 - taper * L
+    sb = sign * s
+    w = np.where(sb > bow0, W * np.clip(1 - (sb - bow0) / max(taper * L, 1e-6), 0.05, 1), W)
+    gs = ndtr((s + L / 2) / sigma) - ndtr((s - L / 2) / sigma)
+    gt = ndtr((t + w / 2) / sigma) - ndtr((t - w / 2) / sigma)
+    out = A * gs * gt
+    if len(params) > 6:
+        fa, fl, ww = params[6:]
+        aw, lam = fa * A, fl * L
+        d = -sb - L / 2  # distance behind the stern (px)
+        onset = ndtr(d / sigma)
+        fade = np.exp(-np.clip(d, 0, None) / max(lam, 1e-3))
+        out = out + aw * onset * fade * (ndtr((t + ww / 2) / sigma) - ndtr((t - ww / 2) / sigma))
+    return out
+
+
+def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) -> dict | None:
+    """Refine length, beam, centre and axis by fitting the blurred hull model.
+
+    A moving ship trails a bright wake that would otherwise be measured as hull (a
+    150 m tanker reading 300 m+). When a hull-plus-wake model explains the pixels
+    clearly better, the wake is separated out and only the hull is measured.
+
+    Returns None (keep the profile estimate) when the fit fails or runs into its bounds.
+    """
+    region = ndimage.binary_dilation(mask, iterations=4)
+    around = region & ~ndimage.binary_dilation(mask, iterations=2)
+    vals = excess[around]
+    noise = float(1.4826 * np.median(np.abs(vals - np.median(vals)))) if vals.size > 10 else 0.003
+    rr, cc = np.nonzero(region)
+    y = excess[rr, cc].astype(np.float64)
+    sigma = math.sqrt(p.psf_sigma_px ** 2 + 1 / 12)  # optics + pixel footprint
+    th0 = math.atan2(init["axis_c"], -init["axis_r"])
+    ur, uc = -math.cos(th0), math.sin(th0)
+    L0, W0 = init["length_px"], max(init["width_px"], 1.0)
+    inside = mask[rr, cc]
+    A0 = max(float(np.percentile(y[inside], 60)) if inside.any() else float(y.max()), 0.01)
+    lb6 = np.array([init["row"] - 3, init["col"] - 3, th0 - 0.35, 1.5, 0.3, 0.003])
+    ub6 = np.array([init["row"] + 3, init["col"] + 3, th0 + 0.35, L0 * 1.6 + 4, max(W0 * 1.6, 3), 1.0])
+    f_scale = max(2 * noise, 0.004)
+
+    def solve(fun, x0, lb, ub):
+        try:
+            return least_squares(fun, np.clip(x0, lb + 1e-9, ub - 1e-9), bounds=(lb, ub), loss="soft_l1",
+                                 f_scale=f_scale, x_scale="jac")
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+
+    x0 = np.array([init["row"], init["col"], th0, L0 * 1.03, max(W0 * 0.7, 0.6), A0])
+    best, best_sign = None, 1
+    for sign in (1, -1):  # bow at either end
+        res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, x0, lb6, ub6)
+        if res is not None and res.success and (best is None or res.cost < best.cost):
+            best, best_sign = res, sign
+    if best is None:
+        return None
+
+    wake = None
+    soft_end = max(init.get("end_edges_px", (0.0, 0.0)))
+    if p.wake_model and L0 >= 6 and soft_end >= p.wake_soft_end_px:
+        # Wake behind the stern. The first estimate may include the wake, so also start
+        # from shorter hulls shifted towards the bow.
+        lbw = np.concatenate([lb6, [0.0, p.wake_min_length, 0.3]])
+        ubw = np.concatenate([ub6, [p.wake_max_brightness, 6.0, max(3 * W0, 4)]])
+        lbw[0] -= L0 / 2
+        lbw[1] -= L0 / 2
+        ubw[0] += L0 / 2
+        ubw[1] += L0 / 2
+        # The wake trails from the end that fades out; the bow is the other end.
+        # (Profile and model share the hull axis direction: +s is the "hi" end.)
+        e_lo, e_hi = init["end_edges_px"]
+        for sign in ((-1,) if e_hi > e_lo else (1,)):
+            for frac in (1.0, 0.6, 0.35):
+                Ls = L0 * frac
+                shift = sign * (L0 - Ls) / 2
+                xw = np.array([init["row"] + ur * shift, init["col"] + uc * shift, th0, Ls, max(W0 * 0.7, 0.6),
+                               A0, 0.5, max(1.0, p.wake_min_length * 1.5), W0])
+                res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, xw, lbw, ubw)
+                if res is not None and res.success and (wake is None or res.cost < wake[0].cost):
+                    wake = (res, sign)
+        # Keep the wake only if it explains the pixels clearly better than a plain hull
+        # and is a real tail (not a sliver of the hull itself).
+        if wake is not None:
+            res = wake[0]
+            fa = res.x[6]
+            plausible = res.x[3] >= 0.35 * best.x[3]  # a wake inflates a hull by ~1/3, not 5x
+            if res.cost < (1 - p.wake_min_gain) * best.cost and fa > 0.15 and plausible:
+                best = res
+            else:
+                wake = None
+
+    if (wake is None and p.fit_blur and L0 >= p.blur_fit_min_len_px
+            and A0 >= p.blur_fit_min_snr * max(noise, 1e-6)):
+        lb7, ub7 = np.append(lb6, 0.35), np.append(ub6, 1.3)
+        res = solve(lambda q: _hull_model(q[:6], rr, cc, p.bow_taper, best_sign, q[6]) - y,
+                    np.append(best.x, sigma), lb7, ub7)
+        if res is not None and res.success and lb7[6] + 0.01 < res.x[6] < ub7[6] - 0.01:
+            best = res
+
+    r0, c0, th, L, W, A = best.x[:6]
+    ub = ubw if wake is not None else ub6
+    if L >= ub[3] * 0.99 or W >= ub[4] * 0.99 or L < W:
+        return None
+    n_par = len(best.x)
+    dof = max(len(best.fun) - n_par, 1)
+    try:
+        cov = np.linalg.pinv(best.jac.T @ best.jac) * float(np.sum(best.fun ** 2) / dof)
+        sl, sw = math.sqrt(max(cov[3, 3], 0.0)), math.sqrt(max(cov[4, 4], 0.0))
+    except np.linalg.LinAlgError:
+        sl = sw = 0.5
+    ar, ac = -math.cos(th), math.sin(th)
+    if ar > 0:  # same canonical direction as the profile estimate
+        ar, ac = -ar, -ac
+    out = {"row": r0, "col": c0, "length_px": L, "width_px": W, "axis_r": ar, "axis_c": ac,
+           "sigma_length_px": sl, "sigma_width_px": sw, "wake_px": 0.0}
+    if wake is not None:
+        out["wake_px"] = float(3 * best.x[7] * L)  # visible wake length (~95 % faded)
+    return out
 
 
 def _confidence(snr: float, aspect: float, length_m: float) -> float:
@@ -233,37 +551,88 @@ def _confidence(snr: float, aspect: float, length_m: float) -> float:
     return round(float(np.clip(c, 0, 1)), 3)
 
 
+def _ring(shape, r: float, c: float, inner: float, outer: float):
+    """Slices and boolean ring mask (inner <= distance <= outer) around (r, c)."""
+    H, W = shape
+    r0, r1 = max(int(r - outer), 0), min(int(r + outer) + 1, H)
+    c0, c1 = max(int(c - outer), 0), min(int(c + outer) + 1, W)
+    yy, xx = np.mgrid[r0:r1, c0:c1]
+    d = np.hypot(yy - r, xx - c)
+    return (slice(r0, r1), slice(c0, c1)), (d >= inner) & (d <= outer)
+
+
 def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
-                    p: DetectParams, pixel_m: float = 10.0) -> list[Detection]:
+                    p: DetectParams, pixel_m: float = 10.0, rejected: Counter | None = None,
+                    on_reject=None) -> list[Detection]:
     """Detect and measure ships in one in-memory block.
 
     refl: NIR (B08) reflectance; scl: SCL classes resampled to the same grid;
     valid: data mask; aoi: True inside the area of interest.
+    ``rejected`` (optional) counts candidates dropped, by reason.
     """
-    search, sea = build_masks(refl, scl, valid, aoi, p)
+    rejected = rejected if rejected is not None else Counter()
+    search, sea, land = build_masks(refl, scl, valid, aoi, p)
     if not search.any():
         return []
 
-    cand, _, _ = _candidates(refl, search, search, p)
-    bgmask = search & ~ndimage.maximum_filter(cand, size=7) if cand.any() else search
-    cand, excess, snr = _candidates(refl, search, bgmask, p)
+    water_ok = search & (refl < _coarse_background(refl, search) + p.min_contrast)
+    stats = _local_stats(refl, water_ok, p.bg_window)
+    cand, _, _ = _candidates(refl, search, stats, p)
+    if cand.any():  # second pass: background statistics without the candidates themselves
+        removed = water_ok & ndimage.maximum_filter(cand, size=7)
+        _update_stats(stats, refl, water_ok & ~removed, removed, p.bg_window)
+    cand, excess, snr = _candidates(refl, search, stats, p)
     if not cand.any():
         return []
 
     labels, n = ndimage.label(cand, structure=np.ones((3, 3)))
-    peaks = ndimage.maximum(excess, labels, index=np.arange(1, n + 1))
+    peaks = _label_max(excess, labels, n)
     claimed = np.zeros(refl.shape, bool)
     out: list[Detection] = []
-    max_px = p.max_length_m / pixel_m
-    pad = int(max_px / 2) + 6
+    # Window around each seed: the seed may be only the brightest part of the hull
+    # (e.g. the superstructure at one end), so allow a full hull length either side.
+    pad = int(p.max_length_m / pixel_m) + 6
     slices = ndimage.find_objects(labels)
     H, W = refl.shape
+
+    def size_class(length_m: float) -> int:
+        return 0 if length_m < p.aspect_from_m else 1 if length_m < 60 else 2
+
+    def min_aspect_for(length_m: float) -> float:
+        return 0.0 if length_m < p.aspect_from_m else p.min_aspect if length_m < 60 else p.min_aspect_long
+
+    def ship_like(length_m: float, width_m: float, softness: float) -> bool:
+        k = size_class(length_m)
+        return (length_m / max(width_m, 1e-6) >= p.ship_like_aspect[k]
+                and softness <= p.ship_like_softness[k])
+
+    def context(cr: float, cc_: float, length_px: float) -> str | None:
+        """A ship sits in clean water; clouds come in fields with more cloud, haze and
+        shadows around them. Look at a ring beyond the hull ends."""
+        inner = length_px / 2 + p.ring_gap_px
+        sl2, ring = _ring(refl.shape, cr, cc_, inner, inner + p.ring_width_px)
+        # Only sea and cloud count: bright land near the coast is not "clutter".
+        ring &= valid[sl2] & ~(land[sl2] & ~np.isin(scl[sl2], SCL_CLOUDY))
+        if ring.sum() <= 50:
+            return None
+        if float(np.isin(scl[sl2], SCL_CLOUDY)[ring].mean()) > p.max_ring_cloud:
+            return "cloud nearby"
+        if float(((excess[sl2] > p.min_contrast) & ~claimed[sl2])[ring].mean()) > p.max_ring_clutter:
+            return "cluttered (cloud/glint)"
+        return None
 
     for idx in np.argsort(-np.asarray(peaks)):
         lab = idx + 1
         sl = slices[idx]
         if sl is None:
             continue
+        here = ((sl[0].start + sl[0].stop) / 2, (sl[1].start + sl[1].stop) / 2)
+
+        def reject(why: str, here=here) -> None:
+            rejected[why] += 1
+            if on_reject is not None:
+                on_reject(why, *here)
+
         r0, r1 = max(sl[0].start - pad, 0), min(sl[0].stop + pad, H)
         c0, c1 = max(sl[1].start - pad, 0), min(sl[1].stop + pad, W)
         seed = labels[r0:r1, c0:c1] == lab
@@ -272,19 +641,85 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         ex = excess[r0:r1, c0:c1]
         peak = float(peaks[idx])
         grow = (ex > max(p.grow_frac * peak, p.min_contrast / 2)) & sea[r0:r1, c0:c1]
+        grow &= ~_alongside(labels[r0:r1, c0:c1], seed)
         glab, _ = ndimage.label(grow | seed, structure=np.ones((3, 3)))
         hull = np.isin(glab, np.unique(glab[seed]))
+        brightest = float(ex[hull].max())  # including parts already claimed by a brighter seed
         hull &= ~claimed[r0:r1, c0:c1]
         claimed[r0:r1, c0:c1] |= hull
 
         m = measure(ex, hull, p)
         if m is None:
             continue
-        length_m, width_m = m["length_px"] * pixel_m, m["width_px"] * pixel_m
-        aspect = length_m / max(width_m, 1e-6)
-        if not (p.min_length_m <= length_m <= p.max_length_m) or width_m > p.max_width_m:
+        # Cheap tests first, on the quick profile measurement (with margins, since the hull
+        # fit refines it): clouds and clutter are rejected without the costly model fit.
+        Lq, Wq = m["length_px"] * pixel_m, m["width_px"] * pixel_m
+        if m["length_px"] >= 1.15 * p.edge_test_from_px and m["softness"] > p.max_edge_softness:
+            reject("soft edges (cloud)")
             continue
-        if length_m >= p.aspect_from_m and aspect < p.min_aspect:
+        # Far bigger than any ship, even one trailing a long wake (which the first
+        # measurement still includes): cloud. Smaller objects are left to the fit.
+        if Lq > 3 * p.max_length_m or Wq > 2 * p.max_width_m or hull.sum() > p.max_fit_px:
+            reject("size")
+            continue
+        if Lq >= 1.2 * p.aspect_from_m and Lq / max(Wq, 1e-6) < 0.75 * min_aspect_for(Lq / 1.2):
+            reject("shape")
+            continue
+        # Hulls are surrounded by water: an object running into land/cloud is an edge.
+        if (ndimage.binary_dilation(hull, iterations=2) & land[r0:r1, c0:c1]).any():
+            reject("touches land/cloud")
+            continue
+        why = None if ship_like(Lq, Wq, m["softness"]) else context(m["row"] + r0, m["col"] + c0, m["length_px"])
+        if why:
+            reject(why)
+            continue
+        method = "profile"
+        f = fit_hull(ex, hull, m, p) if p.model_fit and hull.sum() >= p.min_pixels else None
+        if f is not None:
+            m.update(f)
+            method = "fit"
+        length_m, width_m = m["length_px"] * pixel_m, m["width_px"] * pixel_m
+        if method == "fit":
+            length_err = math.hypot(m["sigma_length_px"] * pixel_m, p.length_err_floor_m, p.length_err_rel * length_m)
+            width_err_stat = math.hypot(m["sigma_width_px"] * pixel_m, p.width_err_floor_m)
+            # Dark hull sides only ever make the beam look narrower: this part of the
+            # uncertainty is reported but not used to let over-wide objects through.
+            width_err = math.hypot(width_err_stat, p.width_err_rel * width_m)
+        else:  # the profile method's own bias (bows short, beams wide) is folded in
+            length_err = math.hypot(1.5 * p.length_err_floor_m, 0.05 * length_m)
+            width_err = math.hypot(2 * p.width_err_floor_m, 0.3 * width_m)
+            width_err_stat = width_err
+        length_err_stat = length_err  # measurement noise only: what the size limits use
+        soft_end = max(m.get("end_edges_px", (0.0, 0.0)))
+        if m.get("wake_px"):
+            length_err = math.hypot(length_err, p.wake_err_rel * m["wake_px"] * pixel_m)
+        elif soft_end > p.wake_soft_end_px:
+            length_err = math.hypot(length_err, p.soft_end_err_m * (soft_end - p.wake_soft_end_px))
+        # Size limits respect the uncertainty: drop only what is confidently outside them.
+        if (length_m + length_err < p.min_length_m or length_m - length_err_stat > p.max_length_m
+                or width_m - width_err_stat > p.max_width_m):
+            reject("size")
+            continue
+        # A big ship has a bright deck and superstructure; a long faint streak is cloud.
+        if (length_m >= 150 and brightest < p.min_big_contrast) or (width_m >= 40 and brightest < p.min_wide_contrast):
+            reject("faint for its size (cloud)")
+            continue
+        aspect = length_m / max(width_m, 1e-6)
+        # No real ship of 150 m+ is more than ~9x as long as it is wide (supertankers ~5.5,
+        # container ships ~7). Longer and thinner means wake or streak still counted as
+        # hull: say so through a wider uncertainty and lower confidence.
+        implausible = length_m >= 150 and aspect > p.max_plausible_aspect
+        if implausible:
+            length_err = max(length_err, length_m - 7 * width_m)
+        if aspect < min_aspect_for(length_m):
+            reject("shape")
+            continue
+        if m["length_px"] >= p.edge_test_from_px and m["softness"] > p.max_edge_softness:
+            reject("soft edges (cloud)")
+            continue
+        why = None if ship_like(length_m, width_m, m["softness"]) else context(m["row"] + r0, m["col"] + c0, m["length_px"])
+        if why:
+            reject(why)
             continue
         rr, cc = np.nonzero(hull)
         s = float(snr[r0:r1, c0:c1][hull].max())
@@ -297,6 +732,8 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             contrast=peak, snr=s, npix=int(rr.size),
             length_m=round(length_m, 1), width_m=round(width_m, 1),
             heading_deg=round(heading, 1),
-            confidence=_confidence(s, aspect, length_m),
+            confidence=round(_confidence(s, aspect, length_m) * (0.6 if implausible else 1.0), 3),
+            length_err_m=round(length_err, 1), width_err_m=round(width_err, 1), method=method,
+            wake_m=round(m.get("wake_px", 0.0) * pixel_m, 0),
         ))
     return out

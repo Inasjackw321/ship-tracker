@@ -19,7 +19,8 @@ def _days_ago(n: int) -> str:
 def _add_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--start", default=None, help="start date YYYY-MM-DD (default: 7 days ago)")
     p.add_argument("--end", default=None, help="end date YYYY-MM-DD (default: today)")
-    p.add_argument("--days", type=int, default=7, help="look-back window when --start is omitted")
+    p.add_argument("--days", type=int, default=30,
+                   help="look-back window when --start is omitted (each tile uses its latest image in it)")
     p.add_argument("--max-cloud", type=float, default=30.0, help="max scene cloud cover %% (default 30)")
     p.add_argument("--limit", type=int, default=None, help="process at most N scenes (newest first)")
 
@@ -28,8 +29,8 @@ def _settings(args) -> Settings:
     s = Settings()
     if args.data:
         s.data_dir = Path(args.data)
-    if args.aoi:
-        s.aoi_path = Path(args.aoi)
+    if args.areas_file:
+        s.areas_path = Path(args.areas_file)
     if args.source:
         s.source = args.source
     return s
@@ -38,27 +39,43 @@ def _settings(args) -> Settings:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="shiptracker", description="Sentinel-2 ship detection and sizing")
     ap.add_argument("--data", help="data directory (tiles, chips, database)")
-    ap.add_argument("--aoi", help="AOI GeoJSON (default: config/aoi.geojson)")
+    ap.add_argument("--areas-file", help="areas GeoJSON (default: config/areas.geojson)")
     ap.add_argument("--source", choices=sorted(SOURCES), help="imagery source (default: earth-search)")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("search", help="list Sentinel-2 scenes over the area (no download)")
+    sub.add_parser("areas", help="list the areas you can scan")
+    sub.add_parser("check", help="test step by step that imagery can be found and downloaded")
+    p = sub.add_parser("reset", help="delete all tracked ships and start fresh")
+    p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+
+    p = sub.add_parser("search", help="list Sentinel-2 scenes over an area (no download)")
+    p.add_argument("area", help="area id (see: shiptracker areas)")
     _add_scan_args(p)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--all-passes", action="store_true", help="list every pass, not just the newest per tile")
 
-    p = sub.add_parser("scan", help="download tiles, detect and measure ships")
+    p = sub.add_parser("scan", help="download tiles of one area, detect and measure ships")
+    p.add_argument("area", help="area id (see: shiptracker areas)")
     _add_scan_args(p)
     p.add_argument("--no-rgb", action="store_true", help="skip the true-colour download; chips use NIR")
-    p.add_argument("--delete-tiles", action="store_true", help="delete each tile after it is processed")
+    p.add_argument("--keep-tiles", action="store_true",
+                   help="download whole image files into data/tiles and keep them (default: stream only what is needed)")
+    p.add_argument("--delete-tiles", action="store_true", help=argparse.SUPPRESS)  # the default now
     p.add_argument("--reprocess", action="store_true", help="re-run scenes that were already processed")
+    p.add_argument("--all-passes", action="store_true",
+                   help="scan every pass in the date range, not just the newest image of each tile")
+    p.add_argument("--workers", type=int, default=0, help="CPU cores used to analyse each tile (default: automatic)")
 
-    p = sub.add_parser("watch", help="scan for new imagery repeatedly")
+    p = sub.add_parser("watch", help="scan one area for new imagery repeatedly")
+    p.add_argument("area", help="area id (see: shiptracker areas)")
     p.add_argument("--every-hours", type=float, default=6.0)
-    p.add_argument("--days", type=int, default=3, help="look-back window on each run")
+    p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--days", type=int, default=30, help="look-back window on each run")
     p.add_argument("--max-cloud", type=float, default=30.0)
     p.add_argument("--no-rgb", action="store_true")
-    p.add_argument("--delete-tiles", action="store_true")
+    p.add_argument("--keep-tiles", action="store_true")
+    p.add_argument("--delete-tiles", action="store_true", help=argparse.SUPPRESS)
 
     p = sub.add_parser("detect", help="run detection on local B08 + SCL GeoTIFFs")
     p.add_argument("nir", help="B08 (10 m NIR) GeoTIFF")
@@ -77,13 +94,43 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     settings = _settings(args)
 
+    if args.cmd == "areas":
+        for a in settings.areas():
+            print(f"  {a.id:18s} {a.name}  ({a.group})")
+        return 0
+
+    if args.cmd == "check":
+        from .check import run_check
+        return run_check(settings, say=lambda *a, **k: print(*a, **k, flush=True))
+
+    if args.cmd == "reset":
+        from .db import Store
+        from .pipeline import reset_data
+        store = Store(settings.db_path)
+        n = store.stats()["detections"]
+        if not args.yes and input(f"Delete all {n} tracked ships, their images and scan history? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing deleted.")
+            return 1
+        removed = reset_data(settings, store)
+        store.close()
+        print(f"Deleted {removed['ships']} ships from {removed['tiles']} tiles. Starting fresh.")
+        return 0
+
+    if args.cmd in ("search", "scan", "watch"):
+        try:
+            settings.area(args.area)
+        except KeyError as exc:
+            print(exc.args[0])
+            return 2
+
     if args.cmd in ("search", "scan"):
         from .pipeline import ScanOptions, find_scenes, scan
         opts = ScanOptions(
             start=args.start or _days_ago(args.days), end=args.end or date.today().isoformat(),
-            max_cloud=args.max_cloud, limit=args.limit,
+            max_cloud=args.max_cloud, limit=args.limit, area=args.area,
         )
         if args.cmd == "search":
+            opts.mode = "all" if args.all_passes else "latest"
             scenes = find_scenes(settings, opts)
             if args.json:
                 print(json.dumps([s.to_dict() for s in scenes], indent=2))
@@ -94,8 +141,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{len(scenes)} scenes")
             return 0
         opts.rgb_chips = not args.no_rgb
-        opts.keep_tiles = not args.delete_tiles
+        opts.keep_tiles = args.keep_tiles
         opts.reprocess = args.reprocess
+        opts.mode = "all" if args.all_passes else "latest"
+        opts.workers = args.workers
         rep = scan(settings, opts)
         return 1 if rep.failed and not rep.processed else 0
 
@@ -105,7 +154,8 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.now(timezone.utc)
             opts = ScanOptions(start=(now - timedelta(days=args.days)).date().isoformat(),
                                end=now.date().isoformat(), max_cloud=args.max_cloud,
-                               rgb_chips=not args.no_rgb, keep_tiles=not args.delete_tiles)
+                               rgb_chips=not args.no_rgb, keep_tiles=args.keep_tiles,
+                               workers=args.workers, area=args.area)
             try:
                 scan(settings, opts)
             except Exception:
@@ -114,10 +164,10 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(args.every_hours * 3600)
 
     if args.cmd == "detect":
-        from .aoi import load_aoi
+
         from .chips import render_chips
         from .scene import detect_scene
-        dets = detect_scene(args.nir, args.scl, load_aoi(settings.aoi_path), args.scale, args.offset)
+        dets = detect_scene(args.nir, args.scl, settings.search_area(), args.scale, args.offset)
         if args.chips:
             render_chips(Path(args.rgb or args.nir), dets, Path(args.chips))
         out = [{"lon": round(g.lon, 6), "lat": round(g.lat, 6), "length_m": g.det.length_m,

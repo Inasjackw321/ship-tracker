@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS scenes (
     note TEXT,
     n_ships INTEGER DEFAULT 0,
     processed_at REAL,
-    geometry TEXT
+    detector_version INTEGER DEFAULT 1,
+    geometry TEXT,
+    covered TEXT                   -- GeoJSON: the part of the tile that was analysed
 );
 CREATE TABLE IF NOT EXISTS detections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +43,17 @@ CREATE TABLE IF NOT EXISTS detections (
     npix INTEGER,
     confidence REAL,
     stationary INTEGER DEFAULT 0,  -- seen at the same spot on another date
-    chip TEXT
+    chip TEXT,
+    length_err_m REAL,             -- 1-sigma uncertainty
+    width_err_m REAL,
+    method TEXT,                   -- fit | profile | manual
+    auto_json TEXT,                -- the automatic measurement, kept when adjusted by hand
+    wake_m REAL,                   -- wake behind the stern: the ship was under way
+    updated_at REAL
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_det_ts ON detections(ts);
 CREATE INDEX IF NOT EXISTS idx_det_pos ON detections(lat, lon);
@@ -66,36 +78,73 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # one connection shared by scan workers and web requests
         with self.lock:
             self.conn.executescript(SCHEMA)
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(scenes)")}
+            if "detector_version" not in cols:  # databases from before versioning
+                self.conn.execute("ALTER TABLE scenes ADD COLUMN detector_version INTEGER DEFAULT 1")
+            if "covered" not in cols:  # databases from before areas could be drawn
+                self.conn.execute("ALTER TABLE scenes ADD COLUMN covered TEXT")
+            dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(detections)")}
+            for name, typ in (("length_err_m", "REAL"), ("width_err_m", "REAL"), ("method", "TEXT"),
+                              ("auto_json", "TEXT"), ("updated_at", "REAL"), ("wake_m", "REAL")):
+                if name not in dcols:  # databases from before measurement uncertainties
+                    self.conn.execute(f"ALTER TABLE detections ADD COLUMN {name} {typ}")
+            self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
 
     # scenes ---------------------------------------------------------------
 
+    def _query(self, sql: str, args=()) -> list[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute(sql, args).fetchall()
+
+    def set_meta(self, key: str, value) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+
+    def delete_meta(self, key: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
+    def get_meta(self, key: str, default=None):
+        rows = self._query("SELECT value FROM meta WHERE key=?", (key,))
+        return json.loads(rows[0]["value"]) if rows else default
+
     def scene_status(self, scene_id: str) -> str | None:
-        row = self.conn.execute("SELECT status FROM scenes WHERE id=?", (scene_id,)).fetchone()
+        rows = self._query("SELECT status FROM scenes WHERE id=?", (scene_id,))
+        row = rows[0] if rows else None
         return row["status"] if row else None
 
+    def scene_version(self, scene_id: str) -> int:
+        rows = self._query("SELECT detector_version FROM scenes WHERE id=?", (scene_id,))
+        return int(rows[0]["detector_version"] or 1) if rows else 0
+
     def save_scene(self, scene, status: str, note: str = "", sea_fraction: float | None = None,
-                   n_ships: int = 0) -> None:
+                   n_ships: int = 0, detector_version: int = 1, covered: dict | None = None) -> None:
         with self.lock, self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO scenes
                    (id, datetime, ts, tile, cloud_cover, aoi_overlap, sea_fraction, status, note,
-                    n_ships, processed_at, geometry)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    n_ships, processed_at, detector_version, geometry, covered)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scene.id, scene.datetime, _ts(scene.datetime), scene.tile, scene.cloud_cover,
                  scene.aoi_overlap, sea_fraction, status, note, n_ships, time.time(),
-                 json.dumps(scene.geometry)),
+                 detector_version, json.dumps(scene.geometry), json.dumps(covered) if covered else None),
             )
 
+    def scene_covered(self, scene_id: str) -> dict | None:
+        """GeoJSON of the part of a tile that was analysed (None for older records)."""
+        rows = self._query("SELECT covered FROM scenes WHERE id=?", (scene_id,))
+        return json.loads(rows[0]["covered"]) if rows and rows[0]["covered"] else None
+
     def scenes(self, limit: int = 500) -> list[dict]:
-        rows = self.conn.execute(
+        rows = self._query(
             "SELECT id, datetime, tile, cloud_cover, aoi_overlap, sea_fraction, status, note, n_ships,"
-            " processed_at, geometry FROM scenes ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            " processed_at, geometry FROM scenes ORDER BY ts DESC LIMIT ?", (limit,))
         out = []
         for r in rows:
             d = dict(r)
@@ -133,14 +182,24 @@ class Store:
                     """INSERT INTO detections
                        (scene_id, datetime, ts, lon, lat, length_m, width_m, heading_deg,
                         bow_lon, bow_lat, stern_lon, stern_lat, peak_reflectance, contrast, snr,
-                        npix, confidence, stationary, chip)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        npix, confidence, stationary, chip, length_err_m, width_err_m, method, wake_m)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (scene.id, scene.datetime, ts, g.lon, g.lat, d.length_m, d.width_m, d.heading_deg,
                      g.bow_lon, g.bow_lat, g.stern_lon, g.stern_lat, round(d.peak_reflectance, 4),
-                     round(d.contrast, 4), round(d.snr, 1), d.npix, d.confidence, int(bool(seen)), chip),
+                     round(d.contrast, 4), round(d.snr, 1), d.npix, d.confidence, int(bool(seen)), chip,
+                     d.length_err_m, d.width_err_m, d.method, d.wake_m),
                 )
                 added += 1
         return added
+
+    def reset(self) -> dict:
+        """Forget every ship, analysed tile and area status. Returns what was removed."""
+        with self.lock, self.conn:
+            ships = self.conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+            scenes = self.conn.execute("SELECT COUNT(*) FROM scenes").fetchone()[0]
+            for table in ("detections", "scenes", "meta"):
+                self.conn.execute(f"DELETE FROM {table}")
+        return {"ships": ships, "tiles": scenes}
 
     def delete_scene_detections(self, scene_id: str) -> None:
         with self.lock, self.conn:
@@ -148,9 +207,14 @@ class Store:
 
     def detections(self, start: str | None = None, end: str | None = None, min_length: float = 0,
                    max_length: float = 1e9, min_confidence: float = 0, include_stationary: bool = True,
-                   limit: int = 20000) -> list[dict]:
+                   limit: int = 20000, scene_ids: set[str] | None = None) -> list[dict]:
         q = ["SELECT * FROM detections WHERE length_m BETWEEN ? AND ? AND confidence >= ?"]
         args: list = [min_length, max_length, min_confidence]
+        if scene_ids is not None:
+            if not scene_ids:
+                return []
+            q.append(f"AND scene_id IN ({','.join('?' * len(scene_ids))})")
+            args.extend(sorted(scene_ids))
         if start:
             q.append("AND ts >= ?")
             args.append(_ts(start if "T" in start else start + "T00:00:00+00:00"))
@@ -161,15 +225,62 @@ class Store:
             q.append("AND stationary = 0")
         q.append("ORDER BY ts DESC, length_m DESC LIMIT ?")
         args.append(limit)
-        return [dict(r) for r in self.conn.execute(" ".join(q), args).fetchall()]
+        return [dict(r) for r in self._query(" ".join(q), args)]
+
+    def chips_for_scene(self, scene_id: str) -> set[str]:
+        return {r["chip"] for r in self._query("SELECT chip FROM detections WHERE scene_id=?", (scene_id,))}
 
     def stats(self) -> dict:
-        c = self.conn
+        def one(sql: str):
+            return self._query(sql)[0][0]
+
         return {
-            "scenes_done": c.execute("SELECT COUNT(*) FROM scenes WHERE status='done'").fetchone()[0],
-            "scenes_skipped": c.execute("SELECT COUNT(*) FROM scenes WHERE status='skipped'").fetchone()[0],
-            "scenes_failed": c.execute("SELECT COUNT(*) FROM scenes WHERE status='failed'").fetchone()[0],
-            "detections": c.execute("SELECT COUNT(*) FROM detections").fetchone()[0],
-            "first": c.execute("SELECT MIN(datetime) FROM detections").fetchone()[0],
-            "last": c.execute("SELECT MAX(datetime) FROM detections").fetchone()[0],
+            "scenes_done": one("SELECT COUNT(*) FROM scenes WHERE status='done'"),
+            "scenes_skipped": one("SELECT COUNT(*) FROM scenes WHERE status='skipped'"),
+            "scenes_failed": one("SELECT COUNT(*) FROM scenes WHERE status='failed'"),
+            "detections": one("SELECT COUNT(*) FROM detections"),
+            "first": one("SELECT MIN(datetime) FROM detections"),
+            "last": one("SELECT MAX(datetime) FROM detections"),
         }
+
+    def get_detection(self, det_id: int) -> dict | None:
+        rows = self._query("SELECT * FROM detections WHERE id=?", (det_id,))
+        return dict(rows[0]) if rows else None
+
+    # hand corrections -----------------------------------------------------
+
+    _GEOM = ("lat", "lon", "length_m", "width_m", "heading_deg", "bow_lat", "bow_lon", "stern_lat",
+             "stern_lon", "length_err_m", "width_err_m", "method")
+
+    def set_manual_measurement(self, det_id: int, stern: tuple[float, float], bow: tuple[float, float],
+                               width_m: float | None = None) -> dict | None:
+        """Replace a ship's measurement with hull ends placed by hand (lat, lon each).
+        The automatic measurement is kept and can be restored."""
+        from pyproj import Geod
+
+        rec = self.get_detection(det_id)
+        if rec is None:
+            return None
+        az, _, dist = Geod(ellps="WGS84").inv(stern[1], stern[0], bow[1], bow[0])
+        auto = rec["auto_json"] or json.dumps({k: rec[k] for k in self._GEOM})
+        width = float(width_m) if width_m is not None else rec["width_m"]
+        with self.lock, self.conn:
+            self.conn.execute(
+                """UPDATE detections SET lat=?, lon=?, length_m=?, width_m=?, heading_deg=?, bow_lat=?, bow_lon=?,
+                   stern_lat=?, stern_lon=?, length_err_m=?, width_err_m=?, method='manual', auto_json=?, updated_at=?
+                   WHERE id=?""",
+                ((stern[0] + bow[0]) / 2, (stern[1] + bow[1]) / 2, round(dist, 1), round(width, 1), round(az % 180, 1),
+                 bow[0], bow[1], stern[0], stern[1], None, None, auto, time.time(), det_id))
+        return self.get_detection(det_id)
+
+    def reset_measurement(self, det_id: int) -> dict | None:
+        rec = self.get_detection(det_id)
+        if rec is None or not rec["auto_json"]:
+            return rec
+        auto = json.loads(rec["auto_json"])
+        sets = ", ".join(f"{k}=?" for k in auto)
+        with self.lock, self.conn:
+            self.conn.execute(f"UPDATE detections SET {sets}, auto_json=NULL, updated_at=? WHERE id=?",
+                              (*auto.values(), time.time(), det_id))
+        return self.get_detection(det_id)
+
