@@ -126,6 +126,7 @@ def _verdict(g: GeoDetection, nir_src, tci_src, nir_scale: float, nir_offset: fl
     ndvi = (nir - red) / max(nir + red, 1e-6)
     bands = np.array([red, green, blue, min(nir, TCI_FULL_SCALE)])
     flat = bands.min() / max(bands.max(), 1e-6)
+    g.det.blue, g.det.flatness, g.det.ndvi = round(float(blue), 4), round(float(flat), 3), round(float(ndvi), 3)
     if ndvi > p.max_ndvi:
         return "vegetation"
     if blue >= p.cloud_min_blue and flat >= p.cloud_flatness:

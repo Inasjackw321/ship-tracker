@@ -168,6 +168,8 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `GET /api/detections/<id>/chip.png[?clean=1]` | The ship's chip with its current ruler (or without any measurement) |
 | `POST /api/detections/<id>/measurement` `{stern: [lat, lon], bow: [lat, lon], width_m}` | Save a hand measurement |
 | `POST /api/detections/<id>/measurement/reset` | Back to the automatic measurement |
+| `POST /api/detections/<id>/flag` `{flag: "not_ship" \| "ship" \| null}` | Your verdict; later scans learn from it |
+| `GET /api/aircraft` / `POST /api/aircraft/tracking` `{enabled}` / `POST /api/aircraft/refresh` | H-60 helicopters: last positions and trails / switch tracking / poll now |
 | `POST /api/download.zip` `{ids: [...]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
 
 ## Clouds
@@ -184,6 +186,24 @@ Each tile also uses the **newest image with at most 10 % cloud** in the look-bac
 
 The cloud checks run *before* the slow hull-model fit. A patch of cumulus used to take minutes to analyse; it now takes about a second. On a synthetic cumulus benchmark (`tests/bench_clouds.py`), false ships fell from 0.96 to 0.38 per 9 × 9 km scene, and ships on clear water between the clouds found rose from 64 % to 80 %. The cost: two ships moored side by side can merge into one fat blob and be rejected as cloud.
 
+## Teaching it what is not a ship
+
+Each ship's popup has **Not a ship** and **Ship ✓** buttons:
+
+- **Not a ship** (a cloud, wave, pier, buoy…) hides the detection at once.
+- **Learning:** every detection keeps a short fingerprint (size, shape, edge softness, brightness, and its colour in the true-colour image). On later scans, a new detection very close to one you marked as not a ship is rejected, unless it is even closer to one you confirmed with **Ship ✓**. So the filter learns what clouds in *your* areas look like, from a handful of marks.
+- **Where your marks are kept:** in their own table, so they survive rescans and *Reset ships & start fresh*.
+- **Reviewing:** **show ones marked "not a ship"** under *Filter* shows the hidden ones again, greyed, with an **Undo** button.
+
+## Helicopters (H-60 / MH-60 Seahawk)
+
+While the app runs, it asks the free public ADS-B aggregators [adsb.lol](https://adsb.lol) (or [airplanes.live](https://airplanes.live) as a fallback) once a minute for aircraft of ICAO type **H60**. That type covers the MH-60R/S Seahawk and the rest of the Sikorsky H-60 family; the popup shows each aircraft's own description where the source gives one.
+
+- **What is kept:** every position is stored, so each helicopter keeps its **last known location** and a 24 h trail after it stops broadcasting. Seen within 5 minutes means pink and live; older means grey, labelled with how long ago it was seen. Aircraft not seen for 7 days are dropped.
+- **On the map and in the sidebar:** helicopters appear on the map and under **Helicopters** in the sidebar. Click one for its callsign, registration, altitude, speed, heading and time, plus a link to its history on ADS-B Exchange.
+- **What doesn't appear:** only aircraft that broadcast ADS-B (or are located by multilateration) show up. Military helicopters often switch it off, so many flights will not appear at all.
+- **Switching it off:** untick **track** in the sidebar, or start with `py run.py --no-flights`. `SHIPTRACKER_AIRCRAFT_TYPES` (e.g. `H60,S70`) changes the types tracked.
+
 ## Ships moored at piers
 
 In each image's own scene classification, a ship moored alongside a pier merges with the pier into one piece of "land". The detector also keeps 50 m clear of land to avoid shoreline effects. So docked ships were never looked at.
@@ -198,7 +218,7 @@ Every ship has a **reliability** rating in its popup, list entry and downloaded 
 - **Fair**: usable, but less certain (e.g. a boat only 4–6 pixels long, or a wake separated from the hull).
 - **Rough**: treat as an estimate. Typical reasons are a hull only 2–3 pixels long, the hull model not fitting, or a shape so slender it may include a wake.
 
-**Measurement quality** under *Filter* hides the rough (or the fair) ones. The **±** after each size is a 1-sigma uncertainty, tested to be honest: on the hard benchmark 87 % of true lengths and 79 % of true beams fall inside it (a 1-sigma range should hold at least 68 %). The beam is the less certain of the two. For a ship under way, the point where the wake meets the stern is the least certain part, and the ± widens accordingly (72 % of true lengths within it on the moving-ship benchmark, up from 45 %). Dark hull paint next to a bright deck looks like water in the near-infrared, so a beam can read narrower than it really is, never wider.
+**Measurement quality** under *Filter* hides the rough (or the fair) ones. The **±** after each size is a 1-sigma uncertainty, tested to be honest: on the hard benchmark 87 % of true lengths and 79 % of true beams fall inside it (a 1-sigma range should hold at least 68 %). The bow is modelled as full-bowed, like merchant hulls; a straight wedge read every ship about 2.5 m too long (standard benchmark length error 3.7 → 3.3 m, bias +2.5 → 0.0 m; hard benchmark 5.6 → 5.3 m). The beam is the less certain of the two. For a ship under way, the point where the wake meets the stern is the least certain part, and the ± widens accordingly (72 % of true lengths within it on the moving-ship benchmark, up from 45 %). Dark hull paint next to a bright deck looks like water in the near-infrared, so a beam can read narrower than it really is, never wider.
 
 These numbers come from synthetic ships, not real ones with known sizes. Besides the standard benchmark, `tests/test_measure_accuracy.py` runs a **hard benchmark** of 200 ships:
 

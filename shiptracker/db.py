@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .feedback import fingerprint
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenes (
     id TEXT PRIMARY KEY,
@@ -49,7 +51,16 @@ CREATE TABLE IF NOT EXISTS detections (
     method TEXT,                   -- fit | profile | manual
     auto_json TEXT,                -- the automatic measurement, kept when adjusted by hand
     wake_m REAL,                   -- wake behind the stern: the ship was under way
-    updated_at REAL
+    updated_at REAL,
+    flag TEXT,                     -- your verdict: not_ship | ship (NULL = none)
+    features_json TEXT             -- fingerprint used to learn from those verdicts
+);
+CREATE TABLE IF NOT EXISTS feedback (  -- your verdicts, kept when tiles are re-analysed or reset
+    det_id INTEGER PRIMARY KEY,
+    flag TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    lat REAL, lon REAL,
+    created REAL
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -88,7 +99,8 @@ class Store:
                 self.conn.execute("ALTER TABLE scenes ADD COLUMN covered TEXT")
             dcols = {r[1] for r in self.conn.execute("PRAGMA table_info(detections)")}
             for name, typ in (("length_err_m", "REAL"), ("width_err_m", "REAL"), ("method", "TEXT"),
-                              ("auto_json", "TEXT"), ("updated_at", "REAL"), ("wake_m", "REAL")):
+                              ("auto_json", "TEXT"), ("updated_at", "REAL"), ("wake_m", "REAL"),
+                              ("flag", "TEXT"), ("features_json", "TEXT")):
                 if name not in dcols:  # databases from before measurement uncertainties
                     self.conn.execute(f"ALTER TABLE detections ADD COLUMN {name} {typ}")
             self.conn.commit()
@@ -182,15 +194,29 @@ class Store:
                     """INSERT INTO detections
                        (scene_id, datetime, ts, lon, lat, length_m, width_m, heading_deg,
                         bow_lon, bow_lat, stern_lon, stern_lat, peak_reflectance, contrast, snr,
-                        npix, confidence, stationary, chip, length_err_m, width_err_m, method, wake_m)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        npix, confidence, stationary, chip, length_err_m, width_err_m, method, wake_m,
+                        features_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (scene.id, scene.datetime, ts, g.lon, g.lat, d.length_m, d.width_m, d.heading_deg,
                      g.bow_lon, g.bow_lat, g.stern_lon, g.stern_lat, round(d.peak_reflectance, 4),
                      round(d.contrast, 4), round(d.snr, 1), d.npix, d.confidence, int(bool(seen)), chip,
-                     d.length_err_m, d.width_err_m, d.method, d.wake_m),
+                     d.length_err_m, d.width_err_m, d.method, d.wake_m, json.dumps(fingerprint(d))),
                 )
                 added += 1
         return added
+
+    def set_flag(self, det_id: int, flag: str | None) -> dict | None:
+        """Record your verdict on a detection: 'not_ship', 'ship' or None (no verdict)."""
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE detections SET flag=? WHERE id=?", (flag, det_id))
+            if flag is None:
+                self.conn.execute("DELETE FROM feedback WHERE det_id=?", (det_id,))
+            else:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO feedback (det_id, flag, features_json, lat, lon, created) "
+                    "SELECT id, ?, features_json, lat, lon, ? FROM detections WHERE id=? AND features_json IS NOT NULL",
+                    (flag, time.time(), det_id))
+        return self.get_detection(det_id)
 
     def reset(self) -> dict:
         """Forget every ship, analysed tile and area status. Returns what was removed."""
@@ -207,9 +233,12 @@ class Store:
 
     def detections(self, start: str | None = None, end: str | None = None, min_length: float = 0,
                    max_length: float = 1e9, min_confidence: float = 0, include_stationary: bool = True,
-                   limit: int = 20000, scene_ids: set[str] | None = None) -> list[dict]:
+                   limit: int = 20000, scene_ids: set[str] | None = None,
+                   include_not_ships: bool = False) -> list[dict]:
         q = ["SELECT * FROM detections WHERE length_m BETWEEN ? AND ? AND confidence >= ?"]
         args: list = [min_length, max_length, min_confidence]
+        if not include_not_ships:
+            q.append("AND (flag IS NULL OR flag <> 'not_ship')")
         if scene_ids is not None:
             if not scene_ids:
                 return []
@@ -238,7 +267,8 @@ class Store:
             "scenes_done": one("SELECT COUNT(*) FROM scenes WHERE status='done'"),
             "scenes_skipped": one("SELECT COUNT(*) FROM scenes WHERE status='skipped'"),
             "scenes_failed": one("SELECT COUNT(*) FROM scenes WHERE status='failed'"),
-            "detections": one("SELECT COUNT(*) FROM detections"),
+            "detections": one("SELECT COUNT(*) FROM detections WHERE flag IS NULL OR flag <> 'not_ship'"),
+            "marked_not_ship": one("SELECT COUNT(*) FROM detections WHERE flag = 'not_ship'"),
             "first": one("SELECT MIN(datetime) FROM detections"),
             "last": one("SELECT MAX(datetime) FROM detections"),
         }

@@ -476,6 +476,28 @@ def test_ships_moored_at_piers_found_using_earlier_passes(world):
     assert "B08.tif" not in str([k for k in Handler.served if Handler.served[k] and "old" in k])
 
 
+def test_marking_not_a_ship_hides_it_and_teaches_later_scans(world):
+    """A detection marked "not a ship" disappears from the map, and when the tile is
+    analysed again, things that look like it are rejected; a confirmed ship is kept."""
+    settings, _, _ = world
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    client = create_app(settings).test_client()
+    feats = sorted(client.get("/api/detections").get_json()["features"], key=lambda f: f["properties"]["length_m"])
+    bad, good = feats[0]["properties"], feats[-1]["properties"]
+    assert client.post(f"/api/detections/{bad['id']}/flag", json={"flag": "not_ship"}).get_json()["properties"]["flag"] == "not_ship"
+    assert client.post(f"/api/detections/{good['id']}/flag", json={"flag": "ship"}).status_code == 200
+    assert client.post(f"/api/detections/{good['id']}/flag", json={"flag": "boat"}).status_code == 400
+    shown = client.get("/api/detections").get_json()["features"]
+    assert len(shown) == len(SHIPS) - 1 and bad["id"] not in {f["properties"]["id"] for f in shown}
+    assert len(client.get("/api/detections?not_ships=1").get_json()["features"]) == len(SHIPS)
+
+    # analyse the tiles again: the marked object is rejected, the others are found again
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01", reprocess=True))
+    assert any("like ones you marked not a ship" in line for line in rep.log) or rep.ships == len(SHIPS) - 1
+    lengths = sorted(f["properties"]["length_m"] for f in client.get("/api/detections?not_ships=1").get_json()["features"])
+    assert len(lengths) == len(SHIPS) - 1 and min(lengths) > bad["length_m"] + 5
+
+
 def test_scan_api_requires_an_area(world):
     settings, _, _ = world
     client = create_app(settings).test_client()

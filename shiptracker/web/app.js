@@ -54,7 +54,9 @@ const sceneLayer = L.geoJSON(null, {
 }).addTo(map);
 const shipLayer = L.layerGroup().addTo(map);
 const rulerLayer = L.layerGroup().addTo(map);
-L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Areas': areaLayer,
+map.createPane('aircraft').style.zIndex = 655;
+const aircraftLayer = L.layerGroup().addTo(map);
+L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Areas': areaLayer, 'Helicopters (H-60)': aircraftLayer,
   'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships': shipLayer,
   'Rulers': rulerLayer }).addTo(map);
 
@@ -123,6 +125,10 @@ function popupHtml(p, lat, lon) {
     </table>${coordsHtml(p, lat, lon)}
     <div class="dl">
       <button class="mini" data-adjust="${p.id}" title="Drag the ruler ends onto the bow and stern">Adjust measurement</button>
+      ${p.flag === 'not_ship'
+        ? `<button class="mini ghost" data-flag="${p.id}" data-value="" title="Undo: show it as a ship again">Undo "not a ship"</button>`
+        : `<button class="mini ghost danger-mini" data-flag="${p.id}" data-value="not_ship" title="Cloud, wave, pier... Hides it, and later scans reject things that look like it">Not a ship</button>
+           <button class="mini ghost" data-flag="${p.id}" data-value="ship" title="Confirm: helps the filter keep similar real ships">${p.flag === 'ship' ? 'Ship ✓ (confirmed)' : 'Ship ✓'}</button>`}
       ${p.chip_url && cleanOk(p) ? `<button class="mini ghost" data-toggle-ruler="${p.id}" title="Show the satellite image with or without the measurement drawn on it">${!showRulers || hidden.has(p.id) ? 'Show measurement' : 'Hide measurement'}</button>` : ''}
       ${p.adjusted ? `<button class="mini ghost" data-reset="${p.id}">Reset to automatic</button>` : ''}
     </div></div>`;
@@ -233,7 +239,7 @@ function render() {
     const m = L.circleMarker([lat, lon], {
       pane: 'ships',
       radius: Math.max(4, Math.min(12, p.length_m / 30)), color: '#000', weight: 1,
-      fillColor: colorFor(p.length_m), fillOpacity: 0.9,
+      fillColor: p.flag === 'not_ship' ? '#777' : colorFor(p.length_m), fillOpacity: p.flag === 'not_ship' ? 0.5 : 0.9,
     }).on('click', () => openShip(f));
     f._marker = m;
     shipLayer.addLayer(m);
@@ -364,6 +370,8 @@ document.addEventListener('click', (e) => {
     refreshChips();
     return;
   }
+  const fl = e.target.closest('[data-flag]');
+  if (fl) { e.preventDefault(); e.stopPropagation(); flagShip(Number(fl.dataset.flag), fl.dataset.value || null); return; }
   const del = e.target.closest('[data-delete-area]');
   if (del) { e.preventDefault(); e.stopPropagation(); deleteArea(del.dataset.deleteArea); return; }
   const zm = e.target.closest('[data-zoom-area]');
@@ -662,6 +670,7 @@ async function loadDetections() {
   q.set('min_confidence', $('f-conf').value || 0);
   q.set('stationary', $('f-stat').checked ? '1' : '0');
   q.set('view', $('f-latest').checked ? 'latest' : 'all');
+  if ($('f-notships').checked) q.set('not_ships', '1');
   const fc = await getJSON('/api/detections?' + q);
   const want = $('f-quality').value;  // any | fair | good
   const ok = { any: ['good', 'fair', 'rough'], fair: ['good', 'fair'], good: ['good'] }[want] || ['good', 'fair', 'rough'];
@@ -828,6 +837,28 @@ async function startScan(id) {
   pollScan().catch(console.error);
 }
 
+async function flagShip(id, flag) {
+  try {
+    const f = await getJSON(`/api/detections/${id}/flag`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ flag }) });
+    if (flag === 'not_ship' && !$('f-notships').checked) {
+      closeAllPopups();
+      for (const [k, t] of tray) if (t.properties.id === id) tray.delete(k);
+      renderTray();
+      $('scan-state').textContent = 'Marked as not a ship: hidden, and later scans will reject things that look like it.';
+    } else if (flag === 'ship') {
+      $('scan-state').textContent = 'Confirmed as a ship: the filter will keep similar ones.';
+    }
+    await loadDetections();
+    if (flag !== 'not_ship' || $('f-notships').checked) {
+      const g = featuresById.get(id);
+      if (g) { closeAllPopups(); openShip(g); }
+    }
+    loadStats();
+    return f;
+  } catch (e) { alert('Could not save: ' + e.message); }
+}
+
 async function resetAll() {
   const n = Number($('s-ships').textContent) || 0;
   if (!confirm(`Delete all ${n} tracked ships, their images and the scan history of every area?\n\n`
@@ -846,6 +877,7 @@ $('reset-btn').onclick = resetAll;
 $('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes()]).catch((e) => alert(e.message));
 $('f-latest').onchange = $('f-apply').onclick;
 $('f-quality').onchange = $('f-apply').onclick;
+$('f-notships').onchange = $('f-apply').onclick;
 $('f-rulers').checked = showRulers;
 $('f-rulers').onchange = () => {
   showRulers = $('f-rulers').checked;
@@ -853,6 +885,82 @@ $('f-rulers').onchange = () => {
   try { localStorage.setItem('showRulers', showRulers ? '1' : '0'); } catch (e) { /* private window */ }
   refreshChips();
 };
+
+// ---- H-60 helicopters (MH-60 Seahawk etc.) from public ADS-B ----
+const LIVE_S = 300;  // seen in the last 5 minutes: live; older: last known position
+let aircraft = [];
+const aircraftMarkers = new Map();
+function ago(s) {
+  if (s < 90) return `${Math.round(s)} s ago`;
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 172800) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} days ago`;
+}
+const heliName = (a) => a.flight || a.reg || a.hex.toUpperCase();
+function heliPopup(a) {
+  const c = coordText(a.lat, a.lon);
+  const alt = a.on_ground ? 'on the ground' : a.alt_ft != null ? `${a.alt_ft.toLocaleString()} ft` : '–';
+  return `<div class="popup"><b style="font-size:14px">🚁 ${esc(heliName(a))}</b>
+    <div style="color:#666;font-size:12px">${esc(a.descr || a.type || 'H-60')}${a.military ? ' · military' : ''}</div>
+    <table>
+      <tr><td>Last seen</td><td><b>${esc(ago(a.age_s))}</b>${a.age_s < LIVE_S ? ' (live)' : ' · last known position'}</td></tr>
+      <tr><td>Time</td><td>${esc(new Date(a.seen * 1000).toISOString().replace('T', ' ').slice(0, 16))} UTC</td></tr>
+      <tr><td>Altitude</td><td>${alt}</td></tr>
+      <tr><td>Speed</td><td>${a.gs_kt != null ? `${Math.round(a.gs_kt)} kt` : '–'}</td></tr>
+      <tr><td>Heading</td><td>${a.track != null ? `${Math.round(a.track)}°` : '–'}</td></tr>
+      <tr><td>Callsign</td><td>${esc(a.flight || '–')}</td></tr>
+      <tr><td>Registration</td><td>${esc(a.reg || '–')}</td></tr>
+      <tr><td>ICAO hex</td><td>${esc(a.hex.toUpperCase())}${a.squawk ? ` · squawk ${esc(a.squawk)}` : ''}</td></tr>
+      <tr><td>Source</td><td>${esc(a.source || '')} (public ADS-B)</td></tr>
+    </table>
+    <div class="coords"><input readonly value="${c}" onclick="this.select()"><button class="mini" data-copy="${c}">Copy</button></div>
+    <div class="dl"><a class="mini ghost" href="https://globe.adsbexchange.com/?icao=${encodeURIComponent(a.hex)}" target="_blank" rel="noopener">History on ADS-B Exchange</a></div></div>`;
+}
+function renderAircraft() {
+  aircraftLayer.clearLayers();
+  aircraftMarkers.clear();
+  for (const a of aircraft) {
+    const live = a.age_s < LIVE_S;
+    if (a.trail && a.trail.length > 1) {
+      L.polyline(a.trail, { pane: 'aircraft', color: live ? '#ff6bd6' : '#999', weight: 2, dashArray: '4 4', opacity: 0.8, interactive: false }).addTo(aircraftLayer);
+    }
+    const icon = L.divIcon({
+      className: 'heli' + (live ? ' live' : ''), iconSize: [24, 24], iconAnchor: [12, 12],
+      html: `<div class="heli-arrow" style="transform:rotate(${a.track || 0}deg)">▲</div><span>${esc(heliName(a))}</span>`,
+    });
+    const m = L.marker([a.lat, a.lon], { icon, pane: 'aircraft', zIndexOffset: live ? 1000 : 0 })
+      .bindPopup(() => heliPopup(a), { maxWidth: 280 });
+    m.on('click', () => { if (measure.on || draw.on) m.closePopup(); });
+    m.addTo(aircraftLayer);
+    aircraftMarkers.set(a.hex, m);
+  }
+  const ul = $('heli-list');
+  ul.innerHTML = '';
+  for (const a of aircraft.slice(0, 40)) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="dot ${a.age_s < LIVE_S ? 'live' : ''}"></span><b>${esc(heliName(a))}</b>
+      <span class="meta">${esc(a.reg && a.flight ? a.reg + ' · ' : '')}${esc(ago(a.age_s))}</span>`;
+    li.onclick = () => { map.setView([a.lat, a.lon], Math.max(map.getZoom(), 9)); aircraftMarkers.get(a.hex)?.openPopup(); };
+    ul.appendChild(li);
+  }
+}
+async function loadAircraft() {
+  const r = await getJSON('/api/aircraft');
+  aircraft = r.aircraft;
+  const st = r.status;
+  $('heli-track').checked = st.enabled;
+  const live = aircraft.filter((a) => a.age_s < LIVE_S).length;
+  $('heli-status').textContent = !st.enabled ? 'Tracking is off.'
+    : st.error && !st.source ? `No flight data: ${st.error}`
+    : `${live} live, ${aircraft.length} seen in the last 7 days` + (st.last_poll ? ` · updated ${ago(Date.now() / 1000 - st.last_poll)}` : ' · first update within a minute');
+  renderAircraft();
+}
+$('heli-track').onchange = async () => {
+  await getJSON('/api/aircraft/tracking', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: $('heli-track').checked }) }).catch(console.error);
+  loadAircraft().catch(console.error);
+};
+setInterval(() => loadAircraft().catch(console.error), 30000);
 
 (function init() {
   loadAreas().then(() => {
@@ -863,4 +971,5 @@ $('f-rulers').onchange = () => {
   loadStats().catch(console.error);
   loadScenes().catch(console.error);
   loadCoverage().catch(console.error);
+  loadAircraft().catch(console.error);
 })();

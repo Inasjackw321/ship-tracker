@@ -100,6 +100,7 @@ def main() -> int:
     ap.add_argument("--no-scan", action="store_true", help=argparse.SUPPRESS)  # the default now
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--no-flights", action="store_true", help="don't track H-60 helicopters (public ADS-B)")
     args = ap.parse_args()
     if args.areas:
         from shiptracker.__main__ import main as cli
@@ -125,7 +126,7 @@ def main() -> int:
         app = create_app(scan_defaults={
             "days": args.days, "max_cloud": args.max_cloud, "limit": args.limit or None,
             "all_passes": args.all_passes, "workers": args.workers, "keep_tiles": args.keep_tiles,
-        })
+        }, flights=not args.no_flights)
     except Exception:
         import traceback
         traceback.print_exc()

@@ -27,6 +27,7 @@ from shapely.ops import unary_union
 from .chips import render_chips
 from .config import Settings
 from .db import Store
+from .feedback import Feedback, fingerprint
 from .detect import DETECTOR_VERSION, DetectParams
 from rasterio.errors import RasterioIOError
 
@@ -274,6 +275,12 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
             except Exception as exc:
                 log.warning("  true-colour image unavailable (%s); colour checks skipped, chips use NIR", exc)
         dets = verify_detections(dets, nir, tci, scene.nir_scale, scene.nir_offset, rejected)
+        feedback = Feedback.from_store(store)  # what you marked as not a ship (or ship)
+        if feedback:
+            keep = [g for g in dets if not feedback.looks_like_marked_not_ship(fingerprint(g.det))]
+            if len(keep) < len(dets):
+                rejected["like ones you marked not a ship"] += len(dets) - len(keep)
+            dets = keep
         if rejected:
             log.info("  %s: %d ships kept; rejected %s", scene.id, len(dets),
                      ", ".join(f"{n} {why}" for why, n in rejected.most_common()))

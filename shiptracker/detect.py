@@ -44,7 +44,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9)  # used for the "is there cloud around it?" test (not smoke or haze)
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 9
+DETECTOR_VERSION = 10
 
 
 @dataclass
@@ -109,6 +109,9 @@ class DetectParams:
     wake_min_length: float = 0.2   # wake fades over >= 0.2 x hull length (shorter = superstructure)
     wake_max_brightness: float = 2.0  # wake at most 2 x the deck brightness
     bow_taper: float = 0.12        # pointed part of the bow, as a fraction of length
+    # How full the bow is in plan view: the beam there falls as (1 - x) ** fullness. Merchant
+    # hulls are full-bowed; a straight wedge (1.0) read every ship ~2.5 m too long.
+    bow_fullness: float = 0.6
     length_err_floor_m: float = 4.0
     length_err_rel: float = 0.015
     width_err_floor_m: float = 3.0
@@ -143,6 +146,10 @@ class Detection:
     method: str = "profile"    # "fit" (hull model) or "profile" (fallback)
     wake_m: float = 0.0        # visible wake behind the stern (ship under way); 0 = none found
     hull_nir_dn: float | None = None  # mean NIR DN over the hull (for the colour checks)
+    softness: float = 1.0      # how gradually the hull ends fade (1 = sharp; clouds ~1.4+)
+    blue: float | None = None  # colour of the hull in the true-colour image (reflectance) ...
+    flatness: float | None = None  # ... min/max over R, G, B, NIR (white/grey = 1)
+    ndvi: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -422,7 +429,7 @@ def measure(excess: np.ndarray, mask: np.ndarray, p: DetectParams) -> dict | Non
     }
 
 
-def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float) -> np.ndarray:
+def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float, fullness: float = 1.0) -> np.ndarray:
     """Blurred hull: a rectangle with a pointed bow (at +s if sign=1), convolved with a
     Gaussian of width ``sigma`` px. Separable in the hull frame, so it is evaluated
     analytically at pixel centres (no supersampling).
@@ -438,7 +445,7 @@ def _hull_model(params, rr, cc, taper: float, sign: int, sigma: float) -> np.nda
     t = (rr - r0) * uc - (cc - c0) * ur
     bow0 = L / 2 - taper * L
     sb = sign * s
-    w = np.where(sb > bow0, W * np.clip(1 - (sb - bow0) / max(taper * L, 1e-6), 0.05, 1), W)
+    w = np.where(sb > bow0, W * np.clip(1 - (sb - bow0) / max(taper * L, 1e-6), 0.05, 1) ** fullness, W)
     gs = ndtr((s + L / 2) / sigma) - ndtr((s - L / 2) / sigma)
     gt = ndtr((t + w / 2) / sigma) - ndtr((t - w / 2) / sigma)
     out = A * gs * gt
@@ -487,7 +494,7 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
     x0 = np.array([init["row"], init["col"], th0, L0 * 1.03, max(W0 * 0.7, 0.6), A0])
     best, best_sign = None, 1
     for sign in (1, -1):  # bow at either end
-        res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, x0, lb6, ub6)
+        res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma, p.bow_fullness) - y, x0, lb6, ub6)
         if res is not None and res.success and (best is None or res.cost < best.cost):
             best, best_sign = res, sign
     if best is None:
@@ -513,7 +520,7 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
                 shift = sign * (L0 - Ls) / 2
                 xw = np.array([init["row"] + ur * shift, init["col"] + uc * shift, th0, Ls, max(W0 * 0.7, 0.6),
                                A0, 0.5, max(1.0, p.wake_min_length * 1.5), W0])
-                res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma) - y, xw, lbw, ubw)
+                res = solve(lambda q, sign=sign: _hull_model(q, rr, cc, p.bow_taper, sign, sigma, p.bow_fullness) - y, xw, lbw, ubw)
                 if res is not None and res.success and (wake is None or res.cost < wake[0].cost):
                     wake = (res, sign)
         # Keep the wake only if it explains the pixels clearly better than a plain hull
@@ -530,7 +537,7 @@ def fit_hull(excess: np.ndarray, mask: np.ndarray, init: dict, p: DetectParams) 
     if (wake is None and p.fit_blur and L0 >= p.blur_fit_min_len_px
             and A0 >= p.blur_fit_min_snr * max(noise, 1e-6)):
         lb7, ub7 = np.append(lb6, 0.35), np.append(ub6, 1.3)
-        res = solve(lambda q: _hull_model(q[:6], rr, cc, p.bow_taper, best_sign, q[6]) - y,
+        res = solve(lambda q: _hull_model(q[:6], rr, cc, p.bow_taper, best_sign, q[6], p.bow_fullness) - y,
                     np.append(best.x, sigma), lb7, ub7)
         if res is not None and res.success and lb7[6] + 0.01 < res.x[6] < ub7[6] - 0.01:
             best = res
@@ -751,5 +758,6 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
             confidence=round(_confidence(s, aspect, length_m) * (0.6 if implausible else 1.0), 3),
             length_err_m=round(length_err, 1), width_err_m=round(width_err, 1), method=method,
             wake_m=round(m.get("wake_px", 0.0) * pixel_m, 0),
+            softness=round(float(m["softness"]), 3),
         ))
     return out

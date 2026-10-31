@@ -55,6 +55,7 @@
   .leaflet-container a.mini.ghost { color: #333; }
   .card .coords input { width: 100%; font-size: 11px; }
   .popup .mini.ghost { color: #333; }
+  .popup .mini.ghost.danger-mini { color: #b42318; border-color: #e3a19b; }
   header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
   header h1 { margin: 0; font-size: 17px; }
   header p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
@@ -99,6 +100,18 @@
   .area-pop .st { color: #555; font-size: 12px; margin: 4px 0 8px; }
   .area-pop button { background: #39d353; color: #04130a; border: 0; border-radius: 6px; padding: 6px 12px; font: 600 13px system-ui, sans-serif; cursor: pointer; }
   .area-pop button:disabled { opacity: .5; cursor: default; }
+  #heli-list { list-style: none; margin: 6px 0 0; padding: 0; max-height: 160px; overflow: auto; font-size: 12px; }
+  #heli-list li { display: flex; gap: 6px; align-items: center; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
+  #heli-list li:hover { background: #1c242d; }
+  #heli-list .meta { color: var(--muted); margin-left: auto; }
+  #heli-list .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; flex: none; }
+  #heli-list .dot.live { background: #ff6bd6; box-shadow: 0 0 6px #ff6bd6; }
+  .heli { position: relative; }
+  .heli .heli-arrow { width: 24px; height: 24px; line-height: 24px; text-align: center; font-size: 18px; color: #bbb;
+    text-shadow: 0 0 3px #000, 0 0 2px #000; }
+  .heli.live .heli-arrow { color: #ff6bd6; }
+  .heli span { position: absolute; left: 22px; top: 3px; white-space: nowrap; font: 600 11px system-ui, sans-serif;
+    color: #fff; background: #000a; padding: 0 4px; border-radius: 3px; }
   #list { flex: 1; min-height: 180px; overflow: auto; padding: 0; margin: 0; list-style: none; }
   #list li { display: flex; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
   #list li:hover { background: #1c242d; }
@@ -149,6 +162,12 @@
       <div class="row"><button class="ghost danger" id="reset-btn" title="Delete every tracked ship, its images and the scan history">Reset ships &amp; start fresh</button></div>
     </section>
     <section>
+      <h2>Helicopters · H-60 / MH-60 Seahawk</h2>
+      <label class="inline" title="Ask the public ADS-B aggregators (adsb.lol, airplanes.live) for H-60 helicopters every minute"><input type="checkbox" id="heli-track" checked> track (public ADS-B, every minute)</label>
+      <div class="meta" id="heli-status" style="margin-top:4px"></div>
+      <ul id="heli-list"></ul>
+    </section>
+    <section>
       <h2>Filter</h2>
       <div class="grid">
         <label>From <input type="date" id="f-start"></label>
@@ -161,6 +180,7 @@
         <label title="How far each measurement can be trusted (see the ship's popup for why)">Measurement quality
           <select id="f-quality"><option value="any">any</option><option value="fair">fair or good</option><option value="good">good only</option></select></label>
         <label class="inline" title="Draw the ruler and hull outline on the satellite images and the map"><input type="checkbox" id="f-rulers" checked> show measurements on images</label>
+        <label class="inline" title="Show the detections you marked as not a ship (to review or undo)"><input type="checkbox" id="f-notships"> show ones marked "not a ship"</label>
       </div>
       <div class="row"><button class="ghost" id="f-apply">Apply</button></div>
     </section>

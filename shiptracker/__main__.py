@@ -88,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("serve", help="web map and API")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--no-flights", action="store_true", help="don't track H-60 helicopters (public ADS-B)")
 
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -178,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "serve":
         from .server import create_app
-        create_app(settings).run(host=args.host, port=args.port, threaded=True)
+        create_app(settings, flights=not args.no_flights).run(host=args.host, port=args.port, threaded=True)
         return 0
     return 2
 

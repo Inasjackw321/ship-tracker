@@ -16,6 +16,7 @@ from shapely.geometry import mapping, shape
 from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path, quality, tif_index
 from .config import Settings
 from .db import Store
+from .flights import FlightTracker
 from .aoi import CUSTOM_GROUP, Area, new_area_id, save_areas
 from .pipeline import ScanOptions, ScanReport, area_km2, current_scene_ids, reset_data, scan
 
@@ -23,7 +24,7 @@ log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
 MAX_AREA_KM2 = 3_000_000
 # Stored per ship but not needed by the map (kept in downloads and the database).
-_UNUSED = ("peak_reflectance", "contrast", "npix", "ts", "updated_at")  # larger than the biggest built-in area; more is a mistake
+_UNUSED = ("peak_reflectance", "contrast", "npix", "ts", "updated_at", "features_json")  # larger than the biggest built-in area; more is a mistake
 
 
 def _feature(d: dict) -> dict:
@@ -36,20 +37,27 @@ def _feature(d: dict) -> dict:
     props["adjusted"] = d.get("method") == "manual"
     props["quality"], props["quality_why"] = quality(d)
     props.pop("auto_json", None)
+    props.pop("features_json", None)
     if d.get("auto_json"):
         props["auto"] = json.loads(d["auto_json"])
     return {"type": "Feature", "geometry": {"type": "Point", "coordinates": [d["lon"], d["lat"]]},
             "properties": props}
 
 
-def create_app(settings: Settings | None = None, scan_defaults: dict | None = None) -> Flask:
+def create_app(settings: Settings | None = None, scan_defaults: dict | None = None,
+               flights: bool = False) -> Flask:
     """``scan_defaults`` fill in whatever a scan request from the map leaves out
-    (``days``, ``max_cloud``, ``workers``, ``keep_tiles``, ``all_passes``, ``limit``)."""
+    (``days``, ``max_cloud``, ``workers``, ``keep_tiles``, ``all_passes``, ``limit``).
+    ``flights``: start tracking H-60 helicopters from public ADS-B data in the background."""
     settings = settings or Settings()
     defaults = {"days": 30, "max_cloud": 30, "keep_tiles": False, **(scan_defaults or {})}
     settings.ensure_dirs()
     store = Store(settings.db_path)
+    tracker = FlightTracker(store)
+    if flights:
+        tracker.start()
     app = Flask(__name__, static_folder=None)
+    app.extensions["flights"] = tracker
     app.json.sort_keys = False  # sorting the keys of thousands of ships is wasted time
     job: dict = {"thread": None, "report": None, "error": None, "options": None}
 
@@ -92,6 +100,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
                 include_stationary=a.get("stationary", "1") != "0",
                 limit=int(a.get("limit", 20000)),
                 scene_ids=ids,
+                include_not_ships=a.get("not_ships") == "1",
             )
         except ValueError as exc:
             abort(400, str(exc))
@@ -157,6 +166,15 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
         except (KeyError, TypeError, ValueError):
             abort(400, "expected stern and bow as [lat, lon], and an optional width_m")
         return _feature_response(store.set_manual_measurement(det_id, stern, bow, width))
+
+    @app.post("/api/detections/<int:det_id>/flag")
+    def flag_detection(det_id: int):
+        """Your verdict on a detection: {"flag": "not_ship" | "ship" | null}. Later scans
+        reject new detections that look like the ones marked not a ship."""
+        flag = (request.get_json(silent=True) or {}).get("flag")
+        if flag not in ("not_ship", "ship", None):
+            abort(400, "flag must be not_ship, ship or null")
+        return _feature_response(store.set_flag(det_id, flag))
 
     @app.post("/api/detections/<int:det_id>/measurement/reset")
     def reset_measurement(det_id: int):
@@ -267,6 +285,23 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
             "report": asdict(rep) if rep else None,
             "defaults": {"days": defaults["days"], "max_cloud": defaults["max_cloud"]},
         })
+
+    @app.get("/api/aircraft")
+    def aircraft():
+        """H-60 helicopters seen in the last days: last known position and 24 h trail."""
+        return jsonify({"status": tracker.status, "aircraft": tracker.aircraft()})
+
+    @app.post("/api/aircraft/tracking")
+    def aircraft_tracking():
+        """{"enabled": true|false}: start or stop polling the ADS-B aggregators."""
+        on = bool((request.get_json(silent=True) or {}).get("enabled"))
+        tracker.start() if on else tracker.stop()
+        return jsonify(tracker.status)
+
+    @app.post("/api/aircraft/refresh")
+    def aircraft_refresh():
+        n = tracker.poll_once()
+        return jsonify({"seen": n, "status": tracker.status})
 
     @app.post("/api/reset")
     def reset():
