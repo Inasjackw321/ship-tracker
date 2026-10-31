@@ -44,7 +44,7 @@ SCL_SHADOW = (2, 3)
 SCL_CLOUDY = (3, 8, 9)  # used for the "is there cloud around it?" test (not smoke or haze)
 
 # Bump when detection changes enough that old results should be recomputed.
-DETECTOR_VERSION = 8
+DETECTOR_VERSION = 9
 
 
 @dataclass
@@ -160,9 +160,14 @@ def _component_sizes(mask: np.ndarray, structure=None) -> tuple[np.ndarray, np.n
 
 
 def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
-                p: DetectParams) -> tuple[np.ndarray, np.ndarray]:
+                p: DetectParams, berth: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Return (search, sea, land): where to look for ship seeds, where hulls may extend,
-    and land (including large clouds) that a hull must not touch."""
+    and land (including large clouds) that a hull must not touch.
+
+    ``berth`` (optional): pixels that are not water today but were open water on other
+    recent passes, such as a berth beside a pier with a ship moored in it today. They
+    count as sea, with only a 1-pixel coast margin, so moored ships are found; piers
+    (never water) stay land."""
     # Thin cirrus is the class Sen2Cor gives smoke and dust haze too: only where it is
     # bright enough to hide the sea is it treated as cloud; ships under haze stay visible.
     cloud_raw = (np.isin(scl, SCL_CLOUD) | ((scl == SCL_THIN) & (refl > p.opaque_haze_refl))) & valid
@@ -173,6 +178,8 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
 
     water = valid & ((scl == SCL_WATER) |
                      ((refl < p.water_nir_max) & ~np.isin(scl, SCL_SHADOW) & (scl != 0)))
+    if berth is not None:
+        water |= berth & valid
     nonwater = valid & ~water
     labels, sizes = _component_sizes(nonwater)
     border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
@@ -186,7 +193,10 @@ def build_masks(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.nd
 
     land = valid & ~sea
     if p.coast_buffer_px and land.any():
-        land = ndimage.maximum_filter(land, size=2 * p.coast_buffer_px + 1)
+        wide = ndimage.maximum_filter(land, size=2 * p.coast_buffer_px + 1)
+        if berth is not None and berth.any():  # beside a pier: a 1-pixel margin only
+            wide = np.where(berth, ndimage.maximum_filter(land, size=3), wide)
+        land = wide
     land_raw = (valid & ~sea) | ~valid  # hulls may not touch land, big cloud or nodata
     search = sea & valid & aoi & ~land & ~cloud
     if p.edge_buffer_px and (~valid).any():
@@ -563,7 +573,7 @@ def _ring(shape, r: float, c: float, inner: float, outer: float):
 
 def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: np.ndarray,
                     p: DetectParams, pixel_m: float = 10.0, rejected: Counter | None = None,
-                    on_reject=None) -> list[Detection]:
+                    on_reject=None, berth: np.ndarray | None = None) -> list[Detection]:
     """Detect and measure ships in one in-memory block.
 
     refl: NIR (B08) reflectance; scl: SCL classes resampled to the same grid;
@@ -571,7 +581,9 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
     ``rejected`` (optional) counts candidates dropped, by reason.
     """
     rejected = rejected if rejected is not None else Counter()
-    search, sea, land = build_masks(refl, scl, valid, aoi, p)
+    if berth is not None and not berth.any():
+        berth = None
+    search, sea, land = build_masks(refl, scl, valid, aoi, p, berth)
     if not search.any():
         return []
 
@@ -639,6 +651,8 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         if (claimed[r0:r1, c0:c1] & seed).any():
             continue
         ex = excess[r0:r1, c0:c1]
+        if berth is not None:  # a pier beside a moored ship is not part of its hull
+            ex = np.where(land[r0:r1, c0:c1], 0.0, ex)
         peak = float(peaks[idx])
         grow = (ex > max(p.grow_frac * peak, p.min_contrast / 2)) & sea[r0:r1, c0:c1]
         grow &= ~_alongside(labels[r0:r1, c0:c1], seed)
@@ -665,8 +679,10 @@ def detect_in_array(refl: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi: n
         if Lq >= 1.2 * p.aspect_from_m and Lq / max(Wq, 1e-6) < 0.75 * min_aspect_for(Lq / 1.2):
             reject("shape")
             continue
-        # Hulls are surrounded by water: an object running into land/cloud is an edge.
-        if (ndimage.binary_dilation(hull, iterations=2) & land[r0:r1, c0:c1]).any():
+        # Hulls are surrounded by water: an object running into land/cloud is an edge,
+        # unless it lies in a berth (water on other days): a ship moored at a pier.
+        moored = berth is not None and float(berth[r0:r1, c0:c1][hull].mean()) >= 0.5
+        if not moored and (ndimage.binary_dilation(hull, iterations=2) & land[r0:r1, c0:c1]).any():
             reject("touches land/cloud")
             continue
         why = None if ship_like(Lq, Wq, m["softness"]) else context(m["row"] + r0, m["col"] + c0, m["length_px"])

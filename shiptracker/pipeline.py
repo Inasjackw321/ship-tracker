@@ -31,7 +31,7 @@ from .detect import DETECTOR_VERSION, DetectParams
 from rasterio.errors import RasterioIOError
 
 from .download import download_file, gdal_env, remote_href, remove_scene, scene_dir
-from .scene import clear_sea_fraction, detect_scene
+from .scene import berth_map, clear_sea_fraction, coastal, detect_scene
 from .stac import Scene, search_scenes
 from .verify import verify_detections
 
@@ -85,6 +85,7 @@ def area_km2(geom: BaseGeometry) -> float:
     return projected.area / 1e6
 
 
+BERTH_HISTORY = 6  # earlier passes of a coastal tile used to map its berths
 CLEAR_CLOUD = 10.0  # % cloud: an image this clear is preferred over a newer, cloudier one
 
 
@@ -186,7 +187,7 @@ _analyse_gate = threading.Semaphore(1)
 _progress: Callable[[str, int, int], None] | None = None
 
 
-def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions):
+def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions, berth_path=None):
     """Detect ships in one tile; its blocks are analysed on every CPU core."""
     global _pool
     with _pool_lock:
@@ -195,15 +196,37 @@ def _detect(nir, scl_path, aoi, scene: Scene, opts: ScanOptions):
     stats: dict = {}
     progress = (lambda done, total: _progress(scene.id, done, total)) if _progress else None
     dets = detect_scene(nir, str(scl_path), aoi, scene.nir_scale, scene.nir_offset, opts.params,
-                        rejected, stats, progress, pool)
+                        rejected, stats, progress, pool, berth_path)
     if pool is not None and getattr(pool, "_broken", False):
         with _pool_lock:
             _pool = None  # the rest of the scan runs in this process
     return dets, rejected, stats
 
 
-def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions) -> tuple[str, int]:
+def _berths(settings: Settings, scene: Scene, scl_path, history, aoi, sdir) -> str | None:
+    """Map of berths for a coastal tile: water on earlier passes, not water today (ships
+    moored at piers), from the earlier passes' small scene-classification bands."""
+    if not history or not coastal(scl_path, aoi):
+        return None
+    src_cfg = settings.source_config()
+    paths = []
+    for old in history[:BERTH_HISTORY]:
+        try:
+            paths.append(download_file(old.scl_href, sdir / f"history_{old.id}_SCL.tif", src_cfg))
+        except Exception as exc:  # a missing earlier pass only weakens the map
+            log.warning("  earlier pass %s unavailable (%s)", old.id, exc)
+    out = berth_map(scl_path, paths, sdir / "berths.tif") if paths else None
+    if out:
+        log.info("  %s: berths mapped from %d earlier passes", scene.id, len(paths))
+    return str(out) if out else None
+
+
+def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOptions,
+                  history: list | None = None) -> tuple[str, int]:
     """Analyse one scene. Returns (status, ships_added).
+
+    ``history``: earlier passes of the same tile, used on coastal tiles to tell berths
+    (open water on other days) from piers, so ships moored at piers are found.
 
     The small scene-classification band is downloaded; the big NIR and true-colour
     bands are streamed (only sea in the area and patches around ships are read)
@@ -227,19 +250,20 @@ def process_scene(settings: Settings, store: Store, scene: Scene, opts: ScanOpti
                 remove_scene(settings.tiles_dir, scene.id)
             return "skipped", 0
 
+        berth_path = _berths(settings, scene, scl_path, history, aoi, sdir)
         stream = not opts.keep_tiles
         with _analyse_gate:
             log.info("  detecting ships (clear sea %.0f%%)", sea * 100)
             if stream:
                 nir = remote_href(scene.nir_href, src_cfg)
                 try:
-                    dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
+                    dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts, berth_path)
                 except RasterioIOError as exc:
                     log.warning("  streaming %s failed (%s); downloading the whole file instead", scene.id, exc)
                     stream = False
             if not stream:
                 nir = str(download_file(scene.nir_href, sdir / "B08.tif", src_cfg))
-                dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts)
+                dets, rejected, stats = _detect(nir, scl_path, aoi, scene, opts, berth_path)
 
         t_detect = time.time()
         tci = None
@@ -358,6 +382,10 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
                                                "start": opts.start, "end": opts.end})
         report.area_imaged = cov["fraction"]
         scenes = select_latest_coverage(found, aoi) if opts.mode == "latest" else list(found)
+        by_tile: dict = defaultdict(list)
+        for sc in found:  # newest first
+            by_tile[sc.tile or sc.id].append(sc)
+        history = {sc.id: [o for o in by_tile[sc.tile or sc.id] if o.id != sc.id] for sc in found}
         if opts.limit:
             scenes = scenes[: opts.limit]
         report.found = len(scenes)
@@ -371,7 +399,7 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
              f"({cov['imaged_km2']:,} of {cov['area_km2']:,} km2)")
 
         statuses: dict[str, str] = {}
-        _run_batch(settings, store, scenes, opts, report, note, statuses, lock)
+        _run_batch(settings, store, scenes, opts, report, note, statuses, lock, history)
 
         # A tile whose newest image was all cloud: fall back to its next older pass.
         if opts.mode == "latest" and not opts.limit:
@@ -387,7 +415,7 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
                 note(f"{len(need)} tiles had no clear sea in their newest image; trying {len(nxt)} older passes")
                 tried |= {sc.id for sc in nxt}
                 report.found += len(nxt)
-                _run_batch(settings, store, nxt, opts, report, note, statuses, lock)
+                _run_batch(settings, store, nxt, opts, report, note, statuses, lock, history)
 
         note(f"Finished {name}: {report.processed} analysed, {report.skipped} cloud/land only, "
              f"{report.failed} failed, {report.already_done} already done, {report.ships} new ships")
@@ -414,7 +442,7 @@ def scan(settings: Settings, opts: ScanOptions, store: Store | None = None,
     return report
 
 
-def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> None:
+def _run_batch(settings, store, scenes, opts, report, note, statuses, lock, history=None) -> None:
     todo, outdated = [], []
     aoi = scan_region(settings, opts)
     for sc in scenes:
@@ -443,7 +471,7 @@ def _run_batch(settings, store, scenes, opts, report, note, statuses, lock) -> N
             report.active[sc.id] = 0.0
         note(f"start {sc.id} ({sc.datetime[:16]}, cloud {sc.cloud_cover}%)")
         try:
-            return process_scene(settings, store, sc, opts)
+            return process_scene(settings, store, sc, opts, (history or {}).get(sc.id))
         finally:
             with lock:
                 report.active.pop(sc.id, None)

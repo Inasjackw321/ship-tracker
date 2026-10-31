@@ -414,6 +414,68 @@ def test_connection_check(world, tmp_path):
     assert any("FAILED" in line for line in out)
 
 
+def _write_arrays(dirpath: Path, origin_xy, refl, scl, with_bands=True):
+    H, W = refl.shape
+    common = dict(driver="GTiff", crs=f"EPSG:{EPSG}", tiled=True, blockxsize=256, blockysize=256,
+                  compress="deflate")
+    dirpath.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(dirpath / "SCL.tif", "w", height=H // 2, width=W // 2, count=1, dtype="uint8",
+                       transform=from_origin(origin_xy[0], origin_xy[1], 20, 20), nodata=0, **common) as dst:
+        dst.write(scl[::2, ::2], 1)
+    if with_bands:
+        dn = np.clip((refl + 0.1) / 1e-4, 1, 65535).astype(np.uint16)
+        tr10 = from_origin(origin_xy[0], origin_xy[1], 10, 10)
+        with rasterio.open(dirpath / "B08.tif", "w", height=H, width=W, count=1, dtype="uint16",
+                           transform=tr10, nodata=0, **common) as dst:
+            dst.write(dn, 1)
+        rgb = np.clip(np.stack([refl * 900, refl * 1000, refl * 1100]), 0, 255).astype(np.uint8)
+        with rasterio.open(dirpath / "TCI.tif", "w", height=H, width=W, count=3, dtype="uint8",
+                           transform=tr10, nodata=0, **common) as dst:
+            dst.write(rgb)
+    with rasterio.open(dirpath / "SCL.tif") as src:
+        return transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+
+
+def test_ships_moored_at_piers_found_using_earlier_passes(world):
+    """Ships moored alongside piers merge with the pier in today's scene classification;
+    earlier passes of the tile, when the berths were empty water, show they are berths."""
+    from tests.synth import make_harbour
+
+    settings, _, _ = world
+    refl, scl, berth, moored, offshore = make_harbour()
+    served = settings.data_dir.parent / "served"
+    x, y = Transformer.from_crs("EPSG:4326", f"EPSG:{EPSG}", always_xy=True).transform(LON, LAT)
+    origin = (round(x, -1), round(y, -1))
+    bounds = _write_arrays(served / "today", origin, refl, scl)
+    empty = scl.copy()
+    empty[berth] = 6  # berths open water on earlier passes
+    items = [_item("S2A_41QKL_20261030_0_L2A", "2026-10-30T06:40:11Z", settings.stac_url, "today", bounds)]
+    for i, day in enumerate(("20261025", "20261020", "20261015")):
+        _write_arrays(served / f"old{i}", origin, refl, empty, with_bands=False)
+        items.append(_item(f"S2A_41QKL_{day}_0_L2A", f"{day[:4]}-{day[4:6]}-{day[6:]}T06:40:11Z",
+                           settings.stac_url, f"old{i}", bounds))
+    Handler.pages = [items]
+    Handler.served = {}
+    rep = scan(settings, ScanOptions(area=AREA, start="2026-10-10", end="2026-10-31"))
+    assert rep.processed == 1  # the newest image; the others only lent their SCL
+    feats = create_app(settings).test_client().get("/api/detections").get_json()["features"]
+    to_px = Transformer.from_crs("EPSG:4326", f"EPSG:{EPSG}", always_xy=True)
+
+    def found(r, c):
+        for f in feats:
+            fx, fy = to_px.transform(*f["geometry"]["coordinates"])
+            if math.hypot((fx - origin[0]) / 10 - 0.5 - c, (origin[1] - fy) / 10 - 0.5 - r) < 10:
+                return f["properties"]
+        return None
+
+    for r, c, L in moored:
+        hit = found(r, c)
+        assert hit and abs(hit["length_m"] - L) < 0.1 * L, (r, c, L, hit and hit["length_m"])
+    assert found(offshore[0], offshore[1])
+    assert len(feats) == len(moored) + 1  # no pier reported as a ship
+    assert "B08.tif" not in str([k for k in Handler.served if Handler.served[k] and "old" in k])
+
+
 def test_scan_api_requires_an_area(world):
     settings, _, _ = world
     client = create_app(settings).test_client()

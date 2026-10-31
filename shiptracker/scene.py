@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import rasterio
+import rasterio.errors
 from affine import Affine
 from pyproj import Geod, Transformer
 from rasterio.enums import Resampling
@@ -73,13 +74,14 @@ def clear_sea_fraction(scl_path, aoi: BaseGeometry) -> float:
 
 
 def _block_job(dn: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi_mask: np.ndarray, scale: float,
-               offset: float, p: DetectParams, pixel_m: float, rr0: int, cc0: int, r0: int, c0: int):
+               offset: float, p: DetectParams, pixel_m: float, rr0: int, cc0: int, r0: int, c0: int,
+               berth: np.ndarray | None = None):
     """Detect ships in one block (runs in a worker process). Returns the detections whose
     centre lies in the block's core, in tile pixel coordinates, and the rejection counts."""
     rejected: Counter = Counter()
     refl = dn.astype(np.float32) * scale + offset
     out = []
-    for d in detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected):
+    for d in detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected, berth=berth):
         fr, fc = d.row + rr0, d.col + cc0
         # Keep each ship once: only in the block whose core holds its centre.
         if not (r0 <= fr < r0 + p.block and c0 <= fc < c0 + p.block):
@@ -90,9 +92,67 @@ def _block_job(dn: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi_mask: np.
     return out, rejected
 
 
+SCL_CLEAR = (2, 4, 5, 6, 7, 11)  # classes where the surface is seen (not cloud, shadow or nodata)
+
+
+def coastal(scl_path, aoi: BaseGeometry) -> bool:
+    """Whether the tile's part of the area has both sea and land (piers, harbours)."""
+    with rasterio.open(scl_path) as src:
+        step = max(1, src.width // 1000)
+        scl = src.read(1, out_shape=(src.height // step, src.width // step), resampling=Resampling.nearest)
+        tr = Affine(src.transform.a * src.width / scl.shape[1], 0, src.transform.c,
+                    0, src.transform.e * src.height / scl.shape[0], src.transform.f)
+        inside = geometry_mask([transform_geom("EPSG:4326", src.crs, mapping(aoi))], out_shape=scl.shape,
+                               transform=tr, invert=True)
+    seen = inside & (scl != 0)
+    n = max(int(seen.sum()), 1)
+    return (scl[seen] == SCL_WATER).sum() / n > 0.01 and np.isin(scl[seen], (4, 5)).sum() / n > 0.002
+
+
+def berth_map(scl_path, history_paths, out_path, min_share: float = 0.15, reach_px: int = 15,
+              max_patch_px: int = 800):
+    """Pixels that are not water today but were open water on earlier passes of the same
+    tile (at least ``min_share`` of the times they were seen, and within ``reach_px``
+    SCL pixels of today's water): berths with a ship moored in them today. Written as a
+    0/1 GeoTIFF on the SCL grid; returns its path, or None when nothing qualifies."""
+    with rasterio.open(scl_path) as src:
+        today = src.read(1)
+        profile = src.profile
+        grid = (src.transform, src.width, src.height)
+    water = np.zeros(today.shape, np.uint16)
+    seen = np.zeros(today.shape, np.uint16)
+    for hp in history_paths:
+        try:
+            with rasterio.open(hp) as h:
+                if (h.transform, h.width, h.height) != grid:
+                    continue  # not the same tile grid
+                old = h.read(1)
+        except rasterio.errors.RasterioIOError:
+            continue
+        water += old == SCL_WATER
+        seen += np.isin(old, SCL_CLEAR)
+    from scipy import ndimage
+    near_water = ndimage.maximum_filter(today == SCL_WATER, size=2 * reach_px + 1)
+    berth = ((water >= 1) & (water >= min_share * np.maximum(seen, 1)) & (today != SCL_WATER)
+             & (today != 0) & near_water)
+    # A berth holds a ship or a few side by side; a larger patch that is only sometimes
+    # water is a tidal flat or sandbank, which must not become "sea" full of bright objects.
+    labels, n = ndimage.label(berth)
+    if n:
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        berth = (sizes <= max_patch_px)[labels] & berth
+    if not berth.any():
+        return None
+    profile.update(dtype="uint8", count=1, nodata=None, compress="deflate")
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(berth.astype(np.uint8), 1)
+    return out_path
+
+
 def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_offset: float,
                  params: DetectParams | None = None, rejected=None, stats: dict | None = None,
-                 progress=None, pool=None) -> list[GeoDetection]:
+                 progress=None, pool=None, berth_path=None) -> list[GeoDetection]:
     """Detect ships in one tile, block by block.
 
     The blocks are read here, in order, so each part of the image is fetched once; with a
@@ -105,6 +165,7 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
     results: list[GeoDetection] = []
     pending: deque = deque()
     max_pending = 2 * max(getattr(pool, "_max_workers", 1), 1)  # bounds memory
+    berth_src = rasterio.open(berth_path) if berth_path else None
     with rasterio.open(nir_path) as src, rasterio.open(scl_path) as scl_src:
         H, W = src.height, src.width
         pixel_m = abs(src.res[0])
@@ -174,7 +235,8 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                 if not ((scl == SCL_WATER) & valid).any():
                     tick()
                     continue
-                args = (dn, scl, valid, aoi_mask, nir_scale, nir_offset, p, pixel_m, rr0, cc0, r0, c0)
+                berth = _read_scl(berth_src, win, src.transform, shape_).astype(bool) if berth_src else None
+                args = (dn, scl, valid, aoi_mask, nir_scale, nir_offset, p, pixel_m, rr0, cc0, r0, c0, berth)
                 if pool is None:
                     finished(_block_job(*args))
                     continue
@@ -188,6 +250,8 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
                     collect_one()
         while pending:
             collect_one()
+    if berth_src is not None:
+        berth_src.close()
     if stats is not None:
         stats.update(blocks=n_blocks, read=state["read"])
     return results

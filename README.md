@@ -184,6 +184,12 @@ Each tile also uses the **newest image with at most 10 % cloud** in the look-bac
 
 The cloud checks run *before* the slow hull-model fit. A patch of cumulus used to take minutes to analyse; it now takes about a second. On a synthetic cumulus benchmark (`tests/bench_clouds.py`), false ships fell from 0.96 to 0.38 per 9 × 9 km scene, and ships on clear water between the clouds found rose from 64 % to 80 %. The cost: two ships moored side by side can merge into one fat blob and be rejected as cloud.
 
+## Ships moored at piers
+
+In each image's own scene classification, a ship moored alongside a pier merges with the pier into one piece of "land". The detector also keeps 50 m clear of land to avoid shoreline effects. So docked ships were never looked at.
+
+For tiles with coastline, the scan now also downloads the small classification band (a few MB each) of up to 6 earlier passes of the same tile in the look-back window. A pixel that is not water today but was open water on earlier passes is a **berth**. Berths count as sea with only a 10 m margin, so the ship in one is found and measured; piers, never water, stay land. Patches larger than about 0.3 km² that are only sometimes water (tidal flats, sandbanks) are not treated as berths. A ship that stayed at the same berth through every earlier pass can still be missed: no image shows that berth empty.
+
 ## How reliable are the measurements?
 
 Every ship has a **reliability** rating in its popup, list entry and downloaded image, with the reason:

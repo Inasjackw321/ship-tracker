@@ -109,3 +109,44 @@ def test_ignores_bright_artifacts_along_data_edge():
     dets = detect_in_array(refl, scl, valid, valid | True, DetectParams())
     assert len(dets) == 1
     _match(dets, 299.5, 199.5)
+
+
+def test_ships_moored_at_piers():
+    """Moored ships merge with their pier in today's scene classification; with the berths
+    known from earlier passes they are found and measured, and piers are not ships."""
+    import math
+
+    from tests.synth import make_harbour
+
+    refl, scl, berth, moored, offshore = make_harbour()
+    v = np.ones(refl.shape, bool)
+    without = detect_in_array(refl, scl, v, v, DetectParams())
+    assert not any(math.hypot(d.row - r, d.col - c) < 10 for d in without for r, c, L in moored)
+    dets = detect_in_array(refl, scl, v, v, DetectParams(), berth=berth)
+    for r, c, L in moored:
+        hit = [d for d in dets if math.hypot(d.row - r, d.col - c) < 10]
+        assert hit and abs(hit[0].length_m - L) < 0.05 * L
+    assert len(dets) == len(moored) + 1  # plus the ship at sea; no pier
+
+
+def test_berth_map_keeps_berths_not_tidal_flats(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from shiptracker.scene import berth_map
+
+    def write(name, arr):
+        with rasterio.open(tmp_path / name, "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
+                           count=1, dtype="uint8", crs="EPSG:32641",
+                           transform=from_origin(300000, 2600000, 20, 20)) as dst:
+            dst.write(arr, 1)
+        return tmp_path / name
+
+    today = np.full((300, 300), 6, np.uint8)
+    today[:, 200:] = 5
+    today[100:110, 150:200] = 5    # a berth with a ship in it today
+    today[150:250, 120:200] = 5    # a large tidal flat exposed today
+    before = np.full((300, 300), 6, np.uint8)
+    before[:, 200:] = 5
+    b = rasterio.open(berth_map(write("t.tif", today), [write("o.tif", before)], tmp_path / "b.tif")).read(1)
+    assert b[100:110, 150:200].all() and not b[150:250, 120:200].any() and not b[:, 200:].any()
