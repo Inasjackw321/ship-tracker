@@ -106,10 +106,16 @@
   #heli-list .meta { color: var(--muted); margin-left: auto; }
   #heli-list .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; flex: none; }
   #heli-list .dot.live { background: #ff6bd6; box-shadow: 0 0 6px #ff6bd6; }
-  .heli { position: relative; }
+  /* (no "position" here: Leaflet positions marker icons absolutely; overriding it made
+     every marker drift by the size of the ones before it) */
   .heli .heli-arrow { width: 24px; height: 24px; line-height: 24px; text-align: center; font-size: 18px; color: #bbb;
     text-shadow: 0 0 3px #000, 0 0 2px #000; }
   .heli.live .heli-arrow { color: #ff6bd6; }
+  .heli.v22 .heli-arrow { font-size: 17px; }
+  .heli.v22.live .heli-arrow { color: #ffb020; }
+  .heli span em { font-style: normal; color: #ffd27a; margin-left: 4px; }
+  #heli-list .dot.live.v22 { background: #ffb020; box-shadow: 0 0 6px #ffb020; }
+  .heli-types { display: flex; gap: 12px; margin-top: 4px; }
   .heli span { position: absolute; left: 22px; top: 3px; white-space: nowrap; font: 600 11px system-ui, sans-serif;
     color: #fff; background: #000a; padding: 0 4px; border-radius: 3px; }
   #list { flex: 1; min-height: 180px; overflow: auto; padding: 0; margin: 0; list-style: none; }
@@ -162,8 +168,12 @@
       <div class="row"><button class="ghost danger" id="reset-btn" title="Delete every tracked ship, its images and the scan history">Reset ships &amp; start fresh</button></div>
     </section>
     <section>
-      <h2>Helicopters · H-60 / MH-60 Seahawk</h2>
-      <label class="inline" title="Ask the public ADS-B aggregators (adsb.lol, airplanes.live) for H-60 helicopters every minute"><input type="checkbox" id="heli-track" checked> track (public ADS-B, every minute)</label>
+      <h2>Aircraft · MH-60 Seahawk &amp; V-22 Osprey</h2>
+      <label class="inline" title="Ask the public ADS-B aggregators (adsb.lol, airplanes.live) for H-60s and V-22s every minute"><input type="checkbox" id="heli-track" checked> track (public ADS-B, every minute)</label>
+      <div class="heli-types">
+        <label class="inline"><input type="checkbox" id="show-h60" checked> 🚁 H-60</label>
+        <label class="inline"><input type="checkbox" id="show-v22" checked> ✈ V-22 Osprey</label>
+      </div>
       <div class="meta" id="heli-status" style="margin-top:4px"></div>
       <ul id="heli-list"></ul>
     </section>

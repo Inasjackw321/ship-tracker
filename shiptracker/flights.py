@@ -1,5 +1,6 @@
-"""Track H-60 helicopters (MH-60R/S Seahawk and the rest of the Sikorsky H-60 family)
-from public ADS-B data, keeping each one's last known position and recent trail.
+"""Track H-60 helicopters (MH-60R/S Seahawk and the rest of the Sikorsky H-60 family) and
+V-22 Osprey tiltrotors from public ADS-B data, keeping each one's last known position
+and recent trail.
 
 Positions come from free community aggregators with the ADS-B Exchange v2 API
 (adsb.lol, airplanes.live). Only aircraft that broadcast ADS-B (or are located by
@@ -22,7 +23,8 @@ SOURCES = (  # tried in order; the first that answers is used
     ("adsb.lol", "https://api.adsb.lol/v2/type/{type}"),
     ("airplanes.live", "https://api.airplanes.live/v2/type/{type}"),
 )
-TYPES = tuple(t.strip().upper() for t in os.environ.get("SHIPTRACKER_AIRCRAFT_TYPES", "H60").split(",") if t.strip())
+# H60: Sikorsky H-60 family (MH-60R/S Seahawk, Black Hawk...); V22: Bell-Boeing V-22 Osprey
+TYPES = tuple(t.strip().upper() for t in os.environ.get("SHIPTRACKER_AIRCRAFT_TYPES", "H60,V22").split(",") if t.strip())
 POLL_SECONDS = 60
 KEEP_DAYS = 7
 MOVE_M = 300          # store a new trail point after this much movement ...

@@ -76,7 +76,7 @@ def test_aircraft_api_and_failure_status(fake, tmp_path):
     app = create_app(Settings(data_dir=tmp_path / "data"))  # tracking is off unless asked for
     client = app.test_client()
     body = client.get("/api/aircraft").get_json()
-    assert body["aircraft"] == [] and body["status"]["enabled"] is False and body["status"]["types"] == ["H60"]
+    assert body["aircraft"] == [] and body["status"]["enabled"] is False and body["status"]["types"] == ["H60", "V22"]
     app.extensions["flights"].sources = fake
     assert client.post("/api/aircraft/refresh").get_json()["seen"] == 1
     (a,) = client.get("/api/aircraft").get_json()["aircraft"]

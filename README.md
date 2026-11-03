@@ -195,12 +195,12 @@ Each ship's popup has **Not a ship** and **Ship ✓** buttons:
 - **Where your marks are kept:** in their own table, so they survive rescans and *Reset ships & start fresh*.
 - **Reviewing:** **show ones marked "not a ship"** under *Filter* shows the hidden ones again, greyed, with an **Undo** button.
 
-## Helicopters (H-60 / MH-60 Seahawk)
+## Helicopters and Ospreys (H-60 / MH-60 Seahawk, V-22 Osprey)
 
-While the app runs, it asks the free public ADS-B aggregators [adsb.lol](https://adsb.lol) (or [airplanes.live](https://airplanes.live) as a fallback) once a minute for aircraft of ICAO type **H60**. That type covers the MH-60R/S Seahawk and the rest of the Sikorsky H-60 family; the popup shows each aircraft's own description where the source gives one.
+While the app runs, it asks the free public ADS-B aggregators [adsb.lol](https://adsb.lol) (or [airplanes.live](https://airplanes.live) as a fallback) once a minute for aircraft of ICAO types **H60** and **V22**. H60 is the Sikorsky H-60 family; **V22** is the Bell-Boeing V-22 Osprey tiltrotor (MV-22, CV-22, CMV-22), shown as an amber ✈ with a "V-22" badge. That type covers the MH-60R/S Seahawk and the rest of the Sikorsky H-60 family; the popup shows each aircraft's own description where the source gives one.
 
 - **What is kept:** every position is stored, so each helicopter keeps its **last known location** and a 24 h trail after it stops broadcasting. Seen within 5 minutes means pink and live; older means grey, labelled with how long ago it was seen. Aircraft not seen for 7 days are dropped.
-- **On the map and in the sidebar:** helicopters appear on the map and under **Helicopters** in the sidebar. Click one for its callsign, registration, altitude, speed, heading and time, plus a link to its history on ADS-B Exchange.
+- **On the map and in the sidebar:** helicopters appear on the map and under **Aircraft** in the sidebar, where **H-60** and **V-22 Osprey** can each be shown or hidden. Click one for its callsign, registration, altitude, speed, heading and time, plus a link to its history on ADS-B Exchange.
 - **What doesn't appear:** only aircraft that broadcast ADS-B (or are located by multilateration) show up. Military helicopters often switch it off, so many flights will not appear at all.
 - **Switching it off:** untick **track** in the sidebar, or start with `py run.py --no-flights`. `SHIPTRACKER_AIRCRAFT_TYPES` (e.g. `H60,S70`) changes the types tracked.
 

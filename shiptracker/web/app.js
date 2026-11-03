@@ -56,7 +56,7 @@ const shipLayer = L.layerGroup().addTo(map);
 const rulerLayer = L.layerGroup().addTo(map);
 map.createPane('aircraft').style.zIndex = 655;
 const aircraftLayer = L.layerGroup().addTo(map);
-L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Areas': areaLayer, 'Helicopters (H-60)': aircraftLayer,
+L.control.layers({ 'Satellite': imagery }, { 'Labels': labels, 'Areas': areaLayer, 'Aircraft (H-60, V-22)': aircraftLayer,
   'Not imaged': gapLayer, 'Scanned tiles': sceneLayer, 'Ships': shipLayer,
   'Rulers': rulerLayer }).addTo(map);
 
@@ -897,11 +897,14 @@ function ago(s) {
   return `${Math.round(s / 86400)} days ago`;
 }
 const heliName = (a) => a.flight || a.reg || a.hex.toUpperCase();
+const isOsprey = (a) => (a.type || '').toUpperCase() === 'V22';
+const kindLabel = (a) => (isOsprey(a) ? 'V-22' : 'H-60');
+const shown = (a) => (isOsprey(a) ? $('show-v22').checked : $('show-h60').checked);
 function heliPopup(a) {
   const c = coordText(a.lat, a.lon);
   const alt = a.on_ground ? 'on the ground' : a.alt_ft != null ? `${a.alt_ft.toLocaleString()} ft` : '–';
-  return `<div class="popup"><b style="font-size:14px">🚁 ${esc(heliName(a))}</b>
-    <div style="color:#666;font-size:12px">${esc(a.descr || a.type || 'H-60')}${a.military ? ' · military' : ''}</div>
+  return `<div class="popup"><b style="font-size:14px">${isOsprey(a) ? '✈' : '🚁'} ${esc(heliName(a))}</b>
+    <div style="color:#666;font-size:12px">${esc(a.descr || (isOsprey(a) ? 'Bell-Boeing V-22 Osprey' : 'Sikorsky H-60'))}${a.military ? ' · military' : ''}</div>
     <table>
       <tr><td>Last seen</td><td><b>${esc(ago(a.age_s))}</b>${a.age_s < LIVE_S ? ' (live)' : ' · last known position'}</td></tr>
       <tr><td>Time</td><td>${esc(new Date(a.seen * 1000).toISOString().replace('T', ' ').slice(0, 16))} UTC</td></tr>
@@ -919,14 +922,16 @@ function heliPopup(a) {
 function renderAircraft() {
   aircraftLayer.clearLayers();
   aircraftMarkers.clear();
-  for (const a of aircraft) {
+  const visible = aircraft.filter(shown);
+  for (const a of visible) {
     const live = a.age_s < LIVE_S;
     if (a.trail && a.trail.length > 1) {
-      L.polyline(a.trail, { pane: 'aircraft', color: live ? '#ff6bd6' : '#999', weight: 2, dashArray: '4 4', opacity: 0.8, interactive: false }).addTo(aircraftLayer);
+      L.polyline(a.trail, { pane: 'aircraft', color: live ? (isOsprey(a) ? '#ffb020' : '#ff6bd6') : '#999', weight: 2, dashArray: '4 4', opacity: 0.8, interactive: false }).addTo(aircraftLayer);
     }
     const icon = L.divIcon({
-      className: 'heli' + (live ? ' live' : ''), iconSize: [24, 24], iconAnchor: [12, 12],
-      html: `<div class="heli-arrow" style="transform:rotate(${a.track || 0}deg)">▲</div><span>${esc(heliName(a))}</span>`,
+      className: 'heli' + (live ? ' live' : '') + (isOsprey(a) ? ' v22' : ''), iconSize: [24, 24], iconAnchor: [12, 12],
+      html: `<div class="heli-arrow" style="transform:rotate(${(a.track || 0) - (isOsprey(a) ? 45 : 0)}deg)">${isOsprey(a) ? '✈' : '▲'}</div>`
+        + `<span>${esc(heliName(a))}<em>${kindLabel(a)}</em></span>`,
     });
     const m = L.marker([a.lat, a.lon], { icon, pane: 'aircraft', zIndexOffset: live ? 1000 : 0 })
       .bindPopup(() => heliPopup(a), { maxWidth: 280 });
@@ -936,9 +941,10 @@ function renderAircraft() {
   }
   const ul = $('heli-list');
   ul.innerHTML = '';
-  for (const a of aircraft.slice(0, 40)) {
+  for (const a of visible.slice(0, 40)) {
     const li = document.createElement('li');
-    li.innerHTML = `<span class="dot ${a.age_s < LIVE_S ? 'live' : ''}"></span><b>${esc(heliName(a))}</b>
+    li.innerHTML = `<span class="dot ${a.age_s < LIVE_S ? 'live' : ''} ${isOsprey(a) ? 'v22' : ''}"></span><b>${esc(heliName(a))}</b>
+      <span class="meta">${kindLabel(a)}</span>
       <span class="meta">${esc(a.reg && a.flight ? a.reg + ' · ' : '')}${esc(ago(a.age_s))}</span>`;
     li.onclick = () => { map.setView([a.lat, a.lon], Math.max(map.getZoom(), 9)); aircraftMarkers.get(a.hex)?.openPopup(); };
     ul.appendChild(li);
@@ -950,9 +956,10 @@ async function loadAircraft() {
   const st = r.status;
   $('heli-track').checked = st.enabled;
   const live = aircraft.filter((a) => a.age_s < LIVE_S).length;
+  const nV22 = aircraft.filter(isOsprey).length;
   $('heli-status').textContent = !st.enabled ? 'Tracking is off.'
     : st.error && !st.source ? `No flight data: ${st.error}`
-    : `${live} live, ${aircraft.length} seen in the last 7 days` + (st.last_poll ? ` · updated ${ago(Date.now() / 1000 - st.last_poll)}` : ' · first update within a minute');
+    : `${live} live, ${aircraft.length} seen in the last 7 days (${aircraft.length - nV22} H-60, ${nV22} V-22)` + (st.last_poll ? ` · updated ${ago(Date.now() / 1000 - st.last_poll)}` : ' · first update within a minute');
   renderAircraft();
 }
 $('heli-track').onchange = async () => {
@@ -960,6 +967,8 @@ $('heli-track').onchange = async () => {
     body: JSON.stringify({ enabled: $('heli-track').checked }) }).catch(console.error);
   loadAircraft().catch(console.error);
 };
+$('show-h60').onchange = renderAircraft;
+$('show-v22').onchange = renderAircraft;
 setInterval(() => loadAircraft().catch(console.error), 30000);
 
 (function init() {
