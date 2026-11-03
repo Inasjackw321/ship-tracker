@@ -197,7 +197,7 @@ Each ship's popup has **Not a ship** and **Ship ✓** buttons:
 
 ## Helicopters and Ospreys (H-60 / MH-60 Seahawk, V-22 Osprey)
 
-While the app runs, it asks the free public ADS-B aggregators [adsb.lol](https://adsb.lol) (or [airplanes.live](https://airplanes.live) as a fallback) once a minute for aircraft of ICAO types **H60** and **V22**. H60 is the Sikorsky H-60 family; **V22** is the Bell-Boeing V-22 Osprey tiltrotor (MV-22, CV-22, CMV-22), shown as an amber ✈ with a "V-22" badge. That type covers the MH-60R/S Seahawk and the rest of the Sikorsky H-60 family; the popup shows each aircraft's own description where the source gives one.
+While the app runs, it asks the free public ADS-B aggregators [adsb.lol](https://adsb.lol) (or [airplanes.live](https://airplanes.live) as a fallback) once a minute for aircraft of ICAO types **H60** and **V22**. H60 is the Sikorsky H-60 family; **V22** is the Bell-Boeing V-22 Osprey tiltrotor (MV-22, CV-22, CMV-22), shown as an amber ✈ with a "V-22" badge. H60 includes the MH-60R/S Seahawk; the popup shows each aircraft's own description where the source gives one.
 
 - **What is kept:** every position is stored, so each helicopter keeps its **last known location** and a 24 h trail after it stops broadcasting. Seen within 5 minutes means pink and live; older means grey, labelled with how long ago it was seen. Aircraft not seen for 7 days are dropped.
 - **On the map and in the sidebar:** helicopters appear on the map and under **Aircraft** in the sidebar, where **H-60** and **V-22 Osprey** can each be shown or hidden. Click one for its callsign, registration, altitude, speed, heading and time, plus a link to its history on ADS-B Exchange.

@@ -119,6 +119,7 @@ class FlightTracker:
                     r = session.get(url.format(type=t), timeout=20)
                     r.raise_for_status()
                     seen += parse(r.json(), name)
+                seen = list({a["hex"]: a for a in seen}.values())  # each aircraft once
                 self._save(seen)
                 self.status.update(last_poll=time.time(), source=name, error=None)
                 return len(seen)
