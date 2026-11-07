@@ -63,3 +63,55 @@ def make_scene(shape=(600, 600), ships=(), seed=0, glint=True, land=True, cloud=
         scl[r0:r0 + size, c0:c0 + size][fp > 0.05] = 8
         truth.append((r - 0.5, c - 0.5, L, Wd, hd))
     return refl, scl, truth
+
+
+def add_cumulus_field(refl, scl, center, radius, n=40, seed=0):
+    """Scatter small fair-weather cumulus (Gaussian puffs) with SCL marking their cores."""
+    rng = np.random.default_rng(seed)
+    H, W = refl.shape
+    yy, xx = np.mgrid[0:H, 0:W]
+    for _ in range(n):
+        r = center[0] + rng.uniform(-radius, radius)
+        c = center[1] + rng.uniform(-radius, radius)
+        sy, sx = rng.uniform(1.5, 8, 2)
+        amp = rng.uniform(0.05, 0.5)
+        puff = amp * np.exp(-(((yy - r) / sy) ** 2 + ((xx - c) / sx) ** 2) / 2)
+        refl += puff.astype(np.float32)
+        scl[puff > 0.15] = 8
+    return refl, scl
+
+
+
+def make_harbour(seed=0):
+    """Naval-base-like harbour: land to the east with piers reaching west into the water,
+    grey ships moored alongside the piers (touching them) and one ship out at sea.
+
+    Returns (refl, scl_today, berth, moored, offshore): in today's scene classification
+    the moored ships merge with their piers (non-water); ``berth`` marks the pixels that
+    were open water on other passes, when the berths were empty."""
+    rng = np.random.default_rng(seed)
+    H, W = 600, 600
+    refl = np.full((H, W), 0.02, np.float32) + rng.normal(0, 0.002, (H, W)).astype(np.float32)
+    scl = np.full((H, W), 6, np.uint8)
+    refl[:, 450:] = 0.22 + rng.normal(0, 0.03, (H, 150))
+    scl[:, 450:] = 5
+    moored = []
+    for k, r in enumerate(range(80, 560, 60)):
+        refl[r:r + 3, 380:450] = 0.25  # pier, 30 m wide, 700 m long
+        scl[r:r + 3, 380:450] = 5
+        if k % 2 == 0:  # a grey warship (~200 x 25 m) moored along the north side of the pier
+            L, Wd = rng.uniform(150, 250), 25
+            fp = ship_footprint(L, Wd, 90.0, int(L / 10 * 1.6) + 12 + (int(L / 10 * 1.6) % 2))
+            fp *= 0.8
+            h = fp.shape[0] // 2
+            cr, cc = r - 2, 445 - int(L / 20) - 2  # hull centre: touching the pier
+            refl[cr - h:cr - h + fp.shape[0], cc - h:cc - h + fp.shape[1]] += fp
+            scl[cr - h:cr - h + fp.shape[0], cc - h:cc - h + fp.shape[1]][fp > 0.02] = 5
+            moored.append((cr, cc, L))
+    berth = (scl != 6) & (np.arange(W)[None, :] < 450)  # not water today, water on other days
+    for r in range(80, 560, 60):
+        berth[r:r + 3, 380:450] = False  # piers are never water
+    offshore = (300, 150, 180.0)
+    fp = ship_footprint(180, 30, 20.0, 40)
+    refl[280:320, 130:170] += fp
+    return refl, scl, berth, moored, offshore

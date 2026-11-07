@@ -1,12 +1,16 @@
-"""Run ship detection over a downloaded Sentinel-2 tile, block by block."""
+"""Run ship detection over a Sentinel-2 tile (local file or streamed COG), block by block."""
 from __future__ import annotations
 
 import logging
 import math
+from collections import Counter, deque
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import rasterio
+import rasterio.errors
 from affine import Affine
 from pyproj import Geod, Transformer
 from rasterio.enums import Resampling
@@ -69,10 +73,99 @@ def clear_sea_fraction(scl_path, aoi: BaseGeometry) -> float:
     return float(((scl == SCL_WATER) & valid).sum() / valid.sum())
 
 
+def _block_job(dn: np.ndarray, scl: np.ndarray, valid: np.ndarray, aoi_mask: np.ndarray, scale: float,
+               offset: float, p: DetectParams, pixel_m: float, rr0: int, cc0: int, r0: int, c0: int,
+               berth: np.ndarray | None = None):
+    """Detect ships in one block (runs in a worker process). Returns the detections whose
+    centre lies in the block's core, in tile pixel coordinates, and the rejection counts."""
+    rejected: Counter = Counter()
+    refl = dn.astype(np.float32) * scale + offset
+    out = []
+    for d in detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m, rejected, berth=berth):
+        fr, fc = d.row + rr0, d.col + cc0
+        # Keep each ship once: only in the block whose core holds its centre.
+        if not (r0 <= fr < r0 + p.block and c0 <= fc < c0 + p.block):
+            continue
+        d.row, d.col = fr, fc
+        d.hull_nir_dn = _hull_mean(dn, d, rr0, cc0)
+        out.append(d)
+    return out, rejected
+
+
+SCL_CLEAR = (2, 4, 5, 6, 7, 11)  # classes where the surface is seen (not cloud, shadow or nodata)
+
+
+def coastal(scl_path, aoi: BaseGeometry) -> bool:
+    """Whether the tile's part of the area has both sea and land (piers, harbours)."""
+    with rasterio.open(scl_path) as src:
+        step = max(1, src.width // 1000)
+        scl = src.read(1, out_shape=(src.height // step, src.width // step), resampling=Resampling.nearest)
+        tr = Affine(src.transform.a * src.width / scl.shape[1], 0, src.transform.c,
+                    0, src.transform.e * src.height / scl.shape[0], src.transform.f)
+        inside = geometry_mask([transform_geom("EPSG:4326", src.crs, mapping(aoi))], out_shape=scl.shape,
+                               transform=tr, invert=True)
+    seen = inside & (scl != 0)
+    n = max(int(seen.sum()), 1)
+    return (scl[seen] == SCL_WATER).sum() / n > 0.01 and np.isin(scl[seen], (4, 5)).sum() / n > 0.002
+
+
+def berth_map(scl_path, history_paths, out_path, min_share: float = 0.15, reach_px: int = 15,
+              max_patch_px: int = 800):
+    """Pixels that are not water today but were open water on earlier passes of the same
+    tile (at least ``min_share`` of the times they were seen, and within ``reach_px``
+    SCL pixels of today's water): berths with a ship moored in them today. Written as a
+    0/1 GeoTIFF on the SCL grid; returns its path, or None when nothing qualifies."""
+    with rasterio.open(scl_path) as src:
+        today = src.read(1)
+        profile = src.profile
+        grid = (src.transform, src.width, src.height)
+    water = np.zeros(today.shape, np.uint16)
+    seen = np.zeros(today.shape, np.uint16)
+    for hp in history_paths:
+        try:
+            with rasterio.open(hp) as h:
+                if (h.transform, h.width, h.height) != grid:
+                    continue  # not the same tile grid
+                old = h.read(1)
+        except rasterio.errors.RasterioIOError:
+            continue
+        water += old == SCL_WATER
+        seen += np.isin(old, SCL_CLEAR)
+    from scipy import ndimage
+    near_water = ndimage.maximum_filter(today == SCL_WATER, size=2 * reach_px + 1)
+    berth = ((water >= 1) & (water >= min_share * np.maximum(seen, 1)) & (today != SCL_WATER)
+             & (today != 0) & near_water)
+    # A berth holds a ship or a few side by side; a larger patch that is only sometimes
+    # water is a tidal flat or sandbank, which must not become "sea" full of bright objects.
+    labels, n = ndimage.label(berth)
+    if n:
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        berth = (sizes <= max_patch_px)[labels] & berth
+    if not berth.any():
+        return None
+    profile.update(dtype="uint8", count=1, nodata=None, compress="deflate")
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(berth.astype(np.uint8), 1)
+    return out_path
+
+
 def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_offset: float,
-                 params: DetectParams | None = None) -> list[GeoDetection]:
+                 params: DetectParams | None = None, rejected=None, stats: dict | None = None,
+                 progress=None, pool=None, berth_path=None) -> list[GeoDetection]:
+    """Detect ships in one tile, block by block.
+
+    The blocks are read here, in order, so each part of the image is fetched once; with a
+    ``pool`` (ProcessPoolExecutor) they are analysed in parallel on every CPU core while
+    the next ones are read. ``stats`` (optional) receives how many blocks the tile has and
+    how many were read (the others are land, cloud, nodata or outside every area);
+    ``progress`` (optional) is called as progress(blocks_done, blocks_total)."""
     p = params or DetectParams()
+    rejected = rejected if rejected is not None else Counter()
     results: list[GeoDetection] = []
+    pending: deque = deque()
+    max_pending = 2 * max(getattr(pool, "_max_workers", 1), 1)  # bounds memory
+    berth_src = rasterio.open(berth_path) if berth_path else None
     with rasterio.open(nir_path) as src, rasterio.open(scl_path) as scl_src:
         H, W = src.height, src.width
         pixel_m = abs(src.res[0])
@@ -81,37 +174,102 @@ def detect_scene(nir_path, scl_path, aoi: BaseGeometry, nir_scale: float, nir_of
         nodata = src.nodata if src.nodata is not None else 0
         B, halo = p.block, p.halo
         n_blocks = math.ceil(H / B) * math.ceil(W / B)
-        done = 0
+        state = {"done": 0, "read": 0}
+
+        def finished(job) -> None:
+            dets, rej = job
+            rejected.update(rej)
+            results.extend(_georef(d, src.transform, to_wgs) for d in dets)
+            tick()
+
+        def tick() -> None:
+            state["done"] += 1
+            if progress is not None:
+                progress(state["done"], n_blocks)
+
+        def collect_one() -> None:
+            nonlocal pool
+            fut, args = pending.popleft()
+            try:
+                job = fut.result()
+            except BrokenProcessPool:
+                log.warning("Worker processes stopped; analysing in this process")
+                pool = None
+                job = _block_job(*args)
+            finished(job)
+
+        if progress is not None:
+            progress(0, n_blocks)
         for r0 in range(0, H, B):
             for c0 in range(0, W, B):
-                done += 1
                 rr0, cc0 = max(r0 - halo, 0), max(c0 - halo, 0)
                 rr1, cc1 = min(r0 + B + halo, H), min(c0 + B + halo, W)
                 win = Window(cc0, rr0, cc1 - cc0, rr1 - rr0)
                 wb = box(*window_bounds(win, src.transform))
                 if not wb.intersects(aoi_proj):
+                    tick()
+                    continue
+                # Decide from the small SCL band whether this block has any sea in the area
+                # before reading the big NIR band (which may be streamed over the network).
+                shape_ = (int(win.height), int(win.width))
+                scl = _read_scl(scl_src, win, src.transform, shape_)
+                wt = window_transform(win, src.transform)
+                aoi_mask = geometry_mask([mapping(aoi_proj)], out_shape=shape_, transform=wt, invert=True)
+                if not ((scl == SCL_WATER) & aoi_mask).any():
+                    tick()
                     continue
                 dn = src.read(1, window=win)
+                state["read"] += 1
                 valid = dn != nodata
-                if not valid.any():
-                    continue
-                scl = _read_scl(scl_src, win, src.transform, dn.shape)
+                # Treat the outer rim of the tile like nodata: edge artifacts live there,
+                # and the overlapping neighbour tile sees that strip from its interior.
+                e = p.edge_buffer_px
+                if rr0 < e:
+                    valid[: e - rr0] = False
+                if cc0 < e:
+                    valid[:, : e - cc0] = False
+                if rr1 > H - e:
+                    valid[H - e - rr1:] = False
+                if cc1 > W - e:
+                    valid[:, W - e - cc1:] = False
                 if not ((scl == SCL_WATER) & valid).any():
+                    tick()
                     continue
-                refl = dn.astype(np.float32) * nir_scale + nir_offset
-                wt = window_transform(win, src.transform)
-                aoi_mask = geometry_mask([mapping(aoi_proj)], out_shape=dn.shape, transform=wt, invert=True)
-                dets = detect_in_array(refl, scl, valid, aoi_mask, p, pixel_m)
-                for d in dets:
-                    fr, fc = d.row + rr0, d.col + cc0
-                    # Keep each ship once: only in the block whose core holds its centre.
-                    if not (r0 <= fr < r0 + B and c0 <= fc < c0 + B):
-                        continue
-                    d.row, d.col = fr, fc
-                    results.append(_georef(d, src.transform, to_wgs))
-                if done % 10 == 0:
-                    log.info("  block %d/%d, %d ships so far", done, n_blocks, len(results))
+                berth = _read_scl(berth_src, win, src.transform, shape_).astype(bool) if berth_src else None
+                args = (dn, scl, valid, aoi_mask, nir_scale, nir_offset, p, pixel_m, rr0, cc0, r0, c0, berth)
+                if pool is None:
+                    finished(_block_job(*args))
+                    continue
+                try:
+                    pending.append((pool.submit(_block_job, *args), args))
+                except (BrokenProcessPool, RuntimeError):
+                    pool = None
+                    finished(_block_job(*args))
+                    continue
+                while len(pending) >= max_pending:
+                    collect_one()
+        while pending:
+            collect_one()
+    if berth_src is not None:
+        berth_src.close()
+    if stats is not None:
+        stats.update(blocks=n_blocks, read=state["read"])
     return results
+
+
+def _hull_mean(dn: np.ndarray, d: Detection, r_off: int, c_off: int) -> float | None:
+    """Mean DN over the hull samples the colour checks use (see verify.hull_pixels), taken
+    from the block already in memory so the NIR band is not fetched a second time."""
+    from .verify import hull_pixels
+
+    rows, cols = hull_pixels(SimpleNamespace(det=d))
+    ri = np.floor(rows + 0.5).astype(int) - r_off  # sample point -> pixel holding it
+    ci = np.floor(cols + 0.5).astype(int) - c_off
+    inside = (ri >= 0) & (ri < dn.shape[0]) & (ci >= 0) & (ci < dn.shape[1])
+    vals = np.zeros(ri.shape, np.float32)
+    vals[inside] = dn[ri[inside], ci[inside]]
+    ok = vals > 0
+    return float(vals[ok].mean()) if ok.any() else None
 
 
 def _georef(d: Detection, transform, to_wgs: Transformer) -> GeoDetection:
