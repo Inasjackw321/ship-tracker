@@ -160,7 +160,7 @@
       <ul id="areas"></ul>
       <div class="row"><button class="ghost" id="draw-start" title="Click points on the map around the sea you want, then double-click">＋ Draw your own area</button></div>
       <div class="grid" style="margin-top:8px">
-        <label title="Use the newest image of each tile taken in this many days">Look back (days) <input type="number" id="scan-days" value="30" min="1" max="365"></label>
+        <label title="Use the newest image of each tile taken in this many days">Look back (days) <input type="number" id="scan-days" value="10" min="1" max="365"></label>
         <label>Max cloud % <input type="number" id="scan-cloud" value="30" min="0" max="100"></label>
       </div>
       <div class="row"><span id="scan-state" class="meta"></span></div>
@@ -187,6 +187,9 @@
         <label>Min confidence <input type="number" id="f-conf" value="0" min="0" max="1" step="0.1"></label>
         <label class="inline"><input type="checkbox" id="f-stat" checked> show stationary</label>
         <label class="inline" title="Only results from each tile's most recent analysed image"><input type="checkbox" id="f-latest" checked> latest image per tile</label>
+        <label title="Only ships seen in images from this recent period">Images from
+          <select id="f-age"><option value="7">last 7 days</option><option value="14" selected>last 14 days</option>
+            <option value="30">last 30 days</option><option value="">any time</option></select></label>
         <label title="How far each measurement can be trusted (see the ship's popup for why)">Measurement quality
           <select id="f-quality"><option value="any">any</option><option value="fair">fair or good</option><option value="good">good only</option></select></label>
         <label class="inline" title="Draw the ruler and hull outline on the satellite images and the map"><input type="checkbox" id="f-rulers" checked> show measurements on images</label>

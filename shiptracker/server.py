@@ -50,7 +50,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
     (``days``, ``max_cloud``, ``workers``, ``keep_tiles``, ``all_passes``, ``limit``).
     ``flights``: start tracking H-60 helicopters from public ADS-B data in the background."""
     settings = settings or Settings()
-    defaults = {"days": 30, "max_cloud": 30, "keep_tiles": False, **(scan_defaults or {})}
+    defaults = {"days": 10, "max_cloud": 30, "keep_tiles": False, **(scan_defaults or {})}
     settings.ensure_dirs()
     store = Store(settings.db_path)
     tracker = FlightTracker(store)
@@ -327,7 +327,7 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
                 body["start"] = (today - timedelta(days=int(body["days"]))).isoformat()
             opts = ScanOptions(
                 area=body["area"],
-                start=body.get("start") or (today - timedelta(days=30)).isoformat(),
+                start=body.get("start") or (today - timedelta(days=10)).isoformat(),
                 end=body.get("end") or today.isoformat(),
                 max_cloud=float(body.get("max_cloud", 30)),
                 limit=int(body["limit"]) if body.get("limit") else None,

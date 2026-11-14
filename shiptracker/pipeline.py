@@ -87,16 +87,23 @@ def area_km2(geom: BaseGeometry) -> float:
 
 
 BERTH_HISTORY = 6  # earlier passes of a coastal tile used to map its berths
-CLEAR_CLOUD = 10.0  # % cloud: an image this clear is preferred over a newer, cloudier one
+CLEAR_CLOUD = 10.0       # % cloud: an image this clear is preferred over a newer, cloudier one ...
+CLEAR_WITHIN_DAYS = 5.0  # ... but only if it is at most this much older (about one revisit)
+
+
+def _ts_of(iso: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
 def select_latest_coverage(scenes, aoi: BaseGeometry, min_gain: float = 0.02,
                            clear_cloud: float | None = CLEAR_CLOUD) -> list:
     """For each MGRS tile, take the newest scenes until the tile's part of the area is covered.
 
-    Images with at most ``clear_cloud`` % cloud come first (newest first), then the rest:
-    a clear image from a few days ago beats today's cloudy one, which costs time to analyse
-    and yields clouds rather than ships. A tile at the edge of an orbit swath is only
+    Recency comes first. Among a tile's images from the newest one's last
+    ``CLEAR_WITHIN_DAYS``, one with at most ``clear_cloud`` % cloud is preferred to a
+    cloudier one (a clear image from three days ago beats today's overcast one); older
+    images are used only to fill gaps, never because they are clearer. A tile at the edge of an orbit swath is only
     partly imaged on each pass, so a second pass from the neighbouring orbit is added
     when it fills a gap. Works on anything with ``id``, ``tile``, ``datetime``,
     ``geometry`` (and ``cloud_cover``).
@@ -111,7 +118,13 @@ def select_latest_coverage(scenes, aoi: BaseGeometry, min_gain: float = 0.02,
 
     for group in by_tile.values():
         group.sort(key=lambda sc: sc.datetime, reverse=True)
-        group.sort(key=cloudy)  # stable: clear images first, each part newest first
+        newest = _ts_of(group[0].datetime)
+
+        def rank(sc) -> tuple:
+            recent = newest - _ts_of(sc.datetime) <= CLEAR_WITHIN_DAYS * 86400
+            return (not recent, recent and cloudy(sc))
+
+        group.sort(key=rank)  # stable: recent clear, recent cloudy, then older; each newest first
         geoms = [shape(sc.geometry).intersection(aoi) for sc in group]
         total = unary_union(geoms).area
         if total <= 0:

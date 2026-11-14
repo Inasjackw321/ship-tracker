@@ -76,6 +76,10 @@ legend.onAdd = () => {
 legend.addTo(map);
 
 const fmtDate = (iso) => iso.replace('T', ' ').slice(0, 16) + ' UTC';
+const daysAgo = (iso) => {
+  const d = Math.floor((Date.now() - Date.parse(iso)) / 864e5);
+  return d <= 0 ? 'today' : d === 1 ? 'yesterday' : `${d} days ago`;
+};
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function dms(v, pos, neg) {
@@ -117,7 +121,7 @@ function popupHtml(p, lat, lon) {
         ? ` <span style="color:#666">(automatic: ${lenText(p.auto)} × ${beamText(p.auto)})</span>` : ''}</td></tr>
       ${p.wake_m ? `<tr><td>Under way</td><td>wake ≈ ${Math.round(p.wake_m)} m behind the stern (not counted in the length)</td></tr>` : ''}
       <tr><td>Hull axis</td><td>${p.heading_deg.toFixed(0)}° / ${((p.heading_deg + 180) % 360).toFixed(0)}°</td></tr>
-      <tr><td>Seen</td><td>${esc(fmtDate(p.datetime))}</td></tr>
+      <tr><td>Seen</td><td>${esc(fmtDate(p.datetime))} <b>(${daysAgo(p.datetime)})</b></td></tr>
       <tr><td>Position</td><td>${lat.toFixed(5)}, ${lon.toFixed(5)}</td></tr>
       <tr><td>Confidence</td><td>${(p.confidence * 100).toFixed(0)}%  (SNR ${p.snr})</td></tr>
       ${p.stationary ? '<tr><td>Note</td><td>also seen here on another date (platform / anchored?)</td></tr>' : ''}
@@ -250,7 +254,7 @@ function render() {
     li.innerHTML = `${p.chip_url ? `<img loading="lazy" src="${esc(chipSrc(p))}" data-chip="${p.id}" alt="">` : '<img alt="">'}
       <div><div class="len">${lenText(p)} × ${beamText(p)}${p.adjusted ? '<span class="tag">adjusted</span>' : ''}
       ${p.stationary ? '<span class="tag">stationary</span>' : ''}</div>
-      <div class="meta">${esc(fmtDate(p.datetime))}</div>
+      <div class="meta">${esc(fmtDate(p.datetime))} · ${daysAgo(p.datetime)}</div>
       <div class="meta">${f.geometry.coordinates[1].toFixed(4)}, ${f.geometry.coordinates[0].toFixed(4)} · conf ${(p.confidence * 100).toFixed(0)}%
         · <span style="color:${(QUALITY[p.quality] || ['', '#888'])[1]}">${(QUALITY[p.quality] || ['?'])[0].toLowerCase()} measurement</span></div></div>`;
     li.onclick = () => {
@@ -664,6 +668,7 @@ async function getJSON(url, opts) {
 async function loadDetections() {
   const q = new URLSearchParams();
   if ($('f-start').value) q.set('start', $('f-start').value);
+  else if ($('f-age').value) q.set('start', new Date(Date.now() - Number($('f-age').value) * 864e5).toISOString().slice(0, 10));
   if ($('f-end').value) q.set('end', $('f-end').value);
   q.set('min_length', $('f-min').value || 0);
   if ($('f-max').value) q.set('max_length', $('f-max').value);
@@ -716,7 +721,7 @@ function openAreaPopup(id, latlng) {
   const html = `<div class="area-pop"><b>${esc(p.name)}</b>
     <div class="st">${esc(areaStatus(p))}</div>
     <button data-scan-area="${esc(id)}" ${busy ? 'disabled' : ''}>${busy ? (scanJob.area === id ? 'Scanning…' : 'Another scan is running') : (p.status === 'done' ? 'Scan again' : 'Scan this area')}</button>
-    <div class="st">Newest image of each tile from the last ${Number($('scan-days').value || 30)} days.
+    <div class="st">Newest image of each tile from the last ${Number($('scan-days').value || 10)} days.
       ${p.km2 ? `Area ${Number(p.km2).toLocaleString()} km².` : ''}</div>
     ${p.custom ? `<button class="ghost-pop" data-delete-area="${esc(id)}">Remove this area</button>` : ''}</div>`;
   L.popup({ autoPan: true }).setLatLng(latlng || layer.getBounds().getCenter()).setContent(html).openOn(map);
@@ -828,7 +833,7 @@ async function startScan(id) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         area: id,
-        days: Number($('scan-days').value || 30),
+        days: Number($('scan-days').value || 10),
         max_cloud: Number($('scan-cloud').value || 30),
       }),
     });
@@ -877,6 +882,7 @@ $('reset-btn').onclick = resetAll;
 $('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes()]).catch((e) => alert(e.message));
 $('f-latest').onchange = $('f-apply').onclick;
 $('f-quality').onchange = $('f-apply').onclick;
+$('f-age').onchange = $('f-apply').onclick;
 $('f-notships').onchange = $('f-apply').onclick;
 $('f-rulers').checked = showRulers;
 $('f-rulers').onchange = () => {

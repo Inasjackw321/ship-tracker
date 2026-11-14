@@ -18,7 +18,7 @@ The first run creates `.venv` and installs everything. After that it starts the 
 
 1. Click an area on the map (the green outlines), or find it in the **Areas** list in the sidebar.
 2. Press **Scan this area** (or **Scan** in the list).
-3. Each Sentinel-2 tile of that area uses its most recent usable image from the last 30 days. Ships appear on the map as each tile finishes, and the area turns orange and dashed while it is being scanned.
+3. Each Sentinel-2 tile of that area uses its most recent usable image from the last 10 days. Ships appear on the map as each tile finishes, and the area turns orange and dashed while it is being scanned.
 
 | Group | Area (id) |
 |---|---|
@@ -136,7 +136,7 @@ When the detector changes, tiles analysed by an older version are redone automat
 
 ## Covering the whole area
 
-By default a scan uses the **most recent usable image of each MGRS tile** within the look-back window (30 days):
+By default a scan uses the **most recent usable image of each MGRS tile** within the look-back window (10 days; Sentinel-2's three satellites photograph most places every 3–5 days):
 
 - If a tile's newest image has no cloud-free sea, the scan falls back to the next older pass, up to 3 times.
 - Some tiles sit at the edge of a satellite swath, where each pass images only part of the tile. For those, older passes are added until the whole tile is covered.
@@ -182,7 +182,7 @@ Fair-weather cumulus over the sea is the main source of false ships. Clouds are 
 - **Surroundings.** A roundish or soft object in a field of cloud is rejected. A long, narrow, sharp-edged one is kept even between clouds, so ships in partly cloudy weather are still found.
 - **Smoke and haze are not cloud.** Sentinel-2's "thin cirrus" class, where smoke and dust haze also end up, does not reject ships near it. It only hides the sea where it is bright enough to be real cloud.
 
-Each tile also uses the **newest image with at most 10 % cloud** in the look-back window, and only falls back to a cloudier image when there is none.
+Recency comes first: each tile uses its newest image, except that an image with at most 10 % cloud is preferred to a cloudier one taken up to 5 days later. An older image is never used just because it is clearer. The map shows ships from the last 14 days by default; **Images from** under *Filter* changes that.
 
 The cloud checks run *before* the slow hull-model fit. A patch of cumulus used to take minutes to analyse; it now takes about a second. On a synthetic cumulus benchmark (`tests/bench_clouds.py`), false ships fell from 0.96 to 0.38 per 9 × 9 km scene, and ships on clear water between the clouds found rose from 64 % to 80 %. The cost: two ships moored side by side can merge into one fat blob and be rejected as cloud.
 

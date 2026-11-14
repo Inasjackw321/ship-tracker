@@ -37,12 +37,14 @@ def test_coverage_reports_unimaged_part():
     assert imagery_coverage([], AOI)["fraction"] == 0.0
 
 
-def test_clear_image_preferred_over_newer_cloudy_one():
+def test_recent_clear_image_preferred_but_never_old_ones():
+    """Recency first: a clear image from 3 days earlier beats today's cloudy one, but a
+    clear image from 2 weeks ago never beats a recent one (the map stays up to date)."""
     from dataclasses import replace
     cloudy = replace(_scene("today-cloudy", "2026-10-08T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=45.0)
     clear = replace(_scene("monday-clear", "2026-10-05T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=3.0)
-    older = replace(_scene("last-week-clear", "2026-10-01T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=0.5)
-    assert [s.id for s in select_latest_coverage([cloudy, clear, older], AOI)] == ["monday-clear"]
-    # no clear image at all: the newest one, as before
-    hazy = replace(older, id="old-hazy", cloud_cover=25.0)
+    old = replace(_scene("old-clear", "2026-09-24T06:00:00Z", "41QKL", box(60, 20, 61, 21)), cloud_cover=0.5)
+    assert [s.id for s in select_latest_coverage([cloudy, clear, old], AOI)] == ["monday-clear"]
+    assert [s.id for s in select_latest_coverage([cloudy, old], AOI)] == ["today-cloudy"]
+    hazy = replace(clear, id="recent-hazy", cloud_cover=25.0)
     assert [s.id for s in select_latest_coverage([cloudy, hazy], AOI)] == ["today-cloudy"]

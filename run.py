@@ -88,8 +88,8 @@ def main() -> int:
     ap.add_argument("--areas", action="store_true", help="list the area ids and exit")
     ap.add_argument("--check", action="store_true", help="test that imagery can be found and downloaded, then open the map")
     ap.add_argument("--reset", action="store_true", help="delete all tracked ships first and start fresh")
-    ap.add_argument("--days", type=int, default=30,
-                    help="look this many days back for each tile's most recent image (default 30)")
+    ap.add_argument("--days", type=int, default=10,
+                    help="look this many days back for each tile's most recent image (default 10)")
     ap.add_argument("--limit", type=int, default=0, help="max tiles to download this run (default 0 = whole area)")
     ap.add_argument("--all-passes", action="store_true",
                     help="scan every pass in the window instead of the newest image of each tile")

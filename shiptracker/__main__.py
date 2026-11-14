@@ -19,7 +19,7 @@ def _days_ago(n: int) -> str:
 def _add_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--start", default=None, help="start date YYYY-MM-DD (default: 7 days ago)")
     p.add_argument("--end", default=None, help="end date YYYY-MM-DD (default: today)")
-    p.add_argument("--days", type=int, default=30,
+    p.add_argument("--days", type=int, default=10,
                    help="look-back window when --start is omitted (each tile uses its latest image in it)")
     p.add_argument("--max-cloud", type=float, default=30.0, help="max scene cloud cover %% (default 30)")
     p.add_argument("--limit", type=int, default=None, help="process at most N scenes (newest first)")
@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("area", help="area id (see: shiptracker areas)")
     p.add_argument("--every-hours", type=float, default=6.0)
     p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--days", type=int, default=30, help="look-back window on each run")
+    p.add_argument("--days", type=int, default=10, help="look-back window on each run")
     p.add_argument("--max-cloud", type=float, default=30.0)
     p.add_argument("--no-rgb", action="store_true")
     p.add_argument("--keep-tiles", action="store_true")
