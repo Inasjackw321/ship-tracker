@@ -29,10 +29,13 @@ SOURCES = {
 }
 
 
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_DATA", str(ROOT / "data"))))
-    aoi_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_AOI", str(ROOT / "config" / "aoi.geojson"))))
+    # The areas ships are tracked in; each is scanned when chosen (config/areas.geojson).
+    areas_path: Path = field(default_factory=lambda: Path(_env("SHIPTRACKER_AREAS", str(ROOT / "config" / "areas.geojson"))))
     source: str = field(default_factory=lambda: _env("SHIPTRACKER_SOURCE", "earth-search"))
     # Overrides for the selected source (handy for mirrors and tests).
     stac_url: str | None = field(default_factory=lambda: os.environ.get("SHIPTRACKER_STAC_URL"))
@@ -59,6 +62,37 @@ class Settings:
         if self.collection:
             cfg["collection"] = self.collection
         return cfg
+
+    @property
+    def custom_areas_path(self) -> Path:
+        """Areas drawn on the map (kept with your data, not in the repository)."""
+        return self.data_dir / "custom_areas.geojson"
+
+    def builtin_areas(self):
+        from .aoi import load_areas
+        return load_areas(self.areas_path)
+
+    def custom_areas(self):
+        from .aoi import load_areas
+        return load_areas(self.custom_areas_path)
+
+    def areas(self):
+        return self.builtin_areas() + self.custom_areas()
+
+    def area(self, area_id: str):
+        for a in self.areas():
+            if a.id == area_id:
+                return a
+        raise KeyError(f"unknown area {area_id!r}; choose from {', '.join(a.id for a in self.areas())}")
+
+    def search_area(self):
+        """All areas together: every tile is analysed for all the areas it touches."""
+        from shapely.ops import unary_union
+        return unary_union([a.geom for a in self.areas()])
+
+    def builtin_search_area(self):
+        from shapely.ops import unary_union
+        return unary_union([a.geom for a in self.builtin_areas()])
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.tiles_dir, self.chips_dir):

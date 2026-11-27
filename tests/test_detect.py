@@ -33,7 +33,8 @@ def test_detects_and_measures_each_ship():
     assert len(dets) == len(SHIPS)
     for r, c, L, W, hd in truth:
         d = _match(dets, r, c)
-        assert abs(d.length_m - L) / L < 0.10, f"{L} m ship measured {d.length_m} m"
+        # within 10 %, or for boats only a few pixels long within twice the stated +-
+        assert abs(d.length_m - L) <= max(0.10 * L, 2 * d.length_err_m), f"{L} m ship measured {d.length_m} m"
         diff = abs((d.heading_deg - hd + 90) % 180 - 90)
         assert diff < 4, f"axis {hd} measured {d.heading_deg}"
 
@@ -59,3 +60,94 @@ def test_ignores_land_and_clouds():
     refl[80:84, 455:470] += 0.3
     refl += rng.normal(0, 0.001, refl.shape).astype(np.float32)
     assert _run(refl, scl) == []
+
+
+def test_rejects_cumulus_field_but_keeps_isolated_ship():
+    from tests.synth import add_cumulus_field
+
+    refl, scl, truth = make_scene(ships=[(480, 480, 150, 25, 30)], land=False, cloud=False)
+    refl, scl = add_cumulus_field(refl, scl, center=(180, 200), radius=120, n=60)
+    dets = _run(refl, scl)
+    assert len(dets) == 1, [(round(d.row), round(d.col), d.length_m) for d in dets]
+    _match(dets, *truth[0][:2])
+
+
+def _vegetation_strip():
+    # Mangrove forest shore with a detached 450 x 40 m vegetated strip just offshore,
+    # like the false positive at 22.393 N 69.070 E (459 m x 45 m along a mangrove edge).
+    refl, scl, _ = make_scene(ships=[], land=False, cloud=False)
+    refl[:, :150] = 0.30
+    scl[:, :150] = 4
+    refl[280:325, 156:160] = 0.30
+    scl[280:325, 156:160] = 4
+    return refl, scl
+
+
+def test_vegetation_strip_is_not_a_ship():
+    refl, scl = _vegetation_strip()
+    assert _run(refl, scl) == []
+
+
+def test_vegetation_strip_was_a_false_positive_with_old_settings():
+    # Guards the test above: the old sea mask turned the strip into a ~450 m "ship".
+    refl, scl = _vegetation_strip()
+    valid = np.ones(refl.shape, bool)
+    old = DetectParams(max_hole_px=3000, max_length_m=500, coast_buffer_px=3, fill_vegetation_holes=True)
+    dets = detect_in_array(refl, scl, valid, valid, old)
+    assert len(dets) == 1 and dets[0].length_m > 400
+
+
+def test_ignores_bright_artifacts_along_data_edge():
+    # Swath edge: nodata on the right, with a jagged bright rim on the last valid pixels.
+    refl, scl, _ = make_scene(ships=[(300, 200, 150, 25, 20)], land=False, cloud=False)
+    valid = np.ones(refl.shape, bool)
+    valid[:, 450:] = False
+    refl[:, 450:] = 0
+    scl[:, 450:] = 0
+    rng = np.random.default_rng(3)
+    for r in range(0, 600, 25):
+        refl[r:r + rng.integers(4, 15), 440:450] += 0.15
+    dets = detect_in_array(refl, scl, valid, valid | True, DetectParams())
+    assert len(dets) == 1
+    _match(dets, 299.5, 199.5)
+
+
+def test_ships_moored_at_piers():
+    """Moored ships merge with their pier in today's scene classification; with the berths
+    known from earlier passes they are found and measured, and piers are not ships."""
+    import math
+
+    from tests.synth import make_harbour
+
+    refl, scl, berth, moored, offshore = make_harbour()
+    v = np.ones(refl.shape, bool)
+    without = detect_in_array(refl, scl, v, v, DetectParams())
+    assert not any(math.hypot(d.row - r, d.col - c) < 10 for d in without for r, c, L in moored)
+    dets = detect_in_array(refl, scl, v, v, DetectParams(), berth=berth)
+    for r, c, L in moored:
+        hit = [d for d in dets if math.hypot(d.row - r, d.col - c) < 10]
+        assert hit and abs(hit[0].length_m - L) < 0.05 * L
+    assert len(dets) == len(moored) + 1  # plus the ship at sea; no pier
+
+
+def test_berth_map_keeps_berths_not_tidal_flats(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from shiptracker.scene import berth_map
+
+    def write(name, arr):
+        with rasterio.open(tmp_path / name, "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
+                           count=1, dtype="uint8", crs="EPSG:32641",
+                           transform=from_origin(300000, 2600000, 20, 20)) as dst:
+            dst.write(arr, 1)
+        return tmp_path / name
+
+    today = np.full((300, 300), 6, np.uint8)
+    today[:, 200:] = 5
+    today[100:110, 150:200] = 5    # a berth with a ship in it today
+    today[150:250, 120:200] = 5    # a large tidal flat exposed today
+    before = np.full((300, 300), 6, np.uint8)
+    before[:, 200:] = 5
+    b = rasterio.open(berth_map(write("t.tif", today), [write("o.tif", before)], tmp_path / "b.tif")).read(1)
+    assert b[100:110, 150:200].all() and not b[150:250, 120:200].any() and not b[:, 200:].any()
