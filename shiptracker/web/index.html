@@ -19,19 +19,22 @@
   #mapwrap { flex: 1; position: relative; min-height: 0; }
   #map { position: absolute; inset: 0; }
   /* Only as wide as its cards, so the rest of the map stays clickable. */
-  #timeline { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1001; height: 52px; display: flex; gap: 8px;
-    align-items: center; padding: 0 12px; background: #0f1419ee; border-top: 1px solid var(--line); font-size: 12px; }
-  #timeline.past { box-shadow: inset 0 3px 0 #ffb000; }
-  #timeline .tl-track { position: relative; flex: 1; min-width: 120px; height: 36px; }
-  #timeline canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-  #timeline input[type=range] { position: absolute; left: 0; right: 0; bottom: -4px; width: 100%; padding: 0; background: transparent;
-    border: 0; accent-color: #ffb000; }
-  #timeline #tl-label { min-width: 170px; white-space: nowrap; font-weight: 600; }
-  #timeline select { width: auto; padding: 3px 6px; }
-  #timeline .mini { padding: 4px 8px; }
+  #timeline { position: absolute; left: 0; right: 0; top: 0; z-index: 1001; padding: 6px 12px 0; background: #0f1419f2;
+    border-bottom: 1px solid var(--line); font-size: 12px; }
+  #timeline.past { border-bottom: 3px solid #ffb000; }
+  #timeline .tl-top { display: flex; gap: 8px; align-items: center; }
+  #timeline #tl-date { font-size: 16px; min-width: 150px; text-align: center; }
+  #timeline.past #tl-date { color: #ffb000; }
+  #timeline #tl-label { flex: 1; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #timeline .tl-track { position: relative; height: 34px; }
+  #timeline canvas { position: absolute; left: 0; right: 0; top: 2px; width: 100%; height: 20px; }
+  #timeline input[type=range] { position: absolute; left: 0; right: 0; bottom: 0; width: 100%; padding: 0; background: transparent;
+    border: 0; accent-color: #ffb000; cursor: pointer; }
+  #timeline .mini { padding: 4px 9px; }
   #timeline .mini.ghost { color: var(--text); border-color: var(--line); }
-  #map .leaflet-bottom { bottom: 52px; }
-  #tray { position: absolute; left: 10px; bottom: 64px; z-index: 1000; background: #0f1419ee; width: max-content;
+  #map .leaflet-top { top: 78px; }
+  #mapwrap .floatbox { top: 88px; }
+  #tray { position: absolute; left: 10px; bottom: 24px; z-index: 1000; background: #0f1419ee; width: max-content;
     max-width: min(calc(100% - 190px), 980px); border: 1px solid var(--line); border-radius: 8px;
     padding: 8px 10px; max-height: 46%; display: flex; flex-direction: column; gap: 8px; }
   #tray[hidden] { display: none; }
@@ -203,16 +206,11 @@
     <section>
       <h2>Filter</h2>
       <div class="grid">
-        <label>From <input type="date" id="f-start"></label>
-        <label>To <input type="date" id="f-end"></label>
         <label>Min length (m) <input type="number" id="f-min" value="0" min="0"></label>
         <label>Max length (m) <input type="number" id="f-max" placeholder="any" min="0"></label>
         <label>Min confidence <input type="number" id="f-conf" value="0" min="0" max="1" step="0.1"></label>
         <label class="inline"><input type="checkbox" id="f-stat" checked> show stationary</label>
         <label class="inline" title="Only results from each tile's most recent analysed image"><input type="checkbox" id="f-latest" checked> latest image per tile</label>
-        <label title="Only ships seen in images from this recent period">Images from
-          <select id="f-age"><option value="7">last 7 days</option><option value="14" selected>last 14 days</option>
-            <option value="30">last 30 days</option><option value="">any time</option></select></label>
         <label title="How far each measurement can be trusted (see the ship's popup for why)">Measurement quality
           <select id="f-quality"><option value="any">any</option><option value="fair">fair or good</option><option value="good">good only</option></select></label>
         <label class="inline" title="Draw the ruler and hull outline on the satellite images and the map"><input type="checkbox" id="f-rulers" checked> show measurements on images</label>
@@ -243,16 +241,17 @@
       <button class="mini" id="adjust-save">Save</button>
       <button class="mini ghost" id="adjust-cancel">Cancel</button>
     </div>
-    <div id="timeline" title="Move through time to see ships from the past">
-      <button class="mini ghost" id="tl-prev" title="Previous day with imagery">◀</button>
-      <button class="mini ghost" id="tl-play" title="Play: step through the days with imagery">▶</button>
-      <button class="mini ghost" id="tl-next" title="Next day with imagery">▶|</button>
-      <div class="tl-track"><canvas id="tl-hist"></canvas><input type="range" id="tl-slider" min="0" max="0" value="0" step="1"></div>
-      <span id="tl-label">Latest picture</span>
-      <select id="tl-window" title="How many days up to the chosen day to show">
-        <option value="1">1 day</option><option value="3">3 days</option><option value="7" selected>7 days</option>
-        <option value="30">30 days</option><option value="all">all time</option></select>
-      <button class="mini" id="tl-latest" title="Back to the latest picture" disabled>Latest</button>
+    <div id="timeline">
+      <div class="tl-top">
+        <button class="mini ghost" id="tl-prev" title="One day earlier">◀</button>
+        <b id="tl-date">Now</b>
+        <button class="mini ghost" id="tl-next" title="One day later">▶</button>
+        <span id="tl-label">Latest picture of every tile</span>
+        <button class="mini" id="tl-latest" title="Back to the latest picture" disabled>Now</button>
+      </div>
+      <div class="tl-track" title="Pick a day: the area you are working on is loaded with the images taken up to that day">
+        <canvas id="tl-hist"></canvas><input type="range" id="tl-slider" min="0" max="90" value="90" step="1">
+      </div>
     </div>
     <div id="tray" hidden>
       <div class="bar">

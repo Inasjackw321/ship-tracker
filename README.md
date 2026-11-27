@@ -241,17 +241,16 @@ It finds 189/200, with 1 gross length error (more than 15 % off) and a big-ship 
 
 ## Going back in time
 
-The **timeline** under the map covers every day with analysed imagery. Green bars show how many ships each day has, and blue ticks mark days with images.
+The **date bar** at the top of the map reaches back 90 days.
 
-- **Drag the slider** to a day to see the ships from the images of that day and the days before it. The window can be 1, 3, 7 or 30 days, or all time. While you look at the past, an amber line runs along the timeline's top edge.
-- **◀ / ▶|** jump to the previous / next day with imagery, and **▶** plays through those days one by one.
-- **Latest** returns to the latest picture of every tile.
-
-Scanning an area again with a longer **Look back (days)** analyses older passes too, which fills the timeline further back.
+- **Pick a day:** drag the slider, or step a day with **◀ / ▶**. The ships from the images taken that day and the 4 days before it are shown; Sentinel-2 photographs each place every 3–5 days, so that window holds about one picture of every tile.
+- **Imagery loads automatically:** if those days have not been analysed yet, the app loads them for the area you are working on (the one you scanned or clicked last). Ships appear as each tile finishes, and progress shows in the date bar. Days already analysed show at once.
+- **Days with data:** green bars mark days with ships, and blue ticks mark days with analysed images.
+- **Now** returns to the latest picture of every tile.
 
 ## Exporting
 
-**Export ships** in the sidebar exports every ship the map is showing; the filters and the timeline apply:
+**Export ships** in the sidebar exports every ship the map is showing; the filters and the picked day apply:
 
 - **CSV**, **GeoJSON** or **KML** download at once: position, length and beam with uncertainty, reliability, hull ends, confidence, time and source image for every ship.
 - **Data + images (.zip)** adds each ship's image with its coordinates printed on it, plus its GeoTIFF where saved. It is built in the background with a progress count and downloads when ready. Untick *show measurements on images* first for images without rulers.

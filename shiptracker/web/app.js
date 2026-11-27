@@ -669,12 +669,9 @@ async function getJSON(url, opts) {
 function detectionQuery() {
   const q = new URLSearchParams();
   const win = timelineWindow();
-  if (win) {  // the timeline was moved into the past: that window, every pass in it
+  if (win) {  // a day picked on the timeline: the images taken in the days up to it
     q.set('start', win.start); q.set('end', win.end); q.set('view', 'all');
   } else {
-    if ($('f-start').value) q.set('start', $('f-start').value);
-    else if ($('f-age').value) q.set('start', new Date(Date.now() - Number($('f-age').value) * 864e5).toISOString().slice(0, 10));
-    if ($('f-end').value) q.set('end', $('f-end').value);
     q.set('view', $('f-latest').checked ? 'latest' : 'all');
   }
   q.set('min_length', $('f-min').value || 0);
@@ -724,6 +721,7 @@ function areaStatus(p) {
 }
 
 function openAreaPopup(id, latlng) {
+  lastArea = id;
   const p = currentArea(id);
   const layer = areaById.get(id);
   if (!layer) return;
@@ -834,11 +832,14 @@ async function pollScan() {
     }
   } else if (polling) {
     clearInterval(polling); polling = null;
-    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadAreas(); loadTimeline().catch(console.error);
+    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadAreas();
+    loadTimeline().catch(console.error).then(() => { if (tl.pending) loadPickedDay(); });
   }
+  if (running && !tl.live) refreshTimelineUi(`${name}: ${scanJob.text}`);
 }
 
 async function startScan(id) {
+  lastArea = id;
   map.closePopup();
   try {
     await getJSON('/api/scan', {
@@ -894,7 +895,6 @@ $('reset-btn').onclick = resetAll;
 $('f-apply').onclick = () => Promise.all([loadDetections(), loadScenes()]).catch((e) => alert(e.message));
 $('f-latest').onchange = $('f-apply').onclick;
 $('f-quality').onchange = $('f-apply').onclick;
-$('f-age').onchange = $('f-apply').onclick;
 $('f-notships').onchange = $('f-apply').onclick;
 $('f-rulers').checked = showRulers;
 $('f-rulers').onchange = () => {
@@ -904,56 +904,74 @@ $('f-rulers').onchange = () => {
   refreshChips();
 };
 
-// ---- Timeline: move through time to see ships from the past ----
+// ---- Timeline: pick a day to see the ships of that day ----
+// Picking a day shows what is already analysed and loads the area you are working on
+// with the images taken up to that day (Sentinel-2 photographs each place every 3-5 days).
 const DAY = 864e5;
-const tl = { first: null, last: null, counts: new Map(), images: new Set(), live: true, playing: null };
+const TL_DAYS = 90;    // how far back the slider reaches
+const TL_WINDOW = 5;   // a picked day shows the images of that day and the 4 before it
+const tl = { live: true, counts: new Map(), images: new Set(), pending: null };
+let lastArea = null;   // the area you scanned or clicked last: the one the timeline loads
 const isoDay = (t) => new Date(t).toISOString().slice(0, 10);
-const dayIndex = (d) => Math.round((Date.parse(d) - Date.parse(tl.first)) / DAY);
-const indexDay = (i) => isoDay(Date.parse(tl.first) + i * DAY);
+const todayStart = () => Date.parse(isoDay(Date.now()));
+const indexDay = (i) => isoDay(todayStart() - (TL_DAYS - i) * DAY);
+const dayIndex = (d) => TL_DAYS - Math.round((todayStart() - Date.parse(d)) / DAY);
+const niceDay = (d) => new Date(d + 'T12:00:00Z').toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
 
 function timelineWindow() {  // null while showing the latest picture
-  if (tl.live || !tl.first) return null;
+  if (tl.live) return null;
   const end = indexDay(Number($('tl-slider').value));
-  const w = $('tl-window').value;
-  const start = w === 'all' ? tl.first : isoDay(Date.parse(end) - (Number(w) - 1) * DAY);
-  return { start, end };
+  return { start: isoDay(Date.parse(end) - (TL_WINDOW - 1) * DAY), end };
 }
 
-function timelineLabel() {
-  const win = timelineWindow();
-  if (!tl.first) return 'No imagery analysed yet';
-  if (!win) return 'Latest picture';
-  const n = [...tl.counts].filter(([d]) => d >= win.start && d <= win.end).reduce((s, [, c]) => s + c, 0);
-  return (win.start === win.end ? win.end : `${win.start} → ${win.end}`) + ` · ${n} ships`;
+function timelineArea() {
+  if (lastArea && currentArea(lastArea).id) return lastArea;
+  const done = areas.filter((f) => f.properties.finished).sort((a, b) => b.properties.finished - a.properties.finished);
+  return done.length ? done[0].properties.id : null;
 }
 
 function drawTimeline() {
   const cv = $('tl-hist');
   const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w) return;
   cv.width = w * devicePixelRatio; cv.height = h * devicePixelRatio;
   const g = cv.getContext('2d');
   g.scale(devicePixelRatio, devicePixelRatio);
-  g.clearRect(0, 0, w, h);
-  if (!tl.first) return;
-  const n = dayIndex(tl.last) + 1, max = Math.max(1, ...tl.counts.values());
   const win = timelineWindow();
-  for (let i = 0; i < n; i++) {
-    const d = indexDay(i), x = (i + 0.5) / n * w;
+  const max = Math.max(1, ...tl.counts.values());
+  for (let i = 0; i <= TL_DAYS; i++) {
+    const d = indexDay(i), x = i / TL_DAYS * (w - 16) + 8;  // matches the slider thumb's travel
     const inWin = win && d >= win.start && d <= win.end;
-    if (tl.images.has(d)) { g.fillStyle = inWin ? '#58a6ff88' : '#58a6ff33'; g.fillRect(x - 1, h - 4, 2, 4); }
+    if (inWin) { g.fillStyle = '#ffb00033'; g.fillRect(x - (w - 16) / TL_DAYS / 2, 0, (w - 16) / TL_DAYS, h); }
+    if (tl.images.has(d)) { g.fillStyle = '#58a6ff'; g.fillRect(x - 1, h - 3, 2, 3); }
     const c = tl.counts.get(d) || 0;
     if (c) {
-      const bh = Math.max(2, (h - 6) * Math.sqrt(c / max));
-      g.fillStyle = inWin ? '#39d353' : '#39d35366';
-      g.fillRect(x - Math.max(1, w / n / 2 - 0.5), h - 4 - bh, Math.max(2, w / n - 1), bh);
+      const bh = Math.max(2, (h - 5) * Math.sqrt(c / max));
+      g.fillStyle = inWin ? '#39d353' : '#39d35388';
+      g.fillRect(x - 2, h - 4 - bh, 4, bh);
+    }
+    if (d.endsWith('-01')) {  // month marks
+      g.fillStyle = '#8b98a5'; g.font = '10px system-ui';
+      g.fillText(new Date(d + 'T12:00:00Z').toLocaleDateString(undefined, { month: 'short' }), x + 2, 9);
     }
   }
 }
 
-function refreshTimelineUi() {
-  $('tl-label').textContent = timelineLabel();
+function refreshTimelineUi(status) {
+  const win = timelineWindow();
+  $('tl-date').textContent = win ? niceDay(win.end) : 'Now';
   $('tl-latest').disabled = tl.live;
   $('timeline').classList.toggle('past', !tl.live);
+  if (status) $('tl-label').textContent = status;
+  else if (!win) $('tl-label').textContent = 'Latest picture of every tile · pick a day on the slider to go back';
+  else {
+    const n = [...tl.counts].filter(([d]) => d >= win.start && d <= win.end).reduce((s, [, c]) => s + c, 0);
+    const area = timelineArea();
+    const imgs = [...tl.images].some((d) => d >= win.start && d <= win.end);
+    $('tl-label').textContent = `Images taken ${niceDay(win.start)} – ${niceDay(win.end)} · `
+      + (imgs ? `${n} ships` : 'no images analysed for these days')
+      + (area ? '' : ' · click an area on the map to load imagery for it');
+  }
   drawTimeline();
 }
 
@@ -961,53 +979,49 @@ async function loadTimeline() {
   const t = await getJSON('/api/timeline');
   tl.counts = new Map(t.days.map((d) => [d.date, d.ships]));
   tl.images = new Set(t.days.filter((d) => d.images).map((d) => d.date));
-  const today = isoDay(Date.now());
-  tl.first = t.first; tl.last = t.last && t.last > today ? t.last : today;
-  const s = $('tl-slider');
-  s.max = tl.first ? dayIndex(tl.last) : 0;
-  if (tl.live) s.value = s.max;
   refreshTimelineUi();
 }
 
-let tlTimer = null;
-function timelineMoved() {  // debounce while dragging
+function showPicked() {  // what is already analysed for the picked day
+  loadDetections().catch(console.error);
+  loadScenes().catch(console.error);
+}
+
+async function loadPickedDay() {  // and fetch that day's imagery for the area
+  const win = timelineWindow();
+  const area = timelineArea();
+  if (!win || !area) return;
+  if (scanJob.running) {
+    tl.pending = { area, win };
+    refreshTimelineUi(`Loading ${niceDay(win.end)} as soon as the current scan finishes…`);
+    return;
+  }
+  tl.pending = null;
+  refreshTimelineUi(`Loading imagery up to ${niceDay(win.end)} for ${currentArea(area).name}…`);
+  try {
+    await getJSON('/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ area, start: win.start, end: win.end, max_cloud: Number($('scan-cloud').value || 30) }) });
+  } catch (e) { refreshTimelineUi('Could not load that day: ' + e.message); }
+  pollScan().catch(console.error);
+}
+
+let tlShow = null, tlLoad = null;
+function picked(immediate) {
   tl.live = false;
   refreshTimelineUi();
-  clearTimeout(tlTimer);
-  tlTimer = setTimeout(() => { loadDetections().catch(console.error); loadScenes().catch(console.error); }, 150);
+  clearTimeout(tlShow); clearTimeout(tlLoad);
+  tlShow = setTimeout(showPicked, immediate ? 0 : 200);
+  tlLoad = setTimeout(loadPickedDay, immediate ? 300 : 900);  // once the slider has settled
 }
-
-function jumpImageDate(dir) {  // to the previous / next day with imagery
-  if (!tl.first) return;
-  const days = [...tl.images].sort();
-  const cur = indexDay(Number($('tl-slider').value));
-  const target = dir < 0 ? days.filter((d) => d < cur).pop() : days.find((d) => d > cur);
-  if (!target) return false;
-  $('tl-slider').value = dayIndex(target);
-  timelineMoved();
-  return true;
-}
-
-function stopPlaying() { clearInterval(tl.playing); tl.playing = null; $('tl-play').textContent = '▶'; }
-$('tl-slider').oninput = timelineMoved;
-$('tl-window').onchange = () => { if (!tl.live) timelineMoved(); else refreshTimelineUi(); };
-$('tl-prev').onclick = () => { stopPlaying(); jumpImageDate(-1); };
-$('tl-next').onclick = () => { stopPlaying(); jumpImageDate(1); };
-$('tl-play').onclick = () => {
-  if (tl.playing) { stopPlaying(); return; }
-  if (tl.live || Number($('tl-slider').value) >= Number($('tl-slider').max)) {  // start from the first image date
-    $('tl-slider').value = tl.first ? dayIndex([...tl.images].sort()[0] || tl.first) : 0;
-    timelineMoved();
-  }
-  $('tl-play').textContent = '❚❚';
-  tl.playing = setInterval(() => { if (!jumpImageDate(1)) stopPlaying(); }, 1500);
-};
+$('tl-slider').oninput = () => { tl.live = false; refreshTimelineUi(); clearTimeout(tlShow); tlShow = setTimeout(showPicked, 200); };
+$('tl-slider').onchange = () => picked(false);
+$('tl-prev').onclick = () => { const s = $('tl-slider'); s.value = Math.max(0, Number(s.value) - (tl.live ? 0 : 1)); picked(false); };
+$('tl-next').onclick = () => { const s = $('tl-slider'); s.value = Math.min(TL_DAYS, Number(s.value) + 1); picked(false); };
 $('tl-latest').onclick = () => {
-  stopPlaying();
-  tl.live = true;
-  $('tl-slider').value = $('tl-slider').max;
+  tl.live = true; tl.pending = null;
+  $('tl-slider').value = TL_DAYS;
   refreshTimelineUi();
-  loadDetections().catch(console.error); loadScenes().catch(console.error);
+  showPicked();
 };
 window.addEventListener('resize', drawTimeline);
 
