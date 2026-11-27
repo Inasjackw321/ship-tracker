@@ -170,6 +170,9 @@ Sentinel-2 does **not** image the whole open ocean. It images land, coastal wate
 | `POST /api/detections/<id>/measurement/reset` | Back to the automatic measurement |
 | `POST /api/detections/<id>/flag` `{flag: "not_ship" \| "ship" \| null}` | Your verdict; later scans learn from it |
 | `GET /api/aircraft` / `POST /api/aircraft/tracking` `{enabled}` / `POST /api/aircraft/refresh` | H-60 helicopters: last positions and trails / switch tracking / poll now |
+| `GET /api/timeline` | Days with analysed imagery and their ship counts |
+| `GET /api/export.csv\|geojson\|kml?<filters>` | Every ship matching the filters (same parameters as /api/detections) |
+| `POST /api/export` `{<filters>, clean}` / `GET /api/export/status` / `GET /api/export/download` | Zip of every matching ship with images, built in the background |
 | `POST /api/download.zip` `{ids: [...]}` | Zip of images, GeoTIFFs, `coordinates.csv`, `ships.kml` |
 
 ## Clouds
@@ -235,6 +238,23 @@ It finds 189/200, with 1 gross length error (more than 15 % off) and a big-ship 
 - The beam ± ignored dark hull sides.
 
 **Hide the measurement on the images.** Untick **show measurements on images** under *Filter* to see every ship image, the opened-images tray and the map without rulers or outlines. Downloads (single images and the zip) then have no ruler either, though the coordinates and sizes are still printed around the image. **Hide measurement** / **Show measurement** in a popup does the same for one ship. Ships found before GeoTIFF chips were kept have no clean copy and always show their ruler.
+
+## Going back in time
+
+The **timeline** under the map covers every day with analysed imagery. Green bars show how many ships each day has, and blue ticks mark days with images.
+
+- **Drag the slider** to a day to see the ships from the images of that day and the days before it. The window can be 1, 3, 7 or 30 days, or all time. While you look at the past, an amber line runs along the timeline's top edge.
+- **◀ / ▶|** jump to the previous / next day with imagery, and **▶** plays through those days one by one.
+- **Latest** returns to the latest picture of every tile.
+
+Scanning an area again with a longer **Look back (days)** analyses older passes too, which fills the timeline further back.
+
+## Exporting
+
+**Export ships** in the sidebar exports every ship the map is showing; the filters and the timeline apply:
+
+- **CSV**, **GeoJSON** or **KML** download at once: position, length and beam with uncertainty, reliability, hull ends, confidence, time and source image for every ship.
+- **Data + images (.zip)** adds each ship's image with its coordinates printed on it, plus its GeoTIFF where saved. It is built in the background with a progress count and downloads when ready. Untick *show measurements on images* first for images without rulers.
 
 ## Measuring on the map
 

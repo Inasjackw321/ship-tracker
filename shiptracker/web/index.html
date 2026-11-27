@@ -19,7 +19,19 @@
   #mapwrap { flex: 1; position: relative; min-height: 0; }
   #map { position: absolute; inset: 0; }
   /* Only as wide as its cards, so the rest of the map stays clickable. */
-  #tray { position: absolute; left: 10px; bottom: 24px; z-index: 1000; background: #0f1419ee; width: max-content;
+  #timeline { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1001; height: 52px; display: flex; gap: 8px;
+    align-items: center; padding: 0 12px; background: #0f1419ee; border-top: 1px solid var(--line); font-size: 12px; }
+  #timeline.past { box-shadow: inset 0 3px 0 #ffb000; }
+  #timeline .tl-track { position: relative; flex: 1; min-width: 120px; height: 36px; }
+  #timeline canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #timeline input[type=range] { position: absolute; left: 0; right: 0; bottom: -4px; width: 100%; padding: 0; background: transparent;
+    border: 0; accent-color: #ffb000; }
+  #timeline #tl-label { min-width: 170px; white-space: nowrap; font-weight: 600; }
+  #timeline select { width: auto; padding: 3px 6px; }
+  #timeline .mini { padding: 4px 8px; }
+  #timeline .mini.ghost { color: var(--text); border-color: var(--line); }
+  #map .leaflet-bottom { bottom: 52px; }
+  #tray { position: absolute; left: 10px; bottom: 64px; z-index: 1000; background: #0f1419ee; width: max-content;
     max-width: min(calc(100% - 190px), 980px); border: 1px solid var(--line); border-radius: 8px;
     padding: 8px 10px; max-height: 46%; display: flex; flex-direction: column; gap: 8px; }
   #tray[hidden] { display: none; }
@@ -168,6 +180,17 @@
       <div class="row"><button class="ghost danger" id="reset-btn" title="Delete every tracked ship, its images and the scan history">Reset ships &amp; start fresh</button></div>
     </section>
     <section>
+      <h2>Export ships</h2>
+      <div class="meta">Every ship the map is showing (filters and timeline apply): <b id="exp-count">–</b></div>
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <a class="mini" id="exp-csv" download title="Spreadsheet: position, size with uncertainty, reliability, time, image">CSV</a>
+        <a class="mini" id="exp-geojson" download title="For GIS software (QGIS, ArcGIS)">GeoJSON</a>
+        <a class="mini" id="exp-kml" download title="For Google Earth">KML</a>
+        <button class="mini" id="exp-zip" title="Every ship's image with its coordinates, GeoTIFFs, CSV, GeoJSON and KML in one zip">Data + images (.zip)</button>
+      </div>
+      <div class="meta" id="exp-status" style="margin-top:6px"></div>
+    </section>
+    <section>
       <h2>Aircraft · MH-60 Seahawk &amp; V-22 Osprey</h2>
       <label class="inline" title="Ask the public ADS-B aggregators (adsb.lol, airplanes.live) for H-60s and V-22s every minute"><input type="checkbox" id="heli-track" checked> track (public ADS-B, every minute)</label>
       <div class="heli-types">
@@ -219,6 +242,17 @@
       <span class="help">Drag the yellow ends onto the stern and bow. <span id="adjust-auto"></span></span>
       <button class="mini" id="adjust-save">Save</button>
       <button class="mini ghost" id="adjust-cancel">Cancel</button>
+    </div>
+    <div id="timeline" title="Move through time to see ships from the past">
+      <button class="mini ghost" id="tl-prev" title="Previous day with imagery">◀</button>
+      <button class="mini ghost" id="tl-play" title="Play: step through the days with imagery">▶</button>
+      <button class="mini ghost" id="tl-next" title="Next day with imagery">▶|</button>
+      <div class="tl-track"><canvas id="tl-hist"></canvas><input type="range" id="tl-slider" min="0" max="0" value="0" step="1"></div>
+      <span id="tl-label">Latest picture</span>
+      <select id="tl-window" title="How many days up to the chosen day to show">
+        <option value="1">1 day</option><option value="3">3 days</option><option value="7" selected>7 days</option>
+        <option value="30">30 days</option><option value="all">all time</option></select>
+      <button class="mini" id="tl-latest" title="Back to the latest picture" disabled>Latest</button>
     </div>
     <div id="tray" hidden>
       <div class="bar">

@@ -665,22 +665,32 @@ async function getJSON(url, opts) {
   return body;
 }
 
-async function loadDetections() {
+// The map's filters as query parameters: used for the map, the timeline and exports alike.
+function detectionQuery() {
   const q = new URLSearchParams();
-  if ($('f-start').value) q.set('start', $('f-start').value);
-  else if ($('f-age').value) q.set('start', new Date(Date.now() - Number($('f-age').value) * 864e5).toISOString().slice(0, 10));
-  if ($('f-end').value) q.set('end', $('f-end').value);
+  const win = timelineWindow();
+  if (win) {  // the timeline was moved into the past: that window, every pass in it
+    q.set('start', win.start); q.set('end', win.end); q.set('view', 'all');
+  } else {
+    if ($('f-start').value) q.set('start', $('f-start').value);
+    else if ($('f-age').value) q.set('start', new Date(Date.now() - Number($('f-age').value) * 864e5).toISOString().slice(0, 10));
+    if ($('f-end').value) q.set('end', $('f-end').value);
+    q.set('view', $('f-latest').checked ? 'latest' : 'all');
+  }
   q.set('min_length', $('f-min').value || 0);
   if ($('f-max').value) q.set('max_length', $('f-max').value);
   q.set('min_confidence', $('f-conf').value || 0);
   q.set('stationary', $('f-stat').checked ? '1' : '0');
-  q.set('view', $('f-latest').checked ? 'latest' : 'all');
   if ($('f-notships').checked) q.set('not_ships', '1');
-  const fc = await getJSON('/api/detections?' + q);
-  const want = $('f-quality').value;  // any | fair | good
-  const ok = { any: ['good', 'fair', 'rough'], fair: ['good', 'fair'], good: ['good'] }[want] || ['good', 'fair', 'rough'];
-  features = fc.features.filter((f) => ok.includes(f.properties.quality));
+  if ($('f-quality').value !== 'any') q.set('quality', $('f-quality').value);
+  return q;
+}
+
+async function loadDetections() {
+  const fc = await getJSON('/api/detections?' + detectionQuery());
+  features = fc.features;
   render();
+  updateExport();
 }
 
 async function loadStats() {
@@ -776,7 +786,9 @@ async function loadAreas() {
 }
 
 async function loadScenes() {
-  const scenes = await getJSON('/api/scenes?view=' + ($('f-latest').checked ? 'latest' : 'all'));
+  const win = timelineWindow();
+  const q = win ? `view=all&start=${win.start}&end=${win.end}` : 'view=' + ($('f-latest').checked ? 'latest' : 'all');
+  const scenes = await getJSON('/api/scenes?' + q);
   sceneLayer.clearLayers();
   sceneLayer.addData(scenes.filter((s) => s.geometry).map((s) => ({
     type: 'Feature', geometry: s.geometry, properties: s })));
@@ -822,7 +834,7 @@ async function pollScan() {
     }
   } else if (polling) {
     clearInterval(polling); polling = null;
-    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadAreas();
+    loadDetections(); loadStats(); loadScenes(); loadCoverage(); loadAreas(); loadTimeline().catch(console.error);
   }
 }
 
@@ -890,6 +902,144 @@ $('f-rulers').onchange = () => {
   hidden.clear();
   try { localStorage.setItem('showRulers', showRulers ? '1' : '0'); } catch (e) { /* private window */ }
   refreshChips();
+};
+
+// ---- Timeline: move through time to see ships from the past ----
+const DAY = 864e5;
+const tl = { first: null, last: null, counts: new Map(), images: new Set(), live: true, playing: null };
+const isoDay = (t) => new Date(t).toISOString().slice(0, 10);
+const dayIndex = (d) => Math.round((Date.parse(d) - Date.parse(tl.first)) / DAY);
+const indexDay = (i) => isoDay(Date.parse(tl.first) + i * DAY);
+
+function timelineWindow() {  // null while showing the latest picture
+  if (tl.live || !tl.first) return null;
+  const end = indexDay(Number($('tl-slider').value));
+  const w = $('tl-window').value;
+  const start = w === 'all' ? tl.first : isoDay(Date.parse(end) - (Number(w) - 1) * DAY);
+  return { start, end };
+}
+
+function timelineLabel() {
+  const win = timelineWindow();
+  if (!tl.first) return 'No imagery analysed yet';
+  if (!win) return 'Latest picture';
+  const n = [...tl.counts].filter(([d]) => d >= win.start && d <= win.end).reduce((s, [, c]) => s + c, 0);
+  return (win.start === win.end ? win.end : `${win.start} → ${win.end}`) + ` · ${n} ships`;
+}
+
+function drawTimeline() {
+  const cv = $('tl-hist');
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * devicePixelRatio; cv.height = h * devicePixelRatio;
+  const g = cv.getContext('2d');
+  g.scale(devicePixelRatio, devicePixelRatio);
+  g.clearRect(0, 0, w, h);
+  if (!tl.first) return;
+  const n = dayIndex(tl.last) + 1, max = Math.max(1, ...tl.counts.values());
+  const win = timelineWindow();
+  for (let i = 0; i < n; i++) {
+    const d = indexDay(i), x = (i + 0.5) / n * w;
+    const inWin = win && d >= win.start && d <= win.end;
+    if (tl.images.has(d)) { g.fillStyle = inWin ? '#58a6ff88' : '#58a6ff33'; g.fillRect(x - 1, h - 4, 2, 4); }
+    const c = tl.counts.get(d) || 0;
+    if (c) {
+      const bh = Math.max(2, (h - 6) * Math.sqrt(c / max));
+      g.fillStyle = inWin ? '#39d353' : '#39d35366';
+      g.fillRect(x - Math.max(1, w / n / 2 - 0.5), h - 4 - bh, Math.max(2, w / n - 1), bh);
+    }
+  }
+}
+
+function refreshTimelineUi() {
+  $('tl-label').textContent = timelineLabel();
+  $('tl-latest').disabled = tl.live;
+  $('timeline').classList.toggle('past', !tl.live);
+  drawTimeline();
+}
+
+async function loadTimeline() {
+  const t = await getJSON('/api/timeline');
+  tl.counts = new Map(t.days.map((d) => [d.date, d.ships]));
+  tl.images = new Set(t.days.filter((d) => d.images).map((d) => d.date));
+  const today = isoDay(Date.now());
+  tl.first = t.first; tl.last = t.last && t.last > today ? t.last : today;
+  const s = $('tl-slider');
+  s.max = tl.first ? dayIndex(tl.last) : 0;
+  if (tl.live) s.value = s.max;
+  refreshTimelineUi();
+}
+
+let tlTimer = null;
+function timelineMoved() {  // debounce while dragging
+  tl.live = false;
+  refreshTimelineUi();
+  clearTimeout(tlTimer);
+  tlTimer = setTimeout(() => { loadDetections().catch(console.error); loadScenes().catch(console.error); }, 150);
+}
+
+function jumpImageDate(dir) {  // to the previous / next day with imagery
+  if (!tl.first) return;
+  const days = [...tl.images].sort();
+  const cur = indexDay(Number($('tl-slider').value));
+  const target = dir < 0 ? days.filter((d) => d < cur).pop() : days.find((d) => d > cur);
+  if (!target) return false;
+  $('tl-slider').value = dayIndex(target);
+  timelineMoved();
+  return true;
+}
+
+function stopPlaying() { clearInterval(tl.playing); tl.playing = null; $('tl-play').textContent = '▶'; }
+$('tl-slider').oninput = timelineMoved;
+$('tl-window').onchange = () => { if (!tl.live) timelineMoved(); else refreshTimelineUi(); };
+$('tl-prev').onclick = () => { stopPlaying(); jumpImageDate(-1); };
+$('tl-next').onclick = () => { stopPlaying(); jumpImageDate(1); };
+$('tl-play').onclick = () => {
+  if (tl.playing) { stopPlaying(); return; }
+  if (tl.live || Number($('tl-slider').value) >= Number($('tl-slider').max)) {  // start from the first image date
+    $('tl-slider').value = tl.first ? dayIndex([...tl.images].sort()[0] || tl.first) : 0;
+    timelineMoved();
+  }
+  $('tl-play').textContent = '❚❚';
+  tl.playing = setInterval(() => { if (!jumpImageDate(1)) stopPlaying(); }, 1500);
+};
+$('tl-latest').onclick = () => {
+  stopPlaying();
+  tl.live = true;
+  $('tl-slider').value = $('tl-slider').max;
+  refreshTimelineUi();
+  loadDetections().catch(console.error); loadScenes().catch(console.error);
+};
+window.addEventListener('resize', drawTimeline);
+
+// ---- Export every ship the map is showing ----
+function updateExport() {
+  const q = detectionQuery().toString();
+  for (const fmt of ['csv', 'geojson', 'kml']) $(`exp-${fmt}`).href = `/api/export.${fmt}?${q}`;
+  $('exp-count').textContent = features.length;
+}
+let exportPoll = null;
+$('exp-zip').onclick = async () => {
+  const body = Object.fromEntries(detectionQuery());
+  body.clean = !showRulers;
+  try {
+    const r = await getJSON('/api/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    $('exp-zip').disabled = true;
+    $('exp-status').textContent = `Preparing ${r.total} ships…`;
+    clearInterval(exportPoll);
+    exportPoll = setInterval(async () => {
+      const s = await getJSON('/api/export/status');
+      if (s.error) {
+        clearInterval(exportPoll); $('exp-zip').disabled = false;
+        $('exp-status').textContent = 'Export failed: ' + s.error;
+      } else if (s.ready) {
+        clearInterval(exportPoll); $('exp-zip').disabled = false;
+        $('exp-status').innerHTML = `Ready: ${s.total} ships. <a href="/api/export/download">Download again</a>`;
+        window.location.href = '/api/export/download';
+      } else {
+        $('exp-status').textContent = `Preparing images… ${s.done} / ${s.total}`;
+      }
+    }, 1000);
+  } catch (e) { $('exp-status').textContent = 'Export failed: ' + e.message; }
 };
 
 // ---- H-60 helicopters (MH-60 Seahawk etc.) from public ADS-B ----
@@ -987,4 +1137,5 @@ setInterval(() => loadAircraft().catch(console.error), 30000);
   loadScenes().catch(console.error);
   loadCoverage().catch(console.error);
   loadAircraft().catch(console.error);
+  loadTimeline().catch(console.error);
 })();

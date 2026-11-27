@@ -13,7 +13,8 @@ from flask import Flask, Response, abort, jsonify, request, send_file, send_from
 from shapely import contains_xy
 from shapely.geometry import mapping, shape
 
-from .annotate import annotated_png, bundle_zip, chip_image, file_stem, geotiff_path, quality, tif_index
+from .annotate import (_kml, annotated_png, bundle_zip, chip_image, file_stem, geotiff_path, quality, rows_csv,
+                       rows_geojson, ship_row, tif_index, write_bundle)
 from .config import Settings
 from .db import Store
 from .flights import FlightTracker
@@ -87,10 +88,10 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
     def latest_view() -> bool:
         return request.args.get("view", "latest") != "all"
 
-    @app.get("/api/detections")
-    def detections():
-        a = request.args
-        ids = latest_ids() if latest_view() else None
+    def filtered_rows(a) -> list[dict]:
+        """Ships matching the map's filters (query parameters of /api/detections)."""
+        ids = latest_ids() if a.get("view", "latest") != "all" else None
+        allowed = {"good": ("good",), "fair": ("good", "fair")}.get(a.get("quality") or "")
         try:
             rows = store.detections(
                 start=a.get("start") or None, end=a.get("end") or None,
@@ -98,12 +99,17 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
                 max_length=float(a.get("max_length", 1e9) or 1e9),
                 min_confidence=float(a.get("min_confidence", 0) or 0),
                 include_stationary=a.get("stationary", "1") != "0",
-                limit=int(a.get("limit", 20000)),
+                limit=int(a.get("limit", 100000)),
                 scene_ids=ids,
                 include_not_ships=a.get("not_ships") == "1",
             )
         except ValueError as exc:
             abort(400, str(exc))
+        return [r for r in rows if quality(r)[0] in allowed] if allowed else rows
+
+    @app.get("/api/detections")
+    def detections():
+        rows = filtered_rows(request.args)
         tifs = tif_index(settings.chips_dir)  # which ships have a clean GeoTIFF to download
         feats = []
         for r in rows:
@@ -118,11 +124,89 @@ def create_app(settings: Settings | None = None, scan_defaults: dict | None = No
 
     @app.get("/api/scenes")
     def scenes():
-        rows = store.scenes(int(request.args.get("limit", 5000)))
+        a = request.args
+        rows = store.scenes(int(a.get("limit", 5000)))
         if latest_view():
             ids = latest_ids()
             rows = [r for r in rows if r["id"] in ids]
+        if a.get("start"):  # the timeline's window
+            rows = [r for r in rows if r["datetime"][:10] >= a["start"][:10]]
+        if a.get("end"):
+            rows = [r for r in rows if r["datetime"][:10] <= a["end"][:10]]
         return jsonify(rows)
+
+    @app.get("/api/timeline")
+    def timeline():
+        """Days with analysed imagery, and how many ships each has, for the time slider."""
+        days: dict = {}
+        for r in store._query("SELECT substr(datetime, 1, 10) AS d, COUNT(*) AS n FROM scenes "
+                              "WHERE status='done' GROUP BY d"):
+            days[r["d"]] = {"date": r["d"], "images": r["n"], "ships": 0}
+        for r in store._query("SELECT substr(datetime, 1, 10) AS d, COUNT(*) AS n FROM detections "
+                              "WHERE flag IS NULL OR flag <> 'not_ship' GROUP BY d"):
+            days.setdefault(r["d"], {"date": r["d"], "images": 0, "ships": 0})["ships"] = r["n"]
+        out = sorted(days.values(), key=lambda d: d["date"])
+        return jsonify({"days": out, "first": out[0]["date"] if out else None, "last": out[-1]["date"] if out else None})
+
+    # ---- exports: every ship matching the current filters ----
+    def _export_name(ext: str) -> str:
+        return f"ships_{date.today().isoformat()}.{ext}"
+
+    @app.get("/api/export.<fmt>")
+    def export_data(fmt: str):
+        """All ships matching the filters as a table or map file (no images): csv, geojson, kml."""
+        if fmt not in ("csv", "geojson", "kml"):
+            abort(404)
+        rows = [ship_row(r) for r in filtered_rows(request.args)]
+        body = {"csv": rows_csv, "geojson": rows_geojson, "kml": _kml}[fmt](rows)
+        mime = {"csv": "text/csv", "geojson": "application/geo+json", "kml": "application/vnd.google-earth.kml+xml"}[fmt]
+        return Response(body, mimetype=mime,
+                        headers={"Content-Disposition": f'attachment; filename="{_export_name(fmt)}"'})
+
+    export_job: dict = {"thread": None, "done": 0, "total": 0, "file": None, "error": None}
+
+    @app.post("/api/export")
+    def export_start():
+        """Start building a zip of every ship matching the filters, images included."""
+        if export_job["thread"] and export_job["thread"].is_alive():
+            return jsonify({"error": "an export is already being prepared"}), 409
+        body = request.get_json(silent=True) or {}
+        recs = filtered_rows(body)
+        if not recs:
+            return jsonify({"error": "no ships match the current filters"}), 400
+        out_dir = settings.data_dir / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for old in out_dir.glob("*.zip"):  # keep only the latest export
+            old.unlink(missing_ok=True)
+        path = out_dir / _export_name("zip")
+        export_job.update(done=0, total=len(recs), file=None, error=None)
+
+        def run():
+            try:
+                write_bundle(recs, settings.chips_dir, path.with_suffix(".part"), bool(body.get("clean")),
+                             lambda d, t: export_job.update(done=d))
+                path.with_suffix(".part").replace(path)
+                export_job["file"] = str(path)
+            except Exception as exc:
+                log.exception("Export failed")
+                export_job["error"] = str(exc)
+
+        export_job["thread"] = threading.Thread(target=run, daemon=True)
+        export_job["thread"].start()
+        return jsonify({"started": True, "total": len(recs)}), 202
+
+    @app.get("/api/export/status")
+    def export_status():
+        t = export_job["thread"]
+        return jsonify({"running": bool(t and t.is_alive()), "done": export_job["done"], "total": export_job["total"],
+                        "ready": bool(export_job["file"]), "error": export_job["error"]})
+
+    @app.get("/api/export/download")
+    def export_download():
+        if not export_job["file"] or not Path(export_job["file"]).exists():
+            abort(404, "no export ready")
+        return send_file(export_job["file"], mimetype="application/zip", as_attachment=True,
+                         download_name=Path(export_job["file"]).name)
 
     def _png_response(rec: dict | None) -> Response:
         if rec is None:

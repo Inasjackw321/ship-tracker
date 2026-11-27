@@ -498,6 +498,50 @@ def test_marking_not_a_ship_hides_it_and_teaches_later_scans(world):
     assert len(lengths) == len(SHIPS) - 1 and min(lengths) > bad["length_m"] + 5
 
 
+def test_timeline_and_exports(world):
+    """The time slider's data, and exporting every ship matching the filters: instant
+    CSV / GeoJSON / KML, and a zip with images built in the background."""
+    import io
+    import time as _time
+    import zipfile
+
+    settings, _, _ = world
+    scan(settings, ScanOptions(area=AREA, start="2026-09-29", end="2026-10-01"))
+    client = create_app(settings).test_client()
+    t = client.get("/api/timeline").get_json()
+    assert t["first"] == t["last"] == "2026-09-30"
+    assert t["days"] == [{"date": "2026-09-30", "images": 2, "ships": len(SHIPS)}]
+
+    # a window in the past that holds the pass / one that does not
+    inside = client.get("/api/detections?view=all&start=2026-09-24&end=2026-09-30").get_json()["features"]
+    before = client.get("/api/detections?view=all&start=2026-09-01&end=2026-09-29").get_json()["features"]
+    assert len(inside) == len(SHIPS) and before == []
+    assert len(client.get("/api/scenes?view=all&start=2026-09-01&end=2026-09-29").get_json()) == 0
+
+    rows = client.get("/api/export.csv?view=all").get_data(as_text=True).strip().splitlines()
+    assert len(rows) == len(SHIPS) + 1 and rows[0].startswith("id,latitude,longitude,coordinates")
+    assert "reliability" in rows[0] and "length_err_m" in rows[0]
+    gj = client.get("/api/export.geojson?view=all&min_length=200").get_json()
+    assert len(gj["features"]) == 2 and all(f["properties"]["length_m"] >= 200 for f in gj["features"])
+    assert client.get("/api/export.kml").get_data(as_text=True).count("<Placemark>") == len(SHIPS)
+    assert client.get("/api/export.pdf").status_code == 404
+
+    assert client.post("/api/export", json={"view": "all", "start": "2020-01-01", "end": "2020-01-02"}).status_code == 400
+    r = client.post("/api/export", json={"view": "all"})
+    assert r.status_code == 202 and r.get_json()["total"] == len(SHIPS)
+    for _ in range(200):
+        st = client.get("/api/export/status").get_json()
+        if st["ready"] or st["error"]:
+            break
+        _time.sleep(0.1)
+    assert st["ready"] and st["done"] == len(SHIPS) and not st["error"]
+    z = zipfile.ZipFile(io.BytesIO(client.get("/api/export/download").data))
+    names = z.namelist()
+    assert sum(n.startswith("images/") and n.endswith(".png") for n in names) == len(SHIPS)
+    assert {"ships.csv", "ships.geojson", "ships.kml", "README.txt"} <= set(names)
+    assert len(z.read("ships.csv").decode().strip().splitlines()) == len(SHIPS) + 1
+
+
 def test_scan_api_requires_an_area(world):
     settings, _, _ = world
     client = create_app(settings).test_client()

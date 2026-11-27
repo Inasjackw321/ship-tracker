@@ -175,36 +175,79 @@ def tif_index(chips_dir: Path) -> set[str]:
     return out
 
 
-def bundle_zip(recs: list[dict], chips_dir: Path, clean: bool = False) -> bytes:
-    """Zip of annotated PNGs (+ GeoTIFFs where saved), coordinates.csv and ships.kml."""
-    buf = io.BytesIO()
+def ship_row(rec: dict, file: str = "") -> dict:
+    """One ship as a flat record (CSV row / GeoJSON properties) with everything known."""
+    grade, why = quality(rec)
+    return {
+        "id": rec.get("id", ""),
+        "latitude": f"{rec['lat']:.6f}", "longitude": f"{rec['lon']:.6f}",
+        "coordinates": coord_text(rec["lat"], rec["lon"]),
+        "coordinates_dms": coord_dms(rec["lat"], rec["lon"]),
+        "length_m": rec["length_m"], "length_err_m": rec.get("length_err_m") or "",
+        "beam_m": rec["width_m"], "beam_err_m": rec.get("width_err_m") or "",
+        "reliability": grade, "reliability_why": why,
+        "measured_by": rec.get("method") or "",
+        "wake_m": rec.get("wake_m") or "",
+        "hull_axis_deg": rec.get("heading_deg", ""),
+        "bow_lat": rec.get("bow_lat", ""), "bow_lon": rec.get("bow_lon", ""),
+        "stern_lat": rec.get("stern_lat", ""), "stern_lon": rec.get("stern_lon", ""),
+        "confidence": rec.get("confidence", ""), "snr": rec.get("snr", ""),
+        "stationary": rec.get("stationary", ""),
+        "your_verdict": {"not_ship": "not a ship", "ship": "ship"}.get(rec.get("flag") or "", ""),
+        "datetime_utc": rec["datetime"], "image": rec["scene_id"],
+        "file": file,
+    }
+
+
+def rows_csv(rows: list[dict]) -> str:
+    out = io.StringIO()
+    if rows:
+        w = csv.DictWriter(out, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return out.getvalue()
+
+
+def rows_geojson(rows: list[dict]) -> str:
+    feats = [{"type": "Feature", "geometry": {"type": "Point", "coordinates": [float(r["longitude"]), float(r["latitude"])]},
+              "properties": r} for r in rows]
+    return json.dumps({"type": "FeatureCollection", "features": feats}, indent=1)
+
+
+def write_bundle(recs: list[dict], chips_dir: Path, target, clean: bool = False, progress=None) -> None:
+    """Zip of annotated PNGs (+ GeoTIFFs where saved), ships.csv, ships.geojson and
+    ships.kml, written to ``target`` (a path or a file object). ``progress(done, total)``
+    is called after each ship."""
     rows = []
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for rec in recs:
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, rec in enumerate(recs):
             stem = file_stem(rec)
-            z.writestr(f"{stem}.png", annotated_png(rec, chips_dir, clean))
+            if rec.get("id") is not None:
+                stem = f"{stem}_{rec['id']}"  # unique even for two ships of the same size and place
+            z.writestr(f"images/{stem}.png", annotated_png(rec, chips_dir, clean))
             tif = geotiff_path(rec, chips_dir)
             if tif:
-                z.write(tif, f"{stem}.tif")
-            rows.append({
-                "latitude": f"{rec['lat']:.6f}", "longitude": f"{rec['lon']:.6f}",
-                "coordinates": coord_text(rec["lat"], rec["lon"]),
-                "coordinates_dms": coord_dms(rec["lat"], rec["lon"]),
-                "length_m": rec["length_m"], "length_err_m": rec.get("length_err_m") or "",
-                "beam_m": rec["width_m"], "beam_err_m": rec.get("width_err_m") or "",
-                "measured_by": rec.get("method") or "",
-                "wake_m": rec.get("wake_m") or "",
-                "hull_axis_deg": rec.get("heading_deg", ""),
-                "datetime_utc": rec["datetime"], "image": rec["scene_id"],
-                "file": f"{stem}.png",
-            })
-        out = io.StringIO()
-        if rows:
-            w = csv.DictWriter(out, fieldnames=list(rows[0]))
-            w.writeheader()
-            w.writerows(rows)
-        z.writestr("coordinates.csv", out.getvalue())
+                z.write(tif, f"images/{stem}.tif")
+            rows.append(ship_row(rec, f"images/{stem}.png"))
+            if progress:
+                progress(i + 1, len(recs))
+        z.writestr("ships.csv", rows_csv(rows))
+        z.writestr("coordinates.csv", rows_csv(rows))  # same table, the name earlier downloads used
+        z.writestr("ships.geojson", rows_geojson(rows))
         z.writestr("ships.kml", _kml(rows))
+        z.writestr("README.txt",
+                   f"Ship Tracker export: {len(rows)} ships.\n\n"
+                   "images/   each ship's image with its coordinates printed on it (PNG; coordinates also in the\n"
+                   "          PNG metadata) and, where saved, a georeferenced GeoTIFF that opens in place in\n"
+                   "          QGIS or Google Earth Pro\n"
+                   "ships.csv      every ship: position, length/beam with uncertainty, reliability, time, image\n"
+                   "ships.geojson  the same as points for GIS software\n"
+                   "ships.kml      the same for Google Earth\n")
+
+
+def bundle_zip(recs: list[dict], chips_dir: Path, clean: bool = False) -> bytes:
+    buf = io.BytesIO()
+    write_bundle(recs, chips_dir, buf, clean)
     return buf.getvalue()
 
 
